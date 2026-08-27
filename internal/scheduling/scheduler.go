@@ -15,7 +15,6 @@ import (
 type Scheduler struct {
 	authority Authority
 	store     CoordinationStore
-	capacity  CapacityProvider
 	ids       identity.Generator
 	clock     clock.Clock
 	owner     string
@@ -23,15 +22,17 @@ type Scheduler struct {
 	observer  Observer
 }
 
-// Observer is intentionally a tiny bounded-label telemetry port. It avoids
-// coupling scheduling decisions to Prometheus or any other adapter.
 type Observer interface {
 	ObserveReadyToQueued(time.Duration)
 	ObserveSchedulingRedisRebuild(outcome string)
 }
 
-func New(authority Authority, store CoordinationStore, capacity CapacityProvider, ids identity.Generator, valueClock clock.Clock, owner string, settings Settings, observers ...Observer) (*Scheduler, error) {
-	if authority == nil || store == nil || capacity == nil || ids == nil || valueClock == nil || owner == "" {
+type TopicObserver interface {
+	ObserveTopicQueue(resourceClass string, window, occupancy int, ewma float64)
+}
+
+func New(authority Authority, store CoordinationStore, ids identity.Generator, valueClock clock.Clock, owner string, settings Settings, observers ...Observer) (*Scheduler, error) {
+	if authority == nil || store == nil || ids == nil || valueClock == nil || owner == "" {
 		return nil, fmt.Errorf("scheduler dependencies and owner are required")
 	}
 	if err := settings.Validate(); err != nil {
@@ -41,130 +42,96 @@ func New(authority Authority, store CoordinationStore, capacity CapacityProvider
 	if len(observers) > 0 {
 		observer = observers[0]
 	}
-	return &Scheduler{authority: authority, store: store, capacity: capacity, ids: ids, clock: valueClock, owner: owner, settings: settings, observer: observer}, nil
+	return &Scheduler{authority: authority, store: store, ids: ids, clock: valueClock, owner: owner, settings: settings, observer: observer}, nil
 }
 
-func (scheduler *Scheduler) Rebalance(ctx context.Context) (Plan, error) {
-	lease, err := scheduler.store.AcquireBalancerLease(ctx, scheduler.owner, scheduler.settings.BalancerLease)
+// Reconcile repairs Redis from PostgreSQL. It is deliberately independent of
+// the continuous admission loop and is expected to run much less frequently.
+func (scheduler *Scheduler) Reconcile(ctx context.Context) (ReconcileResult, error) {
+	growthAllowed, err := scheduler.store.RefreshMemoryPressure(ctx, scheduler.settings.Memory)
 	if err != nil {
-		return Plan{}, err
+		return ReconcileResult{}, err
 	}
-	if err = parallelLanes(ctx, scheduler.settings.LaneCount, scheduler.settings.AdmissionConcurrency, func(lane int) error {
-		return scheduler.store.PauseAdmissions(ctx, lease, lane)
-	}); err != nil {
-		return Plan{}, err
+	if !growthAllowed {
+		return ReconcileResult{}, ErrMemoryPressure
 	}
-	reservationLanes := make([][]Reservation, scheduler.settings.LaneCount)
-	if err = parallelLanes(ctx, scheduler.settings.LaneCount, scheduler.settings.AdmissionConcurrency, func(lane int) error {
-		values, listErr := scheduler.store.ListReservations(ctx, lane)
-		if listErr != nil {
-			return listErr
+	lease, err := scheduler.store.AcquireReconcileLease(ctx, scheduler.owner, scheduler.settings.ReconcileLease)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	reservations, err := scheduler.store.ListReservations(ctx)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	snapshot, err := scheduler.authority.LoadSchedulingSnapshot(ctx, scheduler.settings.CandidateBatch)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	reservedNodes := make(map[string]struct{}, len(reservations))
+	for _, reservation := range reservations {
+		reservedNodes[reservation.Candidate.NodeRunID] = struct{}{}
+	}
+	candidates := snapshot.Candidates[:0]
+	for _, candidate := range snapshot.Candidates {
+		if _, reserved := reservedNodes[candidate.NodeRunID]; reserved {
+			continue
 		}
-		reservationLanes[lane] = values
-		return nil
-	}); err != nil {
-		return Plan{}, err
-	}
-	reservations := make([]Reservation, 0)
-	for _, values := range reservationLanes {
-		reservations = append(reservations, values...)
-	}
-	capacity, err := scheduler.capacity.HealthyCapacity(ctx)
-	if err != nil {
-		return Plan{}, err
-	}
-	globalWindow, poolWindows, err := DispatchWindows(capacity, scheduler.settings.DispatchBufferFactor)
-	if err != nil {
-		return Plan{}, err
-	}
-	windows, err := scheduler.store.BoundWindows(ctx, lease, Windows{Global: globalWindow, Pools: poolWindows}, scheduler.settings.CapacityChangeLimit)
-	if err != nil {
-		return Plan{}, err
-	}
-	snapshot, err := scheduler.authority.LoadSchedulingSnapshot(ctx, windows.Global)
-	if err != nil {
-		return Plan{}, err
-	}
-	snapshot, keepReservations, renewReservations := mergeReservations(snapshot, reservations, scheduler.settings.LaneCount)
-	plan, err := BuildPlan(snapshot, scheduler.settings.LaneCount, windows.Global, windows.Pools, lease.FencingToken)
-	if err != nil {
-		return Plan{}, err
-	}
-	if err = parallelLanes(ctx, len(plan.Lanes), scheduler.settings.AdmissionConcurrency, func(index int) error {
-		lane := plan.Lanes[index]
-		if rebuildErr := scheduler.store.RebuildLane(ctx, lease, LaneState{Lane: lane.Lane, Candidates: lane.Candidates, Inflight: lane.Inflight, KeepReservations: keepReservations[lane.Lane], RenewReservations: renewReservations[lane.Lane]}, scheduler.settings.ActiveProjectTTL, scheduler.settings.ReservationTTL); rebuildErr != nil {
-			return rebuildErr
+		candidate = candidate.Normalized()
+		if err = candidate.Validate(); err != nil {
+			return ReconcileResult{}, err
 		}
-		batches, batchErr := CreditBatches(lane.Admissions, scheduler.settings.CreditGrantBatch)
-		if batchErr != nil {
-			return batchErr
-		}
-		for _, batch := range batches {
-			if grantErr := scheduler.store.Grant(ctx, lease, lane.Lane, batch); grantErr != nil {
-				return grantErr
-			}
-		}
-		return nil
-	}); err != nil {
-		if scheduler.observer != nil {
-			scheduler.observer.ObserveSchedulingRedisRebuild("failure")
-		}
-		return Plan{}, err
+		candidates = append(candidates, candidate)
 	}
+	snapshot.Candidates = candidates
+	result, err := scheduler.store.Rebuild(ctx, lease, snapshot, scheduler.settings.TopicWindow)
 	if scheduler.observer != nil {
-		scheduler.observer.ObserveSchedulingRedisRebuild("success")
-	}
-	if err = parallelLanes(ctx, len(plan.Lanes), scheduler.settings.AdmissionConcurrency, func(index int) error {
-		return scheduler.store.Activate(ctx, lease, plan.Lanes[index].Lane, plan.Epoch)
-	}); err != nil {
-		return Plan{}, err
-	}
-	return plan, nil
-}
-
-func parallelLanes(ctx context.Context, count, concurrency int, operation func(int) error) error {
-	if count == 0 {
-		return nil
-	}
-	jobs := make(chan int)
-	errorsFound := make(chan error, concurrency)
-	workers := min(count, concurrency)
-	var wait sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			for index := range jobs {
-				if err := operation(index); err != nil {
-					select {
-					case errorsFound <- err:
-					default:
-					}
-				}
-			}
-		}()
-	}
-	for index := 0; index < count; index++ {
-		select {
-		case jobs <- index:
-		case <-ctx.Done():
-			close(jobs)
-			wait.Wait()
-			return ctx.Err()
+		outcome := "success"
+		if err != nil {
+			outcome = "failure"
 		}
+		scheduler.observer.ObserveSchedulingRedisRebuild(outcome)
 	}
-	close(jobs)
-	wait.Wait()
-	close(errorsFound)
-	for err := range errorsFound {
-		return err
+	if err == nil {
+		scheduler.observeTopics(result.Topics)
 	}
-	return nil
+	return result, err
 }
 
-func (scheduler *Scheduler) AdmitLane(ctx context.Context, lane, limit int, traceID string) ([]Task, error) {
-	if lane < 0 || lane >= scheduler.settings.LaneCount || limit <= 0 || limit > scheduler.settings.CandidateBatch || traceID == "" {
-		return nil, fmt.Errorf("admission lane, bounded limit and trace are required")
+// Rebalance remains as a narrow compatibility name for callers from the M6
+// boundary. Its behavior is now reconciliation only; it neither calculates
+// credits nor performs admission.
+func (scheduler *Scheduler) Rebalance(ctx context.Context) (ReconcileResult, error) {
+	return scheduler.Reconcile(ctx)
+}
+
+func (scheduler *Scheduler) Calibrate(ctx context.Context) (map[ResourceClass]TopicState, error) {
+	lease, err := scheduler.store.AcquireReconcileLease(ctx, scheduler.owner, scheduler.settings.ReconcileLease)
+	if err != nil {
+		return nil, err
+	}
+	states, err := scheduler.store.CalibrateTopicWindows(ctx, lease, scheduler.settings.TopicWindow)
+	if err == nil {
+		scheduler.observeTopics(states)
+	}
+	return states, err
+}
+
+func (scheduler *Scheduler) observeTopics(states map[ResourceClass]TopicState) {
+	observer, ok := scheduler.observer.(TopicObserver)
+	if !ok {
+		return
+	}
+	for class, state := range states {
+		observer.ObserveTopicQueue(string(class), state.Window, state.Occupancy, state.EWMA)
+	}
+}
+
+// AdmitClass reserves in strict Redis order, then performs PostgreSQL CAS in a
+// bounded worker set. Reservation already accounts for Project Load and Topic
+// occupancy, so concurrent Scheduler replicas cannot over-admit.
+func (scheduler *Scheduler) AdmitClass(ctx context.Context, class ResourceClass, limit int, traceID string) ([]Task, error) {
+	if !class.Valid() || limit <= 0 || limit > scheduler.settings.CandidateBatch || traceID == "" {
+		return nil, fmt.Errorf("admission class, bounded limit and trace are required")
 	}
 	reservations := make([]Reservation, 0, limit)
 	for len(reservations) < limit {
@@ -173,7 +140,7 @@ func (scheduler *Scheduler) AdmitLane(ctx context.Context, lane, limit int, trac
 			scheduler.abortReservations(ctx, reservations, true)
 			return nil, err
 		}
-		reservation, exists, err := scheduler.store.ReserveNext(ctx, lane, attemptID, scheduler.settings.ReservationTTL)
+		reservation, exists, err := scheduler.store.ReserveNext(ctx, class, attemptID, scheduler.settings.ReservationTTL)
 		if err != nil {
 			scheduler.abortReservations(ctx, reservations, true)
 			return nil, err
@@ -183,64 +150,56 @@ func (scheduler *Scheduler) AdmitLane(ctx context.Context, lane, limit int, trac
 		}
 		reservations = append(reservations, reservation)
 	}
-	type projectBatch struct {
-		projectID    string
-		reservations []Reservation
+	if len(reservations) == 0 {
+		return nil, nil
 	}
 	type result struct {
-		tasks []Task
-		err   error
+		task Task
+		err  error
 	}
-	byProject := make(map[string][]Reservation)
-	projects := make([]string, 0)
-	for _, reservation := range reservations {
-		if _, exists := byProject[reservation.ProjectID]; !exists {
-			projects = append(projects, reservation.ProjectID)
-		}
-		byProject[reservation.ProjectID] = append(byProject[reservation.ProjectID], reservation)
-	}
-	results := make(chan result, len(projects))
-	jobs := make(chan projectBatch, len(projects))
-	workers := min(len(projects), scheduler.settings.AdmissionConcurrency)
+	jobs := make(chan Reservation)
+	results := make(chan result, len(reservations))
+	workers := min(len(reservations), scheduler.settings.AdmissionConcurrency)
 	var wait sync.WaitGroup
 	for index := 0; index < workers; index++ {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			for batch := range jobs {
-				tasks := make([]Task, 0, len(batch.reservations))
-				var batchErr error
-				for index, reservation := range batch.reservations {
-					task, err := scheduler.dispatchReservation(ctx, reservation, traceID)
-					if err != nil {
-						for restoreIndex := len(batch.reservations) - 1; restoreIndex >= index; restoreIndex-- {
-							restore := restoreIndex != index || !errors.Is(err, ErrCandidateStale)
-							_ = scheduler.store.AbortReservation(ctx, batch.reservations[restoreIndex], restore)
-						}
-						batchErr = err
-						break
-					}
-					tasks = append(tasks, task)
+			for reservation := range jobs {
+				task, restore, dispatchErr := scheduler.dispatchReservation(ctx, reservation, traceID)
+				if dispatchErr != nil {
+					// Failure before Dispatch may restore the candidate. Once Dispatch
+					// starts, its commit outcome can be ambiguous, so reconciliation
+					// repairs the candidate without risking a duplicate Attempt.
+					_ = scheduler.store.AbortReservation(ctx, reservation, restore)
 				}
-				results <- result{tasks: tasks, err: batchErr}
+				results <- result{task: task, err: dispatchErr}
 			}
 		}()
 	}
-	for _, projectID := range projects {
-		jobs <- projectBatch{projectID: projectID, reservations: byProject[projectID]}
+	for _, reservation := range reservations {
+		select {
+		case jobs <- reservation:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			close(results)
+			return nil, ctx.Err()
+		}
 	}
 	close(jobs)
 	wait.Wait()
 	close(results)
-	tasks := make([]Task, 0, limit)
+	tasks := make([]Task, 0, len(reservations))
 	var firstErr error
 	for value := range results {
-		tasks = append(tasks, value.tasks...)
 		if value.err != nil {
 			if firstErr == nil {
 				firstErr = value.err
 			}
+			continue
 		}
+		tasks = append(tasks, value.task)
 	}
 	return tasks, firstErr
 }
@@ -251,76 +210,27 @@ func (scheduler *Scheduler) abortReservations(ctx context.Context, reservations 
 	}
 }
 
-func (scheduler *Scheduler) dispatchReservation(ctx context.Context, reservation Reservation, traceID string) (Task, error) {
+func (scheduler *Scheduler) dispatchReservation(ctx context.Context, reservation Reservation, traceID string) (Task, bool, error) {
 	taskID, err := scheduler.ids.New()
 	if err != nil {
-		return Task{}, err
+		return Task{}, true, err
 	}
 	task, err := scheduler.authority.DispatchReady(ctx, DispatchCommand{
 		Candidate: reservation.Candidate, AttemptID: reservation.AttemptID, TaskID: taskID,
 		TraceID: traceID, Now: scheduler.clock.Now().UTC(),
 	})
 	if err != nil {
-		return Task{}, err
+		return Task{}, false, err
 	}
 	if scheduler.observer != nil {
 		scheduler.observer.ObserveReadyToQueued(scheduler.clock.Now().UTC().Sub(reservation.Candidate.ReadyAt))
 	}
-	if err = scheduler.store.ConfirmReservation(ctx, reservation, scheduler.settings.ReservationTTL); err != nil {
-		// The database already contains the authoritative queued Attempt. A
-		// leaked derived reservation can only reduce capacity until TTL/rebuild;
-		// it must never turn a committed Dispatch into an application failure.
-		return task, nil
-	}
-	return task, nil
+	// PostgreSQL already contains the authoritative queued Attempt. A missed
+	// Redis confirmation is conservative and repaired by reconciliation.
+	_ = scheduler.store.ConfirmReservation(ctx, reservation)
+	return task, false, nil
 }
 
-func mergeReservations(snapshot AuthoritySnapshot, reservations []Reservation, laneCount int) (AuthoritySnapshot, map[int]map[string]struct{}, map[int]map[string]struct{}) {
-	result := AuthoritySnapshot{Candidates: make([]Candidate, 0, len(snapshot.Candidates)), Inflight: append([]Inflight(nil), snapshot.Inflight...)}
-	keep := make(map[int]map[string]struct{})
-	renew := make(map[int]map[string]struct{})
-	reservedNodes := make(map[string]struct{}, len(reservations))
-	seenAttempts := make(map[string]struct{}, len(snapshot.Inflight)+len(reservations))
-	for _, value := range snapshot.Inflight {
-		seenAttempts[value.AttemptID] = struct{}{}
-		lane, _ := LaneFor(value.ProjectID, laneCount)
-		if keep[lane] == nil {
-			keep[lane] = map[string]struct{}{}
-		}
-		keep[lane][value.AttemptID] = struct{}{}
-		if renew[lane] == nil {
-			renew[lane] = map[string]struct{}{}
-		}
-		renew[lane][value.AttemptID] = struct{}{}
-	}
-	for _, reservation := range reservations {
-		if reservation.Confirmed {
-			if _, exists := seenAttempts[reservation.AttemptID]; !exists {
-				continue
-			}
-		}
-		if keep[reservation.Lane] == nil {
-			keep[reservation.Lane] = map[string]struct{}{}
-		}
-		keep[reservation.Lane][reservation.AttemptID] = struct{}{}
-		reservedNodes[reservation.Candidate.NodeRunID] = struct{}{}
-		if _, exists := seenAttempts[reservation.AttemptID]; exists {
-			continue
-		}
-		seenAttempts[reservation.AttemptID] = struct{}{}
-		result.Inflight = append(result.Inflight, Inflight{AttemptID: reservation.AttemptID, ProjectID: reservation.ProjectID, ResourceClass: reservation.ResourceClass})
-	}
-	for _, candidate := range snapshot.Candidates {
-		if _, reserved := reservedNodes[candidate.NodeRunID]; !reserved {
-			result.Candidates = append(result.Candidates, candidate)
-		}
-	}
-	return result, keep, renew
-}
-
-// Service runs one fail-closed rebalance before admission, then repeats it at
-// every epoch. Kafka publication is deliberately outside M6; DispatchReady
-// only creates the durable Task Outbox fact consumed by M7.
 type Service struct {
 	scheduler *Scheduler
 	traceID   string
@@ -335,31 +245,53 @@ func NewService(scheduler *Scheduler, traceID string, logger *slog.Logger) (*Ser
 	return &Service{scheduler: scheduler, traceID: traceID, logger: logger}, nil
 }
 
-func (service *Service) Name() string { return "project-fair-scheduler" }
+func (service *Service) Name() string { return "fifo-topic-window-scheduler" }
 
 func (service *Service) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	service.stop = cancel
-	ticker := time.NewTicker(service.scheduler.settings.Epoch)
-	defer ticker.Stop()
+	lastReconcile := time.Time{}
+	lastCalibration := time.Time{}
+	idle := service.scheduler.settings.IdlePoll
 	for {
-		_, rebalanceErr := service.scheduler.Rebalance(runCtx)
-		if rebalanceErr == nil || errors.Is(rebalanceErr, ErrLeaseLost) {
-			for lane := 0; lane < service.scheduler.settings.LaneCount; lane++ {
-				if _, admitErr := service.scheduler.AdmitLane(runCtx, lane, service.scheduler.settings.CandidateBatch, service.traceID); admitErr != nil && !errors.Is(admitErr, ErrAdmissionPaused) {
-					service.logger.Warn("scheduler admission paused after error", "lane", lane, "error", admitErr)
-					break
-				}
+		now := service.scheduler.clock.Now()
+		if lastReconcile.IsZero() || now.Sub(lastReconcile) >= service.scheduler.settings.ReadyReconcileInterval {
+			_, err := service.scheduler.Reconcile(runCtx)
+			if err == nil || errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrMemoryPressure) {
+				lastReconcile = now
+			} else if runCtx.Err() == nil {
+				service.logger.Warn("scheduler authority reconciliation failed closed", "error", err)
 			}
-		} else if runCtx.Err() == nil {
-			// Redis or authority failure is fail-closed. Retrying on the next
-			// epoch is safe because no lane is opened before a full rebuild.
-			service.logger.Warn("scheduler rebalance failed closed", "error", rebalanceErr)
 		}
+		if lastCalibration.IsZero() || now.Sub(lastCalibration) >= service.scheduler.settings.CapacityCalibrationInterval {
+			_, err := service.scheduler.Calibrate(runCtx)
+			if err == nil || errors.Is(err, ErrLeaseLost) {
+				lastCalibration = now
+			} else if runCtx.Err() == nil {
+				service.logger.Warn("scheduler topic window calibration failed", "error", err)
+			}
+		}
+		admitted := 0
+		for _, class := range ResourceClasses() {
+			tasks, err := service.scheduler.AdmitClass(runCtx, class, service.scheduler.settings.CandidateBatch, service.traceID)
+			admitted += len(tasks)
+			if err != nil && !errors.Is(err, ErrAdmissionPaused) && runCtx.Err() == nil {
+				service.logger.Warn("scheduler admission failed", "resource_class", class, "error", err)
+			}
+		}
+		if admitted > 0 {
+			idle = service.scheduler.settings.IdlePoll
+		} else {
+			idle = min(idle*2, service.scheduler.settings.IdlePollMax)
+		}
+		timer := time.NewTimer(idle)
 		select {
 		case <-runCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return runCtx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }

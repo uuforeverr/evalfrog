@@ -30,6 +30,7 @@ type Config struct {
 	Postgres      PostgresConfig      `yaml:"postgres"`
 	Redis         RedisConfig         `yaml:"redis"`
 	Kafka         KafkaConfig         `yaml:"kafka"`
+	Engine        EngineConfig        `yaml:"engine"`
 	Scheduler     SchedulerConfig     `yaml:"scheduler"`
 	Worker        WorkerConfig        `yaml:"worker"`
 	Sandbox       SandboxConfig       `yaml:"sandbox"`
@@ -116,19 +117,27 @@ type KafkaTopicConfig struct {
 	Retention  Duration `yaml:"retention"`
 }
 
+type EngineConfig struct {
+	MaxInflight int `yaml:"max_inflight"`
+}
+
 type SchedulerConfig struct {
-	LaneCount                int      `yaml:"lane_count"`
-	Epoch                    Duration `yaml:"epoch"`
-	ActiveProjectTTL         Duration `yaml:"active_project_ttl"`
-	CreditGrantBatch         int      `yaml:"credit_grant_batch"`
-	RedisCandidateBatch      int      `yaml:"redis_candidate_batch"`
-	AdmissionConcurrency     int      `yaml:"admission_concurrency"`
-	InflightReservationTTL   Duration `yaml:"inflight_reservation_ttl"`
-	ReadyReconcileInterval   Duration `yaml:"ready_reconcile_interval"`
-	DispatchBufferFactor     float64  `yaml:"dispatch_buffer_factor"`
-	EpochCapacityChangeLimit float64  `yaml:"epoch_capacity_change_limit"`
-	IdlePoll                 Duration `yaml:"idle_poll"`
-	IdlePollMax              Duration `yaml:"idle_poll_max"`
+	RedisCandidateBatch         int      `yaml:"redis_candidate_batch"`
+	AdmissionConcurrency        int      `yaml:"admission_concurrency"`
+	CapacityCalibrationInterval Duration `yaml:"capacity_calibration_interval"`
+	ReadyReconcileInterval      Duration `yaml:"ready_reconcile_interval"`
+	ReconcileLease              Duration `yaml:"reconcile_lease"`
+	ReservationTTL              Duration `yaml:"reservation_ttl"`
+	TopicQueueBuffer            Duration `yaml:"topic_queue_buffer"`
+	TopicEWMAAlpha              float64  `yaml:"topic_ewma_alpha"`
+	BuiltinMinQueue             int      `yaml:"builtin_min_queue"`
+	BuiltinMaxQueue             int      `yaml:"builtin_max_queue"`
+	SandboxMinQueue             int      `yaml:"sandbox_min_queue"`
+	SandboxMaxQueue             int      `yaml:"sandbox_max_queue"`
+	MemoryHighWatermark         float64  `yaml:"memory_high_watermark"`
+	MemoryResumeWatermark       float64  `yaml:"memory_resume_watermark"`
+	IdlePoll                    Duration `yaml:"idle_poll"`
+	IdlePollMax                 Duration `yaml:"idle_poll_max"`
 }
 
 type WorkerConfig struct {
@@ -400,12 +409,16 @@ func (config Config) Validate() error {
 	add(config.Kafka.Topics.BuiltinTask.Partitions < config.Worker.ExpectedBuiltinConsumers, "builtin task partitions must cover expected consumers")
 	add(config.Kafka.Topics.SandboxTask.Partitions < config.Worker.ExpectedSandboxConsumers, "sandbox task partitions must cover expected consumers")
 	add(config.Kafka.Topics.RuntimeEvent.Partitions < config.Worker.ExpectedRuntimeEventConsumers, "runtime event partitions must cover expected consumers")
+	add(config.Engine.MaxInflight <= 0 || int32(config.Engine.MaxInflight) >= config.Postgres.PoolMax, "engine.max_inflight must be positive and leave PostgreSQL pool capacity for other control-plane modules")
 
-	add(config.Scheduler.LaneCount <= 0 || config.Scheduler.LaneCount&(config.Scheduler.LaneCount-1) != 0, "scheduler.lane_count must be a positive power of two")
-	add(config.Scheduler.Epoch.Duration() <= 0 || config.Scheduler.ActiveProjectTTL.Duration() <= config.Scheduler.Epoch.Duration(), "scheduler active project TTL must exceed epoch")
-	add(config.Scheduler.CreditGrantBatch <= 0 || config.Scheduler.RedisCandidateBatch <= 0 || config.Scheduler.AdmissionConcurrency <= 0, "scheduler batch and concurrency values must be positive")
-	add(config.Scheduler.DispatchBufferFactor < 1 || config.Scheduler.DispatchBufferFactor > 2, "scheduler dispatch buffer factor must be between 1 and 2")
-	add(config.Scheduler.EpochCapacityChangeLimit <= 0 || config.Scheduler.EpochCapacityChangeLimit > 1, "scheduler capacity change limit must be in (0,1]")
+	add(config.Scheduler.RedisCandidateBatch <= 0 || config.Scheduler.AdmissionConcurrency <= 0, "scheduler batch and concurrency values must be positive")
+	add(config.Scheduler.CapacityCalibrationInterval.Duration() <= 0 || config.Scheduler.ReadyReconcileInterval.Duration() < config.Scheduler.CapacityCalibrationInterval.Duration(), "scheduler reconciliation interval must cover the positive capacity calibration interval")
+	add(config.Scheduler.ReconcileLease.Duration() <= 0 || config.Scheduler.ReconcileLease.Duration() >= config.Scheduler.ReadyReconcileInterval.Duration(), "scheduler reconcile lease must be positive and shorter than reconciliation interval")
+	add(config.Scheduler.ReservationTTL.Duration() <= 0, "scheduler reservation TTL must be positive")
+	add(config.Scheduler.TopicQueueBuffer.Duration() <= 0 || config.Scheduler.TopicEWMAAlpha <= 0 || config.Scheduler.TopicEWMAAlpha > 1, "scheduler topic queue buffer and EWMA alpha are invalid")
+	add(config.Scheduler.BuiltinMinQueue <= 0 || config.Scheduler.BuiltinMaxQueue < config.Scheduler.BuiltinMinQueue || config.Scheduler.SandboxMinQueue <= 0 || config.Scheduler.SandboxMaxQueue < config.Scheduler.SandboxMinQueue, "scheduler topic queue bounds are invalid")
+	add(config.Scheduler.MemoryResumeWatermark <= 0 || config.Scheduler.MemoryHighWatermark <= config.Scheduler.MemoryResumeWatermark || config.Scheduler.MemoryHighWatermark >= 1, "scheduler memory watermarks are invalid")
+	add(config.Scheduler.IdlePoll.Duration() <= 0 || config.Scheduler.IdlePollMax.Duration() < config.Scheduler.IdlePoll.Duration(), "scheduler idle polling bounds are invalid")
 
 	heartbeat := config.Worker.HeartbeatInterval.Duration()
 	lease := config.Worker.LeaseDuration.Duration()
@@ -413,7 +426,6 @@ func (config Config) Validate() error {
 	recoveryScan := config.Worker.RecoveryScannerInterval.Duration()
 	add(heartbeat <= 0 || lease <= 0 || heartbeat >= lease/3, "worker heartbeat_interval must be less than lease_duration/3")
 	add(lostAfter < lease+recoveryScan, "worker lost_after must be >= lease_duration + recovery_scanner_interval")
-	add(config.Scheduler.InflightReservationTTL.Duration() < lostAfter+config.Scheduler.ReadyReconcileInterval.Duration(), "scheduler reservation TTL must cover lost_after + ready_reconcile_interval")
 	add(config.Worker.BuiltinSlots <= 0 || config.Worker.SandboxSlots <= 0, "worker slots must be positive")
 	add(config.Worker.TaskPollLimit <= 0 || config.Worker.TaskPollLimit > 32, "worker task_poll_limit must be in [1,32]")
 	add(config.Worker.MaxRecoveries < 0, "worker max_recoveries cannot be negative")

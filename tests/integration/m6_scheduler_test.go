@@ -88,7 +88,7 @@ func TestM6MigrationUpgradesExistingM5RuntimeRows(t *testing.T) {
 	}
 }
 
-func TestM6AuthorityBoundsCandidatesPerProjectWithoutBreakingIdleBorrowing(t *testing.T) {
+func TestM6AuthorityBoundsOneGlobalOldestReadyRead(t *testing.T) {
 	harness := newM5Harness(t)
 	createReadyTasksForProject(t, harness, harness.projectID, harness.principalID, 1)
 
@@ -104,7 +104,7 @@ func TestM6AuthorityBoundsCandidatesPerProjectWithoutBreakingIdleBorrowing(t *te
 	for _, candidate := range authority.Candidates {
 		counts[candidate.ProjectID]++
 	}
-	if counts[harness.projectID] != 1 || counts[busyProject] != 4 || len(authority.Candidates) != 5 {
+	if len(authority.Candidates) != 4 || counts[harness.projectID]+counts[busyProject] != 4 {
 		t.Fatalf("bounded candidates=%v total=%d", counts, len(authority.Candidates))
 	}
 }
@@ -165,7 +165,7 @@ func TestM6DispatchIsAtomicAndConcurrentSchedulersCreateOneAttempt(t *testing.T)
 	}
 }
 
-func TestM6RedisLaneLeaseFencingReservationAndRebuild(t *testing.T) {
+func TestM6RedisReconcileFencingReservationAndDispatch(t *testing.T) {
 	harness := newM5Harness(t)
 	workflow, snapshot := harness.createCodeWorkflow(t, false)
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m6-redis")
@@ -174,65 +174,47 @@ func TestM6RedisLaneLeaseFencingReservationAndRebuild(t *testing.T) {
 	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6:" + uuid.NewString() + ":"
 	store := schedulingredis.Open(configuration.Redis.Scheduling)
 	defer store.Close()
-	scheduler, err := scheduling.New(harness.store, store,
-		scheduling.FixedCapacity{Pools: map[scheduling.ResourceClass]int{scheduling.ResourceSandbox: 1}},
-		identity.UUIDv7Generator{}, clock.System{}, "scheduler-a", scheduling.Settings{
-			LaneCount: configuration.Scheduler.LaneCount, CreditGrantBatch: configuration.Scheduler.CreditGrantBatch,
-			CandidateBatch: configuration.Scheduler.RedisCandidateBatch, AdmissionConcurrency: configuration.Scheduler.AdmissionConcurrency,
-			Epoch: configuration.Scheduler.Epoch.Duration(), ActiveProjectTTL: configuration.Scheduler.ActiveProjectTTL.Duration(),
-			BalancerLease: 2 * configuration.Scheduler.Epoch.Duration(), ReservationTTL: configuration.Scheduler.InflightReservationTTL.Duration(),
-			DispatchBufferFactor: 1, CapacityChangeLimit: configuration.Scheduler.EpochCapacityChangeLimit,
-		})
+	scheduler, err := scheduling.New(harness.store, store, identity.UUIDv7Generator{}, clock.System{}, "scheduler-a", m6Settings(configuration))
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := scheduler.Rebalance(harness.ctx)
-	if err != nil || plan.TotalAdmissions != 1 {
-		t.Fatalf("plan=%+v err=%v", plan, err)
+	result, err := scheduler.Reconcile(harness.ctx)
+	if err != nil || result.CandidateCount != 1 || result.Topics[scheduling.ResourceSandbox].Window != configuration.Scheduler.SandboxMinQueue {
+		t.Fatalf("reconcile=%+v err=%v", result, err)
 	}
-	authority, _ := harness.store.LoadSchedulingSnapshot(harness.ctx, 16)
-	lane, _ := scheduling.LaneFor(authority.Candidates[0].ProjectID, configuration.Scheduler.LaneCount)
-	follower, err := scheduling.New(harness.store, store,
-		scheduling.FixedCapacity{Pools: map[scheduling.ResourceClass]int{scheduling.ResourceSandbox: 1}},
-		identity.UUIDv7Generator{}, clock.System{}, "scheduler-b", scheduling.Settings{
-			LaneCount: configuration.Scheduler.LaneCount, CreditGrantBatch: configuration.Scheduler.CreditGrantBatch,
-			CandidateBatch: configuration.Scheduler.RedisCandidateBatch, AdmissionConcurrency: configuration.Scheduler.AdmissionConcurrency,
-			Epoch: configuration.Scheduler.Epoch.Duration(), ActiveProjectTTL: configuration.Scheduler.ActiveProjectTTL.Duration(),
-			BalancerLease: 2 * configuration.Scheduler.Epoch.Duration(), ReservationTTL: configuration.Scheduler.InflightReservationTTL.Duration(),
-			DispatchBufferFactor: 1, CapacityChangeLimit: configuration.Scheduler.EpochCapacityChangeLimit,
-		})
+	follower, err := scheduling.New(harness.store, store, identity.UUIDv7Generator{}, clock.System{}, "scheduler-b", m6Settings(configuration))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = follower.Rebalance(harness.ctx); !errors.Is(err, scheduling.ErrLeaseLost) {
-		t.Fatalf("follower acquired balancer role: %v", err)
+	if _, err = follower.Reconcile(harness.ctx); !errors.Is(err, scheduling.ErrLeaseLost) {
+		t.Fatalf("follower acquired reconciliation role: %v", err)
 	}
-	tasks, err := follower.AdmitLane(harness.ctx, lane, 1, "m6-redis-trace")
+	tasks, err := follower.AdmitClass(harness.ctx, scheduling.ResourceSandbox, 1, "m6-redis-trace")
 	if err != nil || len(tasks) != 1 || tasks[0].ResourceClass != scheduling.ResourceSandbox {
 		t.Fatalf("tasks=%v err=%v", tasks, err)
 	}
-	_, err = scheduler.Rebalance(harness.ctx)
+	_, err = scheduler.Reconcile(harness.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	more, err := scheduler.AdmitLane(harness.ctx, lane, 1, "m6-redis-trace")
+	more, err := scheduler.AdmitClass(harness.ctx, scheduling.ResourceSandbox, 1, "m6-redis-trace")
 	if err != nil || len(more) != 0 {
 		t.Fatalf("duplicate tasks=%v err=%v", more, err)
 	}
-	firstLease, err := store.AcquireBalancerLease(harness.ctx, "scheduler-a", 20*time.Millisecond)
+	firstLease, err := store.AcquireReconcileLease(harness.ctx, "scheduler-a", 20*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.AcquireBalancerLease(harness.ctx, "scheduler-b", time.Second); !errors.Is(err, scheduling.ErrLeaseLost) {
+	if _, err = store.AcquireReconcileLease(harness.ctx, "scheduler-b", time.Second); !errors.Is(err, scheduling.ErrLeaseLost) {
 		t.Fatalf("competing lease=%v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	secondLease, err := store.AcquireBalancerLease(harness.ctx, "scheduler-b", time.Second)
+	secondLease, err := store.AcquireReconcileLease(harness.ctx, "scheduler-b", time.Second)
 	if err != nil || secondLease.FencingToken <= firstLease.FencingToken {
 		t.Fatalf("second lease=%+v err=%v", secondLease, err)
 	}
-	if err = store.PauseAdmissions(harness.ctx, firstLease, lane); !errors.Is(err, scheduling.ErrLeaseLost) {
-		t.Fatalf("stale lease accepted: %v", err)
+	if _, err = store.Rebuild(harness.ctx, firstLease, scheduling.AuthoritySnapshot{}, m6Settings(configuration).TopicWindow); !errors.Is(err, scheduling.ErrLeaseLost) {
+		t.Fatalf("stale reconciliation lease accepted: %v", err)
 	}
 }
 
@@ -245,82 +227,58 @@ func TestM6RedisLossFailsClosedThenRebuildsFromPostgres(t *testing.T) {
 	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-rebuild:" + uuid.NewString() + ":"
 	store := schedulingredis.Open(configuration.Redis.Scheduling)
 	defer store.Close()
-	authority, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 16)
-	if err != nil || len(authority.Candidates) != 1 {
-		t.Fatalf("authority=%+v err=%v", authority, err)
-	}
-	lane, _ := scheduling.LaneFor(harness.projectID, configuration.Scheduler.LaneCount)
-	if _, _, err = store.ReserveNext(harness.ctx, lane, newID(t), time.Minute); !errors.Is(err, scheduling.ErrAdmissionPaused) {
+	if _, _, err := store.ReserveNext(harness.ctx, scheduling.ResourceSandbox, newID(t), time.Minute); !errors.Is(err, scheduling.ErrAdmissionPaused) {
 		t.Fatalf("empty Redis admitted: %v", err)
 	}
-	scheduler, err := scheduling.New(harness.store, store,
-		scheduling.FixedCapacity{Pools: map[scheduling.ResourceClass]int{scheduling.ResourceSandbox: 1}},
-		identity.UUIDv7Generator{}, clock.System{}, "rebuild-scheduler", scheduling.Settings{
-			LaneCount: configuration.Scheduler.LaneCount, CreditGrantBatch: configuration.Scheduler.CreditGrantBatch,
-			CandidateBatch: configuration.Scheduler.RedisCandidateBatch, AdmissionConcurrency: configuration.Scheduler.AdmissionConcurrency,
-			Epoch: configuration.Scheduler.Epoch.Duration(), ActiveProjectTTL: configuration.Scheduler.ActiveProjectTTL.Duration(),
-			BalancerLease: 2 * configuration.Scheduler.Epoch.Duration(), ReservationTTL: configuration.Scheduler.InflightReservationTTL.Duration(), DispatchBufferFactor: 1, CapacityChangeLimit: configuration.Scheduler.EpochCapacityChangeLimit,
-		})
+	scheduler, err := scheduling.New(harness.store, store, identity.UUIDv7Generator{}, clock.System{}, "rebuild-scheduler", m6Settings(configuration))
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialPlan, err := scheduler.Rebalance(harness.ctx)
+	initialPlan, err := scheduler.Reconcile(harness.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ClearDerivedState(harness.ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = store.ReserveNext(harness.ctx, lane, newID(t), time.Minute); !errors.Is(err, scheduling.ErrAdmissionPaused) {
+	if _, _, err = store.ReserveNext(harness.ctx, scheduling.ResourceSandbox, newID(t), time.Minute); !errors.Is(err, scheduling.ErrAdmissionPaused) {
 		t.Fatalf("cleared Redis admitted before rebuild: %v", err)
 	}
-	rebuiltPlan, err := scheduler.Rebalance(harness.ctx)
+	rebuiltPlan, err := scheduler.Reconcile(harness.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rebuiltPlan.Epoch <= initialPlan.Epoch {
-		t.Fatalf("fencing token regressed after Redis loss: before=%d after=%d", initialPlan.Epoch, rebuiltPlan.Epoch)
+	if rebuiltPlan.Generation <= initialPlan.Generation {
+		t.Fatalf("generation regressed after Redis loss: before=%d after=%d", initialPlan.Generation, rebuiltPlan.Generation)
 	}
-	tasks, err := scheduler.AdmitLane(harness.ctx, lane, 1, "m6-rebuild-trace")
+	tasks, err := scheduler.AdmitClass(harness.ctx, scheduling.ResourceSandbox, 1, "m6-rebuild-trace")
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("rebuilt tasks=%v err=%v", tasks, err)
 	}
 }
 
-func TestM6ConcurrentRedisAdmissionCannotExceedGrantedWindow(t *testing.T) {
+func TestM6ConcurrentRedisAdmissionCannotExceedTopicWindow(t *testing.T) {
 	harness := newM5Harness(t)
 	configuration := localM6Config(t)
 	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-window:" + uuid.NewString() + ":"
 	store := schedulingredis.Open(configuration.Redis.Scheduling)
 	defer store.Close()
-	lease, err := store.AcquireBalancerLease(harness.ctx, "window-balancer", time.Second)
+	lease, err := store.AcquireReconcileLease(harness.ctx, "window-reconciler", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const window = 7
 	projectID := newID(t)
-	lane, _ := scheduling.LaneFor(projectID, configuration.Scheduler.LaneCount)
 	candidates := make([]scheduling.Candidate, 50)
 	for index := range candidates {
 		candidates[index] = scheduling.Candidate{
 			ProjectID: projectID, RunID: newID(t), NodeRunID: newID(t), ExecutionNodeID: "xn_window",
 			StateVersion: 1, ReadyAt: time.Now().UTC().Add(time.Duration(index) * time.Millisecond), ResourceClass: scheduling.ResourceBuiltin,
-		}
+		}.Normalized()
 	}
-	if err = store.PauseAdmissions(harness.ctx, lease, lane); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.RebuildLane(harness.ctx, lease, scheduling.LaneState{Lane: lane, Candidates: candidates}, time.Second, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	admissions := make([]scheduling.PlannedAdmission, window)
-	for index := range admissions {
-		admissions[index] = scheduling.PlannedAdmission{ProjectID: projectID, ResourceClass: scheduling.ResourceBuiltin}
-	}
-	if err = store.Grant(harness.ctx, lease, lane, admissions); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.Activate(harness.ctx, lease, lane, lease.FencingToken); err != nil {
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = window, window
+	if _, err = store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{Candidates: candidates}, policy); err != nil {
 		t.Fatal(err)
 	}
 	var wait sync.WaitGroup
@@ -330,7 +288,7 @@ func TestM6ConcurrentRedisAdmissionCannotExceedGrantedWindow(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			_, exists, reserveErr := store.ReserveNext(harness.ctx, lane, newID(t), time.Minute)
+			_, exists, reserveErr := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, newID(t), time.Minute)
 			if reserveErr != nil {
 				t.Errorf("reserve: %v", reserveErr)
 				return
@@ -348,55 +306,199 @@ func TestM6ConcurrentRedisAdmissionCannotExceedGrantedWindow(t *testing.T) {
 	}
 }
 
+func TestM6RebuildClampsExistingTopicWindowToNewBounds(t *testing.T) {
+	harness := newM5Harness(t)
+	configuration := localM6Config(t)
+	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-window-clamp:" + uuid.NewString() + ":"
+	store := schedulingredis.Open(configuration.Redis.Scheduling)
+	defer store.Close()
+	lease, err := store.AcquireReconcileLease(harness.ctx, "window-clamp-reconciler", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 10, 10
+	if _, err = store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{}, policy); err != nil {
+		t.Fatal(err)
+	}
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 2, 3
+	result, err := store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Topics[scheduling.ResourceBuiltin].Window != 3 {
+		t.Fatalf("rebuilt window=%d want=3", result.Topics[scheduling.ResourceBuiltin].Window)
+	}
+}
+
 func TestM6RedisReservationRetryIsIdempotent(t *testing.T) {
 	harness := newM5Harness(t)
 	configuration := localM6Config(t)
 	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-reservation-retry:" + uuid.NewString() + ":"
 	store := schedulingredis.Open(configuration.Redis.Scheduling)
 	defer store.Close()
-	lease, err := store.AcquireBalancerLease(harness.ctx, "retry-balancer", time.Second)
+	lease, err := store.AcquireReconcileLease(harness.ctx, "retry-reconciler", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	projectID := newID(t)
-	lane, _ := scheduling.LaneFor(projectID, configuration.Scheduler.LaneCount)
-	candidate := scheduling.Candidate{ProjectID: projectID, RunID: newID(t), NodeRunID: newID(t), ExecutionNodeID: "xn_retry", StateVersion: 1, ReadyAt: time.Now().UTC(), ResourceClass: scheduling.ResourceBuiltin}
-	if err = store.PauseAdmissions(harness.ctx, lease, lane); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.RebuildLane(harness.ctx, lease, scheduling.LaneState{Lane: lane, Candidates: []scheduling.Candidate{candidate}}, time.Second, time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.Grant(harness.ctx, lease, lane, []scheduling.PlannedAdmission{{ProjectID: projectID, ResourceClass: scheduling.ResourceBuiltin}}); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.Activate(harness.ctx, lease, lane, lease.FencingToken); err != nil {
+	candidate := scheduling.Candidate{ProjectID: projectID, RunID: newID(t), NodeRunID: newID(t), ExecutionNodeID: "xn_retry", StateVersion: 1, ReadyAt: time.Now().UTC(), ResourceClass: scheduling.ResourceBuiltin}.Normalized()
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 1, 1
+	if _, err = store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{Candidates: []scheduling.Candidate{candidate}}, policy); err != nil {
 		t.Fatal(err)
 	}
 	attemptID := newID(t)
-	first, exists, err := store.ReserveNext(harness.ctx, lane, attemptID, time.Minute)
+	first, exists, err := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, attemptID, time.Minute)
 	if err != nil || !exists {
 		t.Fatalf("first reservation=%+v exists=%t err=%v", first, exists, err)
 	}
-	second, exists, err := store.ReserveNext(harness.ctx, lane, attemptID, time.Minute)
+	second, exists, err := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, attemptID, time.Minute)
 	if err != nil || !exists || second.AttemptID != first.AttemptID || second.Candidate.NodeRunID != candidate.NodeRunID {
 		t.Fatalf("retry reservation=%+v exists=%t err=%v", second, exists, err)
 	}
-	if _, exists, err = store.ReserveNext(harness.ctx, lane, newID(t), time.Minute); err != nil || exists {
+	if _, exists, err = store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, newID(t), time.Minute); err != nil || exists {
 		t.Fatalf("duplicate reservation consumed another credit exists=%t err=%v", exists, err)
+	}
+}
+
+func TestM6ExpiredReservationReleasesTopicOccupancy(t *testing.T) {
+	harness := newM5Harness(t)
+	configuration := localM6Config(t)
+	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-reservation-expiry:" + uuid.NewString() + ":"
+	store := schedulingredis.Open(configuration.Redis.Scheduling)
+	defer store.Close()
+	lease, err := store.AcquireReconcileLease(harness.ctx, "expiry-reconciler", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC()
+	candidates := []scheduling.Candidate{
+		{ProjectID: newID(t), RunID: newID(t), NodeRunID: "expiry-first", ExecutionNodeID: "xn_first", StateVersion: 1, ReadyAt: base, ResourceClass: scheduling.ResourceBuiltin},
+		{ProjectID: newID(t), RunID: newID(t), NodeRunID: "expiry-second", ExecutionNodeID: "xn_second", StateVersion: 1, ReadyAt: base, ResourceClass: scheduling.ResourceBuiltin},
+	}
+	for index := range candidates {
+		candidates[index] = candidates[index].Normalized()
+	}
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 1, 1
+	if _, err = store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{Candidates: candidates}, policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, reserveErr := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, "expiring-attempt", 20*time.Millisecond); reserveErr != nil || !exists {
+		t.Fatalf("initial reservation exists=%t err=%v", exists, reserveErr)
+	}
+	time.Sleep(40 * time.Millisecond)
+	reservations, err := store.ListReservations(harness.ctx)
+	if err != nil || len(reservations) != 0 {
+		t.Fatalf("expired reservations=%+v err=%v", reservations, err)
+	}
+	if _, exists, reserveErr := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, "next-attempt", time.Minute); reserveErr != nil || !exists {
+		t.Fatalf("expired reservation did not release occupancy: exists=%t err=%v", exists, reserveErr)
+	}
+}
+
+func TestM6RedisOrdersOldestBucketThenProjectLoadAndProjectPriority(t *testing.T) {
+	harness := newM5Harness(t)
+	configuration := localM6Config(t)
+	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-order:" + uuid.NewString() + ":"
+	store := schedulingredis.Open(configuration.Redis.Scheduling)
+	defer store.Close()
+	lease, err := store.AcquireReconcileLease(harness.ctx, "order-reconciler", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Second)
+	projectA, projectB, projectC := newID(t), newID(t), newID(t)
+	values := []scheduling.Candidate{
+		{ProjectID: projectA, RunID: newID(t), NodeRunID: "a-low", ExecutionNodeID: "xn_a_low", StateVersion: 1, Priority: 1, ReadyAt: base.Add(100 * time.Millisecond), ResourceClass: scheduling.ResourceBuiltin},
+		{ProjectID: projectA, RunID: newID(t), NodeRunID: "a-high", ExecutionNodeID: "xn_a_high", StateVersion: 1, Priority: 10, ReadyAt: base.Add(200 * time.Millisecond), ResourceClass: scheduling.ResourceBuiltin},
+		{ProjectID: projectC, RunID: newID(t), NodeRunID: "c", ExecutionNodeID: "xn_c", StateVersion: 1, ReadyAt: base.Add(300 * time.Millisecond), ResourceClass: scheduling.ResourceBuiltin},
+		{ProjectID: projectB, RunID: newID(t), NodeRunID: "b-later", ExecutionNodeID: "xn_b", StateVersion: 1, ReadyAt: base.Add(1100 * time.Millisecond), ResourceClass: scheduling.ResourceBuiltin},
+	}
+	for index := range values {
+		values[index] = values[index].Normalized()
+	}
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 4, 4
+	snapshot := scheduling.AuthoritySnapshot{Candidates: values, Inflight: []scheduling.Inflight{
+		{AttemptID: newID(t), ProjectID: projectA, ResourceClass: scheduling.ResourceBuiltin},
+		{AttemptID: newID(t), ProjectID: projectA, ResourceClass: scheduling.ResourceSandbox},
+	}}
+	if _, err = store.Rebuild(harness.ctx, lease, snapshot, policy); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"c", "a-high", "a-low", "b-later"}
+	for index, nodeRunID := range want {
+		reservation, exists, reserveErr := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, newID(t), time.Minute)
+		if reserveErr != nil || !exists || reservation.Candidate.NodeRunID != nodeRunID {
+			t.Fatalf("reservation %d=%+v exists=%t err=%v want_node=%s", index, reservation, exists, reserveErr, nodeRunID)
+		}
+	}
+}
+
+func TestM6ClaimReleasesTopicOccupancyAndTerminalReleasesProjectLoad(t *testing.T) {
+	harness := newM5Harness(t)
+	configuration := localM6Config(t)
+	configuration.Redis.Scheduling.KeyPrefix = "evalfrog:local:m6-lifecycle:" + uuid.NewString() + ":"
+	store := schedulingredis.Open(configuration.Redis.Scheduling)
+	defer store.Close()
+	lease, err := store.AcquireReconcileLease(harness.ctx, "lifecycle-reconciler", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC()
+	candidates := []scheduling.Candidate{
+		{ProjectID: newID(t), RunID: newID(t), NodeRunID: "first", ExecutionNodeID: "xn_first", StateVersion: 1, ReadyAt: base, ResourceClass: scheduling.ResourceBuiltin},
+		{ProjectID: newID(t), RunID: newID(t), NodeRunID: "second", ExecutionNodeID: "xn_second", StateVersion: 1, ReadyAt: base, ResourceClass: scheduling.ResourceBuiltin},
+	}
+	for index := range candidates {
+		candidates[index] = candidates[index].Normalized()
+	}
+	policy := m6Settings(configuration).TopicWindow
+	policy.Minimum[scheduling.ResourceBuiltin], policy.Maximum[scheduling.ResourceBuiltin] = 1, 1
+	if _, err = store.Rebuild(harness.ctx, lease, scheduling.AuthoritySnapshot{Candidates: candidates}, policy); err != nil {
+		t.Fatal(err)
+	}
+	first, exists, err := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, "attempt-first", time.Minute)
+	if err != nil || !exists {
+		t.Fatalf("first reservation=%+v exists=%t err=%v", first, exists, err)
+	}
+	if err = store.ConfirmReservation(harness.ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err = store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, "blocked", time.Minute); err != nil || exists {
+		t.Fatalf("topic window admitted before Claim: exists=%t err=%v", exists, err)
+	}
+	if err = store.MarkClaimed(harness.ctx, first.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.MarkClaimed(harness.ctx, first.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	second, exists, err := store.ReserveNext(harness.ctx, scheduling.ResourceBuiltin, "attempt-second", time.Minute)
+	if err != nil || !exists {
+		t.Fatalf("Claim did not release topic occupancy: reservation=%+v exists=%t err=%v", second, exists, err)
+	}
+	if err = store.MarkTerminal(harness.ctx, first.AttemptID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.MarkTerminal(harness.ctx, first.AttemptID, true); err != nil {
+		t.Fatal(err)
+	}
+	states, err := store.CalibrateTopicWindows(harness.ctx, lease, policy)
+	if err != nil || states[scheduling.ResourceBuiltin].Window != 1 || states[scheduling.ResourceBuiltin].Occupancy != 1 {
+		t.Fatalf("calibration=%+v err=%v", states, err)
 	}
 }
 
 func TestM6IndexesServeSchedulingAccessPaths(t *testing.T) {
 	harness := newM5Harness(t)
 	queries := map[string]string{
-		"node_runs_ready_idx": `SELECT n.node_run_id FROM node_runs n JOIN workflow_runs r
-			ON r.project_id=n.project_id AND r.run_id=n.run_id
-			WHERE n.project_id='00000000-0000-0000-0000-000000000001' AND n.state='ready'
-			AND r.state='running' AND r.termination_intent_json IS NULL
-			ORDER BY n.priority DESC, n.ready_at, n.node_run_id LIMIT 100`,
-		"node_attempts_project_inflight_idx": `SELECT attempt_id FROM node_attempts
-			WHERE project_id='00000000-0000-0000-0000-000000000001' AND state IN ('queued','running')
+		"node_runs_ready_fifo_idx": `SELECT node_run_id FROM node_runs
+			WHERE state='ready' ORDER BY ready_at, project_id, node_run_id LIMIT 100`,
+		"node_attempts_scheduling_inflight_idx": `SELECT attempt_id FROM node_attempts
+			WHERE state IN ('queued','running')
 			ORDER BY project_id, attempt_id LIMIT 100`,
 		"node_task_outbox_relay_idx": `SELECT task_id FROM node_task_outbox
 			WHERE resource_class='builtin' AND published_at IS NULL AND available_at <= clock_timestamp()
@@ -428,6 +530,32 @@ func TestM6IndexesServeSchedulingAccessPaths(t *testing.T) {
 				t.Fatalf("query did not use %s:\n%s", index, joined)
 			}
 		})
+	}
+}
+
+func m6Settings(configuration config.Config) scheduling.Settings {
+	return scheduling.Settings{
+		CandidateBatch:              configuration.Scheduler.RedisCandidateBatch,
+		AdmissionConcurrency:        configuration.Scheduler.AdmissionConcurrency,
+		CapacityCalibrationInterval: configuration.Scheduler.CapacityCalibrationInterval.Duration(),
+		ReadyReconcileInterval:      configuration.Scheduler.ReadyReconcileInterval.Duration(),
+		ReconcileLease:              configuration.Scheduler.ReconcileLease.Duration(),
+		ReservationTTL:              configuration.Scheduler.ReservationTTL.Duration(),
+		IdlePoll:                    configuration.Scheduler.IdlePoll.Duration(), IdlePollMax: configuration.Scheduler.IdlePollMax.Duration(),
+		TopicWindow: scheduling.TopicWindowPolicy{
+			BufferDuration: configuration.Scheduler.TopicQueueBuffer.Duration(),
+			SampleInterval: configuration.Scheduler.CapacityCalibrationInterval.Duration(),
+			EWMAAlpha:      configuration.Scheduler.TopicEWMAAlpha,
+			Minimum: map[scheduling.ResourceClass]int{
+				scheduling.ResourceBuiltin: configuration.Scheduler.BuiltinMinQueue,
+				scheduling.ResourceSandbox: configuration.Scheduler.SandboxMinQueue,
+			},
+			Maximum: map[scheduling.ResourceClass]int{
+				scheduling.ResourceBuiltin: configuration.Scheduler.BuiltinMaxQueue,
+				scheduling.ResourceSandbox: configuration.Scheduler.SandboxMaxQueue,
+			},
+		},
+		Memory: scheduling.MemoryPolicy{HighWatermark: configuration.Scheduler.MemoryHighWatermark, ResumeWatermark: configuration.Scheduler.MemoryResumeWatermark},
 	}
 }
 

@@ -3,8 +3,9 @@ package scheduling
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -14,527 +15,538 @@ import (
 )
 
 type sequenceIDs struct {
-	mu    sync.Mutex
-	value int
+	mu     sync.Mutex
+	next   int
+	fails  bool
+	failAt int
 }
 
 func (ids *sequenceIDs) New() (string, error) {
 	ids.mu.Lock()
 	defer ids.mu.Unlock()
-	ids.value++
-	return "id-" + time.Unix(int64(ids.value), 0).UTC().Format("150405"), nil
+	ids.next++
+	if ids.fails || ids.failAt == ids.next {
+		return "", errors.New("id failure")
+	}
+	return fmt.Sprintf("id-%d", ids.next), nil
 }
 
 type fakeAuthority struct {
-	mu       sync.Mutex
 	snapshot AuthoritySnapshot
-	dispatch map[string]int
-	err      error
-	failNode string
+	dispatch func(DispatchCommand) (Task, error)
+	window   int
+	loadErr  error
 }
 
-type failingIDs struct{ err error }
-
-func (ids failingIDs) New() (string, error) { return "", ids.err }
-
-type changingCapacity struct {
-	mu       sync.Mutex
-	capacity Capacity
-	err      error
-}
-
-type recordingObserver struct {
-	readyLatencies []time.Duration
-	rebuilds       []string
-}
-
-func (observer *recordingObserver) ObserveReadyToQueued(value time.Duration) {
-	observer.readyLatencies = append(observer.readyLatencies, value)
-}
-
-func (observer *recordingObserver) ObserveSchedulingRedisRebuild(outcome string) {
-	observer.rebuilds = append(observer.rebuilds, outcome)
-}
-
-func (provider *changingCapacity) HealthyCapacity(context.Context) (Capacity, error) {
-	provider.mu.Lock()
-	defer provider.mu.Unlock()
-	return provider.capacity, provider.err
-}
-
-func (authority *fakeAuthority) LoadSchedulingSnapshot(context.Context, int) (AuthoritySnapshot, error) {
-	if authority.err != nil {
-		return AuthoritySnapshot{}, authority.err
-	}
-	return authority.snapshot, nil
+func (authority *fakeAuthority) LoadSchedulingSnapshot(_ context.Context, window int) (AuthoritySnapshot, error) {
+	authority.window = window
+	return authority.snapshot, authority.loadErr
 }
 
 func (authority *fakeAuthority) DispatchReady(_ context.Context, command DispatchCommand) (Task, error) {
-	authority.mu.Lock()
-	defer authority.mu.Unlock()
-	if command.Candidate.NodeRunID == authority.failNode {
-		return Task{}, errors.New("dispatch failed")
+	if authority.dispatch != nil {
+		return authority.dispatch(command)
 	}
-	if authority.dispatch == nil {
-		authority.dispatch = map[string]int{}
-	}
-	if authority.dispatch[command.Candidate.NodeRunID] != 0 {
-		return Task{}, ErrCandidateStale
-	}
-	authority.dispatch[command.Candidate.NodeRunID]++
-	return Task{MessageVersion: 1, AttemptID: command.AttemptID, TaskID: command.TaskID, ProjectID: command.Candidate.ProjectID}, nil
+	return Task{TaskID: command.TaskID, AttemptID: command.AttemptID, ProjectID: command.Candidate.ProjectID, ResourceClass: command.Candidate.ResourceClass}, nil
 }
 
-type memoryStore struct {
-	mu           sync.Mutex
-	paused       bool
-	lease        BalancerLease
-	candidates   map[int][]Candidate
-	credits      map[int][]PlannedAdmission
-	reservations map[string]Reservation
-	fail         error
-	failRebuild  error
-	reserveCalls int
+type memoryCoordination struct {
+	mu                sync.Mutex
+	growthAllowed     bool
+	reservations      []Reservation
+	reserve           []Reservation
+	rebuilt           AuthoritySnapshot
+	confirmed         []string
+	aborted           []string
+	abortRestore      []bool
+	calibrated        bool
+	claimed           []string
+	terminal          []string
+	terminalCompleted []bool
+	memoryErr         error
+	leaseErr          error
+	listErr           error
+	rebuildErr        error
+	calibrateErr      error
+	reserveErr        error
+	confirmErr        error
+	abortErr          error
+	rebuildTopics     map[ResourceClass]TopicState
+	calibrateTopics   map[ResourceClass]TopicState
 }
 
-func (store *memoryStore) BoundWindows(_ context.Context, _ BalancerLease, desired Windows, limit float64) (Windows, error) {
-	if store.fail != nil {
-		return Windows{}, store.fail
-	}
-	return BoundWindows(Windows{}, desired, limit)
-}
-
-func (store *memoryStore) AcquireBalancerLease(context.Context, string, time.Duration) (BalancerLease, error) {
-	if store.fail != nil {
-		return BalancerLease{}, store.fail
-	}
-	store.lease = BalancerLease{Owner: "owner", Token: "token", FencingToken: store.lease.FencingToken + 1, ExpiresAt: time.Now().Add(time.Minute)}
-	return store.lease, nil
-}
-func (store *memoryStore) PauseAdmissions(context.Context, BalancerLease, int) error {
+func (store *memoryCoordination) RegisterReady(context.Context, []Candidate) error { return nil }
+func (store *memoryCoordination) MarkClaimed(_ context.Context, attemptID string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.fail != nil {
-		return store.fail
-	}
-	store.paused = true
+	store.claimed = append(store.claimed, attemptID)
 	return nil
 }
-func (store *memoryStore) ListReservations(context.Context, int) ([]Reservation, error) {
+func (store *memoryCoordination) MarkTerminal(_ context.Context, attemptID string, completed bool) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.fail != nil {
-		return nil, store.fail
-	}
-	var result []Reservation
-	for _, value := range store.reservations {
-		result = append(result, value)
-	}
-	return result, nil
-}
-func (store *memoryStore) RebuildLane(_ context.Context, _ BalancerLease, state LaneState, _, _ time.Duration) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.failRebuild != nil {
-		return store.failRebuild
-	}
-	if store.fail != nil {
-		return store.fail
-	}
-	if store.candidates == nil {
-		store.candidates = map[int][]Candidate{}
-	}
-	store.candidates[state.Lane] = append([]Candidate(nil), state.Candidates...)
+	store.terminal = append(store.terminal, attemptID)
+	store.terminalCompleted = append(store.terminalCompleted, completed)
 	return nil
 }
-func (store *memoryStore) Grant(_ context.Context, _ BalancerLease, lane int, values []PlannedAdmission) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.fail != nil {
-		return store.fail
+func (store *memoryCoordination) AcquireReconcileLease(_ context.Context, owner string, duration time.Duration) (ReconcileLease, error) {
+	if store.leaseErr != nil {
+		return ReconcileLease{}, store.leaseErr
 	}
-	if store.credits == nil {
-		store.credits = map[int][]PlannedAdmission{}
-	}
-	store.credits[lane] = append(store.credits[lane], values...)
-	return nil
+	return ReconcileLease{Owner: owner, Token: "token", FencingToken: 7, ExpiresAt: time.Now().Add(duration)}, nil
 }
-func (store *memoryStore) Activate(context.Context, BalancerLease, int, uint64) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.fail != nil {
-		return store.fail
-	}
-	store.paused = false
-	return nil
+func (store *memoryCoordination) RefreshMemoryPressure(context.Context, MemoryPolicy) (bool, error) {
+	return store.growthAllowed, store.memoryErr
 }
-func (store *memoryStore) ReserveNext(_ context.Context, lane int, attemptID string, _ time.Duration) (Reservation, bool, error) {
+func (store *memoryCoordination) ListReservations(context.Context) ([]Reservation, error) {
+	return append([]Reservation(nil), store.reservations...), store.listErr
+}
+func (store *memoryCoordination) Rebuild(_ context.Context, lease ReconcileLease, snapshot AuthoritySnapshot, _ TopicWindowPolicy) (ReconcileResult, error) {
+	store.rebuilt = snapshot
+	return ReconcileResult{Generation: lease.FencingToken, CandidateCount: len(snapshot.Candidates), InflightCount: len(snapshot.Inflight), Topics: store.rebuildTopics}, store.rebuildErr
+}
+func (store *memoryCoordination) CalibrateTopicWindows(context.Context, ReconcileLease, TopicWindowPolicy) (map[ResourceClass]TopicState, error) {
+	store.calibrated = true
+	if store.calibrateTopics != nil {
+		return store.calibrateTopics, store.calibrateErr
+	}
+	return map[ResourceClass]TopicState{ResourceBuiltin: {Window: 10}}, store.calibrateErr
+}
+func (store *memoryCoordination) ReserveNext(_ context.Context, class ResourceClass, _ string, _ time.Duration) (Reservation, bool, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.reserveCalls++
-	if store.fail != nil {
-		return Reservation{}, false, store.fail
+	if store.reserveErr != nil {
+		return Reservation{}, false, store.reserveErr
 	}
-	if store.paused {
-		return Reservation{}, false, ErrAdmissionPaused
-	}
-	for index, credit := range store.credits[lane] {
-		for candidateIndex, candidate := range store.candidates[lane] {
-			if candidate.ProjectID != credit.ProjectID {
-				continue
-			}
-			store.credits[lane] = append(store.credits[lane][:index], store.credits[lane][index+1:]...)
-			store.candidates[lane] = append(store.candidates[lane][:candidateIndex], store.candidates[lane][candidateIndex+1:]...)
-			reservation := Reservation{AttemptID: attemptID, ProjectID: candidate.ProjectID, Lane: lane, ResourceClass: candidate.ResourceClass, Candidate: candidate}
-			if store.reservations == nil {
-				store.reservations = map[string]Reservation{}
-			}
-			store.reservations[attemptID] = reservation
-			return reservation, true, nil
+	for index, reservation := range store.reserve {
+		if reservation.ResourceClass != class {
+			continue
 		}
+		store.reserve = append(store.reserve[:index], store.reserve[index+1:]...)
+		return reservation, true, nil
 	}
 	return Reservation{}, false, nil
 }
-
-func TestEmptyLaneStopsAfterFirstReservationMiss(t *testing.T) {
-	store := &memoryStore{}
-	scheduler := newFakeScheduler(t, &fakeAuthority{}, store, 8)
-	tasks, err := scheduler.AdmitLane(context.Background(), 0, 8, "trace")
-	if err != nil || len(tasks) != 0 || store.reserveCalls != 1 {
-		t.Fatalf("tasks=%v calls=%d err=%v", tasks, store.reserveCalls, err)
-	}
-}
-func (store *memoryStore) ConfirmReservation(_ context.Context, reservation Reservation, _ time.Duration) error {
+func (store *memoryCoordination) ConfirmReservation(_ context.Context, reservation Reservation) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	reservation.Confirmed = true
-	store.reservations[reservation.AttemptID] = reservation
-	return nil
+	store.confirmed = append(store.confirmed, reservation.AttemptID)
+	return store.confirmErr
 }
-func (store *memoryStore) AbortReservation(_ context.Context, reservation Reservation, restore bool) error {
+func (store *memoryCoordination) AbortReservation(_ context.Context, reservation Reservation, restore bool) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	delete(store.reservations, reservation.AttemptID)
-	if restore {
-		store.candidates[reservation.Lane] = append([]Candidate{reservation.Candidate}, store.candidates[reservation.Lane]...)
-		store.credits[reservation.Lane] = append([]PlannedAdmission{{ProjectID: reservation.ProjectID, ResourceClass: reservation.ResourceClass}}, store.credits[reservation.Lane]...)
-	}
-	return nil
+	store.aborted = append(store.aborted, reservation.AttemptID)
+	store.abortRestore = append(store.abortRestore, restore)
+	return store.abortErr
 }
 
-func TestSchedulerRebuildsBeforeActivationAndAdmitsWithinPlan(t *testing.T) {
-	authority := &fakeAuthority{snapshot: fixtureSnapshot(2, 10, ResourceBuiltin)}
-	store := &memoryStore{}
-	scheduler := newFakeScheduler(t, authority, store, 8)
-	plan, err := scheduler.Rebalance(context.Background())
-	if err != nil || store.paused || plan.TotalAdmissions != 8 {
-		t.Fatalf("plan=%+v paused=%v err=%v", plan, store.paused, err)
+func schedulerSettings() Settings {
+	return Settings{
+		CandidateBatch: 8, AdmissionConcurrency: 2,
+		CapacityCalibrationInterval: 5 * time.Second, ReadyReconcileInterval: 20 * time.Second,
+		ReconcileLease: 4 * time.Second, ReservationTTL: 10 * time.Second,
+		IdlePoll: 10 * time.Millisecond, IdlePollMax: 100 * time.Millisecond,
+		TopicWindow: TopicWindowPolicy{
+			BufferDuration: 5 * time.Second, SampleInterval: 5 * time.Second, EWMAAlpha: 0.4,
+			Minimum: map[ResourceClass]int{ResourceBuiltin: 1, ResourceSandbox: 1},
+			Maximum: map[ResourceClass]int{ResourceBuiltin: 100, ResourceSandbox: 100},
+		},
+		Memory: MemoryPolicy{HighWatermark: 0.8, ResumeWatermark: 0.7},
 	}
-	var tasks []Task
-	for lane := 0; lane < scheduler.settings.LaneCount; lane++ {
-		values, admitErr := scheduler.AdmitLane(context.Background(), lane, 8, "trace")
-		if admitErr != nil {
-			t.Fatal(admitErr)
+}
+
+func candidate(project, node string, at time.Time, class ResourceClass) Candidate {
+	return Candidate{ProjectID: project, RunID: project + "-run", NodeRunID: node, ExecutionNodeID: "xn-" + node, StateVersion: 1, ReadyAt: at, ResourceClass: class}.Normalized()
+}
+
+func TestCandidateUsesOneSecondUTCReadyBucket(t *testing.T) {
+	at := time.Date(2026, 8, 27, 10, 0, 0, 987654321, time.FixedZone("CST", 8*60*60))
+	value := candidate("project", "node", at, ResourceBuiltin)
+	if value.ReadyAt.Location() != time.UTC || value.ReadyBucket != value.ReadyAt.UnixMilli()/1000 || value.ReadyOrderKey == "" {
+		t.Fatalf("candidate was not normalized to the one-second UTC bucket: %+v", value)
+	}
+	value.ReadyBucket++
+	if err := value.Validate(); err == nil {
+		t.Fatal("mismatched derived bucket was accepted")
+	}
+}
+
+func TestSettingsRejectsInvalidWindowAndMemoryPolicy(t *testing.T) {
+	settings := schedulerSettings()
+	if err := settings.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	settings.TopicWindow.Minimum[ResourceBuiltin] = 0
+	if err := settings.Validate(); err == nil {
+		t.Fatal("zero bootstrap queue was accepted")
+	}
+	settings = schedulerSettings()
+	settings.Memory.ResumeWatermark = settings.Memory.HighWatermark
+	if err := settings.Validate(); err == nil {
+		t.Fatal("invalid memory hysteresis was accepted")
+	}
+}
+
+func TestReconcileFiltersReservedCandidateAndUsesBoundedAuthorityRead(t *testing.T) {
+	now := time.Now().UTC()
+	reserved := candidate("project-a", "node-a", now, ResourceBuiltin)
+	ready := candidate("project-b", "node-b", now.Add(time.Second), ResourceSandbox)
+	authority := &fakeAuthority{snapshot: AuthoritySnapshot{Candidates: []Candidate{reserved, ready}, Inflight: []Inflight{{AttemptID: "running", ProjectID: "project-a", ResourceClass: ResourceBuiltin}}}}
+	store := &memoryCoordination{growthAllowed: true, reservations: []Reservation{{AttemptID: "reserved", ProjectID: reserved.ProjectID, ResourceClass: reserved.ResourceClass, Candidate: reserved}}}
+	scheduler, err := New(authority, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := scheduler.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authority.window != schedulerSettings().CandidateBatch || result.CandidateCount != 1 || len(store.rebuilt.Candidates) != 1 || store.rebuilt.Candidates[0].NodeRunID != ready.NodeRunID {
+		t.Fatalf("unexpected reconciliation: window=%d result=%+v snapshot=%+v", authority.window, result, store.rebuilt)
+	}
+}
+
+func TestReconcileStopsGrowthButDoesNotMutateExistingGenerationAtHighWatermark(t *testing.T) {
+	now := time.Now().UTC()
+	authority := &fakeAuthority{snapshot: AuthoritySnapshot{Candidates: []Candidate{candidate("project", "node", now, ResourceBuiltin)}}}
+	store := &memoryCoordination{growthAllowed: false}
+	scheduler, _ := New(authority, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err := scheduler.Reconcile(context.Background()); !errors.Is(err, ErrMemoryPressure) {
+		t.Fatalf("expected memory-pressure draining, got %v", err)
+	}
+	if authority.window != 0 || len(store.rebuilt.Candidates) != 0 {
+		t.Fatal("authority growth read or rebuild ran while Redis was draining")
+	}
+}
+
+func TestAdmissionDispatchesInBoundedParallelAndConfirmsPostCommit(t *testing.T) {
+	now := time.Now().UTC()
+	store := &memoryCoordination{growthAllowed: true}
+	for index := 0; index < 4; index++ {
+		value := candidate(fmt.Sprintf("project-%d", index), fmt.Sprintf("node-%d", index), now, ResourceBuiltin)
+		store.reserve = append(store.reserve, Reservation{AttemptID: fmt.Sprintf("attempt-%d", index), ProjectID: value.ProjectID, ResourceClass: value.ResourceClass, Candidate: value})
+	}
+	var mu sync.Mutex
+	active, maximum := 0, 0
+	authority := &fakeAuthority{dispatch: func(command DispatchCommand) (Task, error) {
+		mu.Lock()
+		active++
+		maximum = max(maximum, active)
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return Task{TaskID: command.TaskID, AttemptID: command.AttemptID}, nil
+	}}
+	scheduler, _ := New(authority, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	tasks, err := scheduler.AdmitClass(context.Background(), ResourceBuiltin, 4, "trace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 4 || len(store.confirmed) != 4 || maximum != 2 {
+		t.Fatalf("unexpected bounded admission tasks=%d confirms=%d max_parallel=%d", len(tasks), len(store.confirmed), maximum)
+	}
+}
+
+func TestAmbiguousDispatchFailureDoesNotRestoreCandidate(t *testing.T) {
+	now := time.Now().UTC()
+	value := candidate("project", "node", now, ResourceSandbox)
+	store := &memoryCoordination{growthAllowed: true, reserve: []Reservation{{AttemptID: "attempt", ProjectID: value.ProjectID, ResourceClass: value.ResourceClass, Candidate: value}}}
+	authority := &fakeAuthority{dispatch: func(DispatchCommand) (Task, error) { return Task{}, errors.New("commit outcome unknown") }}
+	scheduler, _ := New(authority, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err := scheduler.AdmitClass(context.Background(), ResourceSandbox, 1, "trace"); err == nil {
+		t.Fatal("dispatch failure was hidden")
+	}
+	if len(store.aborted) != 1 || store.abortRestore[0] {
+		t.Fatalf("ambiguous dispatch was restored eagerly: %+v", store.abortRestore)
+	}
+}
+
+func TestCalibrateDoesNotReadWorkerSlotCapacity(t *testing.T) {
+	now := time.Now().UTC()
+	store := &memoryCoordination{growthAllowed: true}
+	scheduler, _ := New(&fakeAuthority{}, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	states, err := scheduler.Calibrate(context.Background())
+	if err != nil || !store.calibrated || states[ResourceBuiltin].Window != 10 {
+		t.Fatalf("topic throughput calibration failed: states=%+v err=%v", states, err)
+	}
+}
+
+func TestNewAndAdmissionValidateInputs(t *testing.T) {
+	settings := schedulerSettings()
+	if _, err := New(nil, &memoryCoordination{}, &sequenceIDs{}, clock.NewFake(time.Now()), "scheduler", settings); err == nil {
+		t.Fatal("nil authority was accepted")
+	}
+	scheduler, _ := New(&fakeAuthority{}, &memoryCoordination{growthAllowed: true}, &sequenceIDs{}, clock.NewFake(time.Now()), "scheduler", settings)
+	for _, test := range []struct {
+		class ResourceClass
+		limit int
+		trace string
+	}{{"unknown", 1, "trace"}, {ResourceBuiltin, 0, "trace"}, {ResourceBuiltin, settings.CandidateBatch + 1, "trace"}, {ResourceBuiltin, 1, ""}} {
+		if _, err := scheduler.AdmitClass(context.Background(), test.class, test.limit, test.trace); err == nil {
+			t.Fatalf("invalid admission accepted: %+v", test)
 		}
-		tasks = append(tasks, values...)
-	}
-	if len(tasks) != 8 || len(store.reservations) != 8 {
-		t.Fatalf("tasks=%d reservations=%d", len(tasks), len(store.reservations))
 	}
 }
 
-func TestSchedulerObservesRebuildAndAuthoritativeDispatchLatency(t *testing.T) {
-	authority := &fakeAuthority{snapshot: fixtureSnapshot(1, 1, ResourceBuiltin)}
-	store := &memoryStore{}
+func TestRoutingCapabilitiesWorkerRegistrationAndFixedCapacity(t *testing.T) {
+	router := BuiltinV1Router()
+	if class, ok := router.Resolve(dsl.Coordinate{Type: "task.python", Version: 1}); !ok || class != ResourceSandbox {
+		t.Fatalf("python route=%q exists=%t", class, ok)
+	}
+	if _, ok := router.Resolve(dsl.Coordinate{Type: "unknown", Version: 1}); ok {
+		t.Fatal("unknown operation was routable")
+	}
+	builtin := RequiredCapabilities(ResourceBuiltin)
+	wantBuiltin := []dsl.Coordinate{{Type: "task.http", Version: 1}, {Type: "task.rpc", Version: 1}}
+	if !slices.Equal(builtin, wantBuiltin) || len(RequiredCapabilities("unknown")) != 0 {
+		t.Fatalf("builtin capabilities=%+v", builtin)
+	}
+	if CapabilityFingerprint(ResourceBuiltin) == "" || CapabilityFingerprint(ResourceBuiltin) == CapabilityFingerprint(ResourceSandbox) {
+		t.Fatal("capability fingerprints are empty or do not separate resource classes")
+	}
+	valid := WorkerRegistration{
+		WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin,
+		Slots: 2, Capabilities: builtin, TTL: time.Minute,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []WorkerRegistration{
+		{},
+		{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin, Slots: 1, TTL: time.Minute, Capabilities: []dsl.Coordinate{{Version: 1}}},
+		{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin, Slots: 1, TTL: time.Minute, Capabilities: []dsl.Coordinate{{Type: "task.python", Version: 1}}},
+		{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin, Slots: 1, TTL: time.Minute, Capabilities: []dsl.Coordinate{{Type: "task.http", Version: 1}, {Type: "task.http", Version: 1}}},
+		{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin, Slots: 1, TTL: time.Minute, Capabilities: []dsl.Coordinate{{Type: "task.http", Version: 1}}},
+	}
+	for index, registration := range invalid {
+		if err := registration.Validate(); err == nil {
+			t.Fatalf("invalid registration %d was accepted", index)
+		}
+	}
+	provider := FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: 3}}
+	capacity, err := provider.HealthyCapacity(context.Background())
+	if err != nil || capacity.Pools[ResourceBuiltin] != 3 {
+		t.Fatalf("fixed capacity=%+v err=%v", capacity, err)
+	}
+	capacity.Pools[ResourceBuiltin] = 99
+	again, _ := provider.HealthyCapacity(context.Background())
+	if again.Pools[ResourceBuiltin] != 3 {
+		t.Fatal("fixed capacity leaked its mutable map")
+	}
+}
+
+func TestCandidateValidationAndCurrentStableOrder(t *testing.T) {
+	if err := (Candidate{}).Validate(); err == nil {
+		t.Fatal("empty candidate was accepted")
+	}
+	base := time.Date(2026, 8, 27, 1, 2, 3, 0, time.UTC)
+	invalidOrder := candidate("project", "node", base, ResourceBuiltin)
+	invalidOrder.ReadyOrderKey = "wrong"
+	if err := invalidOrder.Validate(); err == nil {
+		t.Fatal("mismatched ready order key was accepted")
+	}
+	values := []Candidate{
+		candidate("project-a", "later-bucket", base.Add(time.Second), ResourceBuiltin),
+		candidate("project-b", "project-b", base, ResourceBuiltin),
+		candidate("project-a", "priority-low", base.Add(300*time.Microsecond), ResourceBuiltin),
+		candidate("project-a", "time-later", base.Add(200*time.Microsecond), ResourceBuiltin),
+		candidate("project-a", "node-z", base.Add(100*time.Microsecond), ResourceBuiltin),
+		candidate("project-a", "node-a", base.Add(100*time.Microsecond), ResourceBuiltin),
+	}
+	values[2].Priority = 1
+	values[3].Priority = 2
+	values[4].Priority = 2
+	values[5].Priority = 2
+	sortCandidates(values)
+	got := make([]string, len(values))
+	for index := range values {
+		got[index] = values[index].NodeRunID
+	}
+	want := []string{"node-a", "node-z", "time-later", "priority-low", "project-b", "later-bucket"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("candidate order=%v want=%v", got, want)
+	}
+}
+
+func TestPolicyAndSettingsValidationBranches(t *testing.T) {
+	valid := schedulerSettings()
+	invalidPolicies := []TopicWindowPolicy{
+		{},
+		{BufferDuration: time.Second, SampleInterval: time.Second, EWMAAlpha: 2, Minimum: valid.TopicWindow.Minimum, Maximum: valid.TopicWindow.Maximum},
+		{BufferDuration: time.Second, SampleInterval: time.Second, EWMAAlpha: .5, Minimum: map[ResourceClass]int{ResourceBuiltin: 1}, Maximum: valid.TopicWindow.Maximum},
+		{BufferDuration: time.Second, SampleInterval: time.Second, EWMAAlpha: .5, Minimum: valid.TopicWindow.Minimum, Maximum: map[ResourceClass]int{ResourceBuiltin: 0, ResourceSandbox: 2}},
+	}
+	for index, policy := range invalidPolicies {
+		if err := policy.Validate(); err == nil {
+			t.Fatalf("invalid topic policy %d was accepted", index)
+		}
+	}
+	for index, policy := range []MemoryPolicy{{}, {HighWatermark: .5, ResumeWatermark: .5}, {HighWatermark: 1, ResumeWatermark: .5}} {
+		if err := policy.Validate(); err == nil {
+			t.Fatalf("invalid memory policy %d was accepted", index)
+		}
+	}
+	invalid := valid
+	invalid.CandidateBatch = 0
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid scheduler batching was accepted")
+	}
+	invalid = valid
+	invalid.TopicWindow.SampleInterval = time.Second
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("mismatched calibration interval was accepted")
+	}
+	invalid = valid
+	invalid.TopicWindow.EWMAAlpha = 0
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("invalid topic policy passed settings validation")
+	}
+}
+
+type recordingObserver struct {
+	readyDurations []time.Duration
+	rebuilds       []string
+	topics         []string
+}
+
+func (observer *recordingObserver) ObserveReadyToQueued(value time.Duration) {
+	observer.readyDurations = append(observer.readyDurations, value)
+}
+func (observer *recordingObserver) ObserveSchedulingRedisRebuild(outcome string) {
+	observer.rebuilds = append(observer.rebuilds, outcome)
+}
+func (observer *recordingObserver) ObserveTopicQueue(class string, _ int, _ int, _ float64) {
+	observer.topics = append(observer.topics, class)
+}
+
+func TestReconcileRebalanceCalibrationObserversAndFailures(t *testing.T) {
+	now := time.Now().UTC()
 	observer := &recordingObserver{}
-	settings := Settings{LaneCount: 8, CreditGrantBatch: 4, CandidateBatch: 8, AdmissionConcurrency: 2, Epoch: time.Second, ActiveProjectTTL: 5 * time.Second, BalancerLease: 2 * time.Second, ReservationTTL: time.Minute, DispatchBufferFactor: 1, CapacityChangeLimit: 0.1}
-	now := time.Date(2026, 8, 12, 0, 0, 1, 0, time.UTC)
-	scheduler, err := New(authority, store, FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: 1}}, &sequenceIDs{}, clock.NewFake(now), "scheduler", settings, observer)
+	store := &memoryCoordination{
+		growthAllowed: true,
+		rebuildTopics: map[ResourceClass]TopicState{
+			ResourceBuiltin: {Window: 2}, ResourceSandbox: {Window: 3},
+		},
+		calibrateTopics: map[ResourceClass]TopicState{ResourceBuiltin: {Window: 4}},
+	}
+	scheduler, err := New(&fakeAuthority{}, store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings(), observer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = scheduler.Rebalance(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(observer.rebuilds) != 1 || observer.rebuilds[0] != "success" {
-		t.Fatalf("rebuild observations=%v", observer.rebuilds)
-	}
-	lane, _ := LaneFor("project-000", settings.LaneCount)
-	if _, err = scheduler.AdmitLane(context.Background(), lane, 1, "trace"); err != nil {
+	if _, err = scheduler.Calibrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(observer.readyLatencies) != 1 || observer.readyLatencies[0] != time.Second {
-		t.Fatalf("ready latencies=%v", observer.readyLatencies)
+	if !slices.Equal(observer.rebuilds, []string{"success"}) || len(observer.topics) != 3 {
+		t.Fatalf("observer rebuilds=%v topics=%v", observer.rebuilds, observer.topics)
+	}
+
+	boom := errors.New("boom")
+	tests := []struct {
+		name      string
+		authority *fakeAuthority
+		store     *memoryCoordination
+	}{
+		{"memory", &fakeAuthority{}, &memoryCoordination{growthAllowed: true, memoryErr: boom}},
+		{"lease", &fakeAuthority{}, &memoryCoordination{growthAllowed: true, leaseErr: boom}},
+		{"reservations", &fakeAuthority{}, &memoryCoordination{growthAllowed: true, listErr: boom}},
+		{"authority", &fakeAuthority{loadErr: boom}, &memoryCoordination{growthAllowed: true}},
+		{"candidate", &fakeAuthority{snapshot: AuthoritySnapshot{Candidates: []Candidate{{}}}}, &memoryCoordination{growthAllowed: true}},
+		{"rebuild", &fakeAuthority{}, &memoryCoordination{growthAllowed: true, rebuildErr: boom}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, newErr := New(test.authority, test.store, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings(), observer)
+			if newErr != nil {
+				t.Fatal(newErr)
+			}
+			if _, reconcileErr := value.Reconcile(context.Background()); reconcileErr == nil {
+				t.Fatal("reconciliation failure was hidden")
+			}
+		})
+	}
+	if observer.rebuilds[len(observer.rebuilds)-1] != "failure" {
+		t.Fatalf("rebuild failure was not observed: %v", observer.rebuilds)
+	}
+	leaseFailure, _ := New(&fakeAuthority{}, &memoryCoordination{leaseErr: boom}, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err = leaseFailure.Calibrate(context.Background()); err == nil {
+		t.Fatal("calibration lease failure was hidden")
+	}
+	calibrationFailure, _ := New(&fakeAuthority{}, &memoryCoordination{calibrateErr: boom}, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err = calibrationFailure.Calibrate(context.Background()); err == nil {
+		t.Fatal("calibration store failure was hidden")
 	}
 }
 
-func TestSchedulerObservesRebuildFailure(t *testing.T) {
-	store := &memoryStore{fail: errors.New("redis unavailable")}
-	observer := &recordingObserver{}
-	settings := Settings{LaneCount: 8, CreditGrantBatch: 4, CandidateBatch: 8, AdmissionConcurrency: 2, Epoch: time.Second, ActiveProjectTTL: 5 * time.Second, BalancerLease: 2 * time.Second, ReservationTTL: time.Minute, DispatchBufferFactor: 1, CapacityChangeLimit: 0.1}
-	scheduler, err := New(&fakeAuthority{snapshot: fixtureSnapshot(1, 1, ResourceBuiltin)}, store, FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: 1}}, &sequenceIDs{}, clock.NewFake(time.Now()), "scheduler", settings, observer)
+func TestAdmissionRestoresOnlyPreDispatchFailures(t *testing.T) {
+	now := time.Now().UTC()
+	value := candidate("project", "node", now, ResourceBuiltin)
+	reservation := Reservation{AttemptID: "attempt", ProjectID: value.ProjectID, ResourceClass: value.ResourceClass, Candidate: value}
+	store := &memoryCoordination{growthAllowed: true, reserve: []Reservation{reservation}}
+	scheduler, _ := New(&fakeAuthority{}, store, &sequenceIDs{failAt: 2}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err := scheduler.AdmitClass(context.Background(), ResourceBuiltin, 1, "trace"); err == nil {
+		t.Fatal("task ID failure was hidden")
+	}
+	if len(store.aborted) != 1 || !store.abortRestore[0] {
+		t.Fatalf("pre-dispatch failure releases=%v restore=%v", store.aborted, store.abortRestore)
+	}
+
+	first := reservation
+	first.AttemptID = "first"
+	secondStore := &memoryCoordination{growthAllowed: true, reserve: []Reservation{first}}
+	secondScheduler, _ := New(&fakeAuthority{}, secondStore, &sequenceIDs{failAt: 2}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err := secondScheduler.AdmitClass(context.Background(), ResourceBuiltin, 2, "trace"); err == nil {
+		t.Fatal("reservation ID failure was hidden")
+	}
+	if len(secondStore.aborted) != 1 || !secondStore.abortRestore[0] {
+		t.Fatalf("previous reservations were not restored: %+v", secondStore.abortRestore)
+	}
+
+	reserveFailure, _ := New(&fakeAuthority{}, &memoryCoordination{growthAllowed: true, reserveErr: errors.New("reserve")}, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if _, err := reserveFailure.AdmitClass(context.Background(), ResourceBuiltin, 1, "trace"); err == nil {
+		t.Fatal("Redis reserve failure was hidden")
+	}
+	confirmStore := &memoryCoordination{growthAllowed: true, reserve: []Reservation{reservation}, confirmErr: errors.New("confirm")}
+	confirmScheduler, _ := New(&fakeAuthority{}, confirmStore, &sequenceIDs{}, clock.NewFake(now), "scheduler", schedulerSettings())
+	if tasks, err := confirmScheduler.AdmitClass(context.Background(), ResourceBuiltin, 1, "trace"); err != nil || len(tasks) != 1 {
+		t.Fatalf("post-commit Redis confirmation affected dispatch: tasks=%v err=%v", tasks, err)
+	}
+}
+
+func TestSchedulerServiceLifecycle(t *testing.T) {
+	settings := schedulerSettings()
+	settings.CapacityCalibrationInterval = time.Millisecond
+	settings.TopicWindow.SampleInterval = time.Millisecond
+	settings.ReadyReconcileInterval = 4 * time.Millisecond
+	settings.ReconcileLease = time.Millisecond
+	settings.IdlePoll = time.Millisecond
+	settings.IdlePollMax = 2 * time.Millisecond
+	scheduler, err := New(&fakeAuthority{}, &memoryCoordination{growthAllowed: true}, &sequenceIDs{}, clock.System{}, "scheduler", settings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = scheduler.Rebalance(context.Background()); err == nil {
-		t.Fatal("rebuild failure was hidden")
+	if _, err = NewService(nil, "trace", slog.Default()); err == nil {
+		t.Fatal("nil scheduler service was accepted")
 	}
-	if len(observer.rebuilds) != 0 {
-		t.Fatalf("failure before rebuild must not report a rebuild result: %v", observer.rebuilds)
-	}
-
-	store = &memoryStore{candidates: map[int][]Candidate{}, credits: map[int][]PlannedAdmission{}, failRebuild: errors.New("rebuild failed")}
-	scheduler, err = New(&fakeAuthority{snapshot: fixtureSnapshot(1, 1, ResourceBuiltin)}, store, FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: 1}}, &sequenceIDs{}, clock.NewFake(time.Now()), "scheduler", settings, observer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = scheduler.Rebalance(context.Background()); err == nil || len(observer.rebuilds) != 1 || observer.rebuilds[0] != "failure" {
-		t.Fatalf("err=%v rebuild observations=%v", err, observer.rebuilds)
-	}
-}
-
-func TestSchedulerFailsClosedWhenCoordinationStoreUnavailable(t *testing.T) {
-	store := &memoryStore{fail: errors.New("redis unavailable")}
-	scheduler := newFakeScheduler(t, &fakeAuthority{snapshot: fixtureSnapshot(1, 10, ResourceBuiltin)}, store, 8)
-	if _, err := scheduler.Rebalance(context.Background()); err == nil {
-		t.Fatal("Redis failure did not pause admission")
-	}
-	if _, err := scheduler.AdmitLane(context.Background(), 0, 1, "trace"); err == nil {
-		t.Fatal("admission continued while coordination store failed")
-	}
-}
-
-func TestConcurrentSchedulersConvergeOnOneAuthoritativeDispatch(t *testing.T) {
-	candidate := fixtureCandidates("project", 1, ResourceBuiltin)[0]
-	authority := &fakeAuthority{snapshot: AuthoritySnapshot{Candidates: []Candidate{candidate}}}
-	stores := []*memoryStore{
-		{paused: false, candidates: map[int][]Candidate{}, credits: map[int][]PlannedAdmission{}},
-		{paused: false, candidates: map[int][]Candidate{}, credits: map[int][]PlannedAdmission{}},
-	}
-	lane, _ := LaneFor(candidate.ProjectID, 8)
-	for _, store := range stores {
-		store.candidates[lane] = []Candidate{candidate}
-		store.credits[lane] = []PlannedAdmission{{ProjectID: candidate.ProjectID, ResourceClass: candidate.ResourceClass}}
-	}
-	var wait sync.WaitGroup
-	for _, store := range stores {
-		wait.Add(1)
-		go func(store *memoryStore) {
-			defer wait.Done()
-			scheduler := newFakeScheduler(t, authority, store, 1)
-			_, _ = scheduler.AdmitLane(context.Background(), lane, 1, "trace")
-		}(store)
-	}
-	wait.Wait()
-	if authority.dispatch[candidate.NodeRunID] != 1 {
-		t.Fatalf("dispatches=%v", authority.dispatch)
-	}
-}
-
-func TestMergeReservationsDeduplicatesAttemptAndExcludesReservedCandidate(t *testing.T) {
-	candidate := fixtureCandidates("project", 1, ResourceBuiltin)[0]
-	value := Inflight{AttemptID: "attempt", ProjectID: "project", ResourceClass: ResourceBuiltin}
-	lane, _ := LaneFor("project", 8)
-	merged, keep, renew := mergeReservations(AuthoritySnapshot{Candidates: []Candidate{candidate}, Inflight: []Inflight{value}}, []Reservation{
-		{AttemptID: "attempt", ProjectID: "project", Lane: lane, ResourceClass: ResourceBuiltin, Candidate: candidate},
-		{AttemptID: "reserved", ProjectID: "project", Lane: lane, ResourceClass: ResourceBuiltin, Candidate: candidate},
-	}, 8)
-	if len(merged.Inflight) != 2 || len(merged.Candidates) != 0 || len(keep[lane]) != 2 || len(renew[lane]) != 1 {
-		t.Fatalf("merged=%+v keep=%v renew=%v", merged, keep, renew)
-	}
-}
-
-func TestSchedulerValidatesPublicContractsAndRoutingPolicy(t *testing.T) {
-	router := BuiltinV1Router()
-	for coordinate, want := range map[dsl.Coordinate]ResourceClass{
-		{Type: "task.python", Version: 1}: ResourceSandbox,
-		{Type: "task.http", Version: 1}:   ResourceBuiltin,
-		{Type: "task.rpc", Version: 1}:    ResourceBuiltin,
-	} {
-		if got, exists := router.Resolve(coordinate); !exists || got != want {
-			t.Fatalf("route %v=%s,%v", coordinate, got, exists)
-		}
-	}
-	if _, exists := router.Resolve(dsl.Coordinate{Type: "unknown", Version: 1}); exists {
-		t.Fatal("unknown operation was routed")
-	}
-	if err := (Candidate{}).Validate(); err == nil {
-		t.Fatal("invalid candidate accepted")
-	}
-	if _, err := LaneFor("", 3); err == nil {
-		t.Fatal("invalid lane dimensions accepted")
-	}
-	if _, _, err := DispatchWindows(Capacity{Pools: map[ResourceClass]int{"unknown": 1}}, 1); err == nil {
-		t.Fatal("invalid capacity accepted")
-	}
-	if _, _, err := DispatchWindows(Capacity{}, 0.5); err == nil {
-		t.Fatal("invalid buffer factor accepted")
-	}
-	builtin := RequiredCapabilities(ResourceBuiltin)
-	if len(builtin) != 2 || builtin[0].Type != "task.http" || builtin[1].Type != "task.rpc" {
-		t.Fatalf("builtin capabilities=%v", builtin)
-	}
-	if CapabilityFingerprint(ResourceBuiltin) == "" || CapabilityFingerprint(ResourceBuiltin) == CapabilityFingerprint(ResourceSandbox) {
-		t.Fatal("resource-class capability fingerprints are not stable and distinct")
-	}
-	registration := WorkerRegistration{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: ResourceBuiltin, Slots: 2, Capabilities: builtin, TTL: time.Minute}
-	if err := registration.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	registration.Capabilities = builtin[:1]
-	if err := registration.Validate(); err == nil {
-		t.Fatal("partial resource-class capability set accepted")
-	}
-	if _, err := CreditBatches(nil, 0); err == nil {
-		t.Fatal("invalid credit batch accepted")
-	}
-	if _, err := BoundWindows(Windows{}, Windows{Global: -1}, 0.1); err == nil {
-		t.Fatal("invalid window accepted")
-	}
-	if _, err := New(nil, nil, nil, nil, nil, "", Settings{}); err == nil {
-		t.Fatal("missing scheduler dependencies accepted")
-	}
-}
-
-func TestSchedulerRebalancePropagatesCapacityAndAuthorityFailures(t *testing.T) {
-	authority := &fakeAuthority{snapshot: fixtureSnapshot(1, 2, ResourceBuiltin)}
-	store := &memoryStore{}
-	provider := &changingCapacity{capacity: Capacity{Pools: map[ResourceClass]int{ResourceBuiltin: 2}}, err: errors.New("capacity unavailable")}
-	settings := Settings{LaneCount: 8, CreditGrantBatch: 4, CandidateBatch: 8, AdmissionConcurrency: 2, Epoch: time.Second, ActiveProjectTTL: 5 * time.Second, BalancerLease: 2 * time.Second, ReservationTTL: time.Minute, DispatchBufferFactor: 1, CapacityChangeLimit: 0.1}
-	scheduler, err := New(authority, store, provider, &sequenceIDs{}, clock.NewFake(time.Now()), "scheduler", settings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = scheduler.Rebalance(context.Background()); err == nil {
-		t.Fatal("capacity failure hidden")
-	}
-	provider.err = nil
-	authority.err = errors.New("authority unavailable")
-	if _, err = scheduler.Rebalance(context.Background()); err == nil {
-		t.Fatal("authority failure hidden")
-	}
-}
-
-func TestAdmissionRestoresReservationOnIdentityFailure(t *testing.T) {
-	candidate := fixtureCandidates("project", 1, ResourceBuiltin)[0]
-	lane, _ := LaneFor(candidate.ProjectID, 8)
-	store := &memoryStore{candidates: map[int][]Candidate{lane: {candidate}}, credits: map[int][]PlannedAdmission{lane: {{ProjectID: candidate.ProjectID, ResourceClass: candidate.ResourceClass}}}}
-	settings := Settings{LaneCount: 8, CreditGrantBatch: 4, CandidateBatch: 8, AdmissionConcurrency: 1, Epoch: time.Second, ActiveProjectTTL: 5 * time.Second, BalancerLease: 2 * time.Second, ReservationTTL: time.Minute, DispatchBufferFactor: 1, CapacityChangeLimit: 0.1}
-	scheduler, err := New(&fakeAuthority{}, store, FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: 1}}, failingIDs{err: errors.New("identity failed")}, clock.NewFake(time.Now()), "scheduler", settings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = scheduler.AdmitLane(context.Background(), lane, 1, "trace"); err == nil {
-		t.Fatal("identity failure hidden")
-	}
-	if len(store.candidates[lane]) != 1 || len(store.credits[lane]) != 1 || len(store.reservations) != 0 {
-		t.Fatalf("reservation was not restored: candidates=%d credits=%d reservations=%d", len(store.candidates[lane]), len(store.credits[lane]), len(store.reservations))
-	}
-}
-
-func TestAdmissionPreservesProjectOrderAndRestoresUndispatchedTail(t *testing.T) {
-	candidates := fixtureCandidates("project", 3, ResourceBuiltin)
-	lane, _ := LaneFor("project", 8)
-	store := &memoryStore{
-		candidates: map[int][]Candidate{lane: append([]Candidate(nil), candidates...)},
-		credits: map[int][]PlannedAdmission{lane: {
-			{ProjectID: "project", ResourceClass: ResourceBuiltin},
-			{ProjectID: "project", ResourceClass: ResourceBuiltin},
-			{ProjectID: "project", ResourceClass: ResourceBuiltin},
-		}},
-	}
-	authority := &fakeAuthority{failNode: candidates[1].NodeRunID}
-	scheduler := newFakeScheduler(t, authority, store, 3)
-	tasks, err := scheduler.AdmitLane(context.Background(), lane, 3, "trace")
-	if err == nil || len(tasks) != 1 {
-		t.Fatalf("tasks=%v err=%v", tasks, err)
-	}
-	if authority.dispatch[candidates[0].NodeRunID] != 1 || authority.dispatch[candidates[2].NodeRunID] != 0 {
-		t.Fatalf("out-of-order dispatch=%v", authority.dispatch)
-	}
-	if len(store.candidates[lane]) != 2 || store.candidates[lane][0].NodeRunID != candidates[1].NodeRunID || store.candidates[lane][1].NodeRunID != candidates[2].NodeRunID {
-		t.Fatalf("restored candidates=%v", store.candidates[lane])
-	}
-}
-
-func TestSchedulerServiceLifecycleAndFailClosedRetry(t *testing.T) {
-	store := &memoryStore{fail: errors.New("redis unavailable")}
-	scheduler := newFakeScheduler(t, &fakeAuthority{}, store, 1)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if _, err := NewService(nil, "", nil); err == nil {
-		t.Fatal("invalid scheduler service accepted")
-	}
-	service, err := NewService(scheduler, "trace", logger)
-	if err != nil || service.Name() != "project-fair-scheduler" {
-		t.Fatalf("service=%v err=%v", service, err)
+	service, err := NewService(scheduler, "trace", slog.Default())
+	if err != nil || service.Name() != "fifo-topic-window-scheduler" {
+		t.Fatalf("service=%+v err=%v", service, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- service.Run(ctx) }()
-	time.Sleep(10 * time.Millisecond)
 	cancel()
-	if err = <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("service stop=%v", err)
+	if err = service.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("service exit=%v", err)
 	}
 	if err = service.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestSchedulerValidatesSettingsAndAdmissionCoordinates(t *testing.T) {
-	settings := Settings{LaneCount: 3, CreditGrantBatch: 0}
-	if err := settings.Validate(); err == nil {
-		t.Fatal("invalid settings accepted")
-	}
-	scheduler := newFakeScheduler(t, &fakeAuthority{}, &memoryStore{}, 1)
-	for _, call := range []struct {
-		lane  int
-		limit int
-		trace string
-	}{{-1, 1, "trace"}, {0, 0, "trace"}, {0, 9, "trace"}, {0, 1, ""}} {
-		if _, err := scheduler.AdmitLane(context.Background(), call.lane, call.limit, call.trace); err == nil {
-			t.Fatalf("invalid admission accepted: %+v", call)
-		}
-	}
-	service, _ := NewService(scheduler, "trace", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err := service.Shutdown(context.Background()); err != nil {
+	unused, _ := NewService(scheduler, "trace", slog.Default())
+	if err = unused.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestParallelLaneOperationsAreBoundedAndPropagateFailure(t *testing.T) {
-	var mutex sync.Mutex
-	active, maximum := 0, 0
-	err := parallelLanes(context.Background(), 12, 3, func(index int) error {
-		mutex.Lock()
-		active++
-		maximum = max(maximum, active)
-		mutex.Unlock()
-		time.Sleep(time.Millisecond)
-		mutex.Lock()
-		active--
-		mutex.Unlock()
-		if index == 7 {
-			return errors.New("lane failed")
-		}
-		return nil
-	})
-	if err == nil || maximum > 3 {
-		t.Fatalf("err=%v maximum=%d", err, maximum)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err = parallelLanes(ctx, 2, 1, func(int) error { return nil }); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled lanes=%v", err)
-	}
-}
-
-func newFakeScheduler(t *testing.T, authority Authority, store CoordinationStore, window int) *Scheduler {
-	t.Helper()
-	settings := Settings{LaneCount: 8, CreditGrantBatch: 4, CandidateBatch: 8, AdmissionConcurrency: 4, Epoch: time.Second, ActiveProjectTTL: 5 * time.Second, BalancerLease: 2 * time.Second, ReservationTTL: time.Minute, DispatchBufferFactor: 1, CapacityChangeLimit: 0.1}
-	scheduler, err := New(authority, store, FixedCapacity{Pools: map[ResourceClass]int{ResourceBuiltin: window}}, &sequenceIDs{}, clock.NewFake(time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)), "scheduler", settings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return scheduler
 }

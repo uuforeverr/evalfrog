@@ -18,6 +18,7 @@ func TestRegistryExposesBuildMetric(t *testing.T) {
 	registry.ObservePostgresPoolAcquire(time.Millisecond, "success")
 	registry.ObserveExecutionContextCache("snapshot", "hit")
 	registry.ObserveSchedulingRedisRebuild("success")
+	registry.ObserveTopicQueue("builtin", 10, 3, 2.5)
 	registry.ObserveRecoveryWakeup("retry-timer", "retry.due", "emitted")
 	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	response := httptest.NewRecorder()

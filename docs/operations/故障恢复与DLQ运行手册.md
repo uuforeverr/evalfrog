@@ -18,7 +18,8 @@
 | `evalfrog_outbox_oldest_unpublished_age_seconds` | Runtime + Node Task Outbox | Relay、Kafka 连接、Outbox Claim/Publish | Relay 重启后至少一次发布，Consumer Inbox 收敛重复 |
 | `evalfrog_kafka_consumer_lag_records` | Kafka Group/Topic offset | Consumer 健康、partition/rebalance、Worker Slot | 恢复消费后 Lag 下降；Offset 不代表 Run 成功 |
 | `evalfrog_attempt_lease_lost_total` | PostgreSQL Lease Reaper | Worker 崩溃、Heartbeat、执行时长、网络 | Lost → Engine 的独立 Recovery Budget；旧结果被 Fencing 拒绝 |
-| `evalfrog_ready_to_queued_seconds` | PostgreSQL ready/dispatch 时间 | Scheduler Credit、Dispatch Window、Redis Lane、Worker 容量 | Scheduling Redis 重建完成后恢复准入 |
+| `evalfrog_ready_to_queued_seconds` | PostgreSQL ready/dispatch 时间 | 最老时间桶、Topic Window/Occupancy、Redis 内存、Worker 完成速率 | Scheduling Redis 校准或重建后恢复准入 |
+| `evalfrog_scheduler_topic_queue_window` / `occupancy` | Scheduling Redis 派生计数 | Worker Completion EWMA、Claim 回调、Queued 权威事实 | Claim 释放 Topic 空位；低频 PostgreSQL 校准修复漂移 |
 | `evalfrog_scheduling_redis_rebuild_total` | Scheduler 重建结果 | Redis 可用性/内存策略/连接 | 失败继续 Fail Closed，不允许深度预派发 |
 | `evalfrog_runtime_recovery_wakeups_total` | Recovery Scanner/Emitter | 条件是否仍 actionable、扫描器日志、Outbox | 重复 wake-up 由 cooldown、Inbox 与 CAS 收敛 |
 
@@ -56,7 +57,7 @@ Replay 只能选择 `run.created`、`run.cancel_requested`、`attempt.completed`
 
 ### Scheduling Redis 丢失
 
-保持新准入暂停。Scheduler 必须先从 PostgreSQL 的 queued/running Attempt 重建 Lane、Credit、Reservation 后才 Activate；此期间已运行 Attempt 仍可通过 Lease/Completion 正常收敛。不要使用 Cache Redis 或人工写 Redis Key 代替重建。
+保持新准入暂停。Scheduler 必须从 PostgreSQL Ready、Queued/Running Attempt 重建新的 Redis Generation：Queued 恢复 Topic Occupancy，Queued+Running 恢复 Project Load；不存在 PostgreSQL 事实的短 Reservation 失效。重建完成后才恢复持续准入，此期间已运行 Attempt 仍可通过 Lease/Completion 正常收敛。不要使用 Cache Redis 或人工写 Redis Key 代替重建。
 
 ### Cache Redis 全量清空
 

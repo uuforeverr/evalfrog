@@ -4,7 +4,7 @@
 
 EvalFrog 是一个同时面向 Human Web 与 Agent CLI 的企业级 Workflow Platform。它的目标不是在第一阶段提供大量节点和外围功能，而是先建立一个边界清晰、可恢复、可追踪、可以长期演进的 Workflow 核心。
 
-当前状态：**M0-M11 已完成；M12 Release Candidate 验收进行中**。Agent CLI 与 Human Web 已通过同一 External API 跑通 IR 编辑、Draft Test、Publish、Production Run、Status、Cancel、Source Map 错误回映，以及可恢复的 Runtime 观测与故障恢复闭环。M12 已加入连接池/缓存容量指标、可达依赖扫描、Sandbox Runtime Controller 与零信任部署断言；GitHub Runner 上的真实 `runsc` Containment Probe 与 1,000 次生命周期压力也已通过。但目标环境容量报告、最终不可变镜像扫描，以及目标环境的恢复/网络策略演练尚未完成，因此当前只能称为 Product Core Loop Ready / Release Candidate，不能称为 Production Ready。验收方法见 [发布与容量验收手册](./docs/operations/发布与容量验收手册.md)。
+当前状态：**M0-M11 已完成；M12 Release Candidate 验收进行中**。Agent CLI 与 Human Web 已通过同一 External API 跑通 IR 编辑、Draft Test、Publish、Production Run、Status、Cancel、Source Map 错误回映，以及可恢复的 Runtime 观测与故障恢复闭环。M12 已加入连接池/缓存容量指标、可达依赖扫描、Sandbox Runtime Controller 与零信任部署断言；Engine/Scheduler/Kafka/Worker 高并发闭环重构已通过本地 Unit/Race/覆盖率、真实依赖集成和完整 Compose E2E，GitHub Runner 上的真实 `runsc` Containment Probe 与 1,000 次生命周期压力也已通过。但目标环境容量报告、最终不可变镜像扫描，以及目标环境的恢复/网络策略演练尚未完成，因此当前只能称为 Product Core Loop Ready / Release Candidate，不能称为 Production Ready。验收方法见 [发布与容量验收手册](./docs/operations/发布与容量验收手册.md)。
 
 ## 为什么是 EvalFrog
 
@@ -153,18 +153,18 @@ M5 已将 M4 Aggregate 映射到真实 PostgreSQL 权威状态与可恢复事件
 
 M5 定义的 Runtime Event DTO 与 Publisher Port 已在 M7 接入真实 Kafka；M6 的 `ready → queued + Attempt + Node Task Outbox` 也已通过 Task Relay 进入 Worker 链路。
 
-## M6 Project 公平 Scheduler
+## FIFO Topic Window Scheduler
 
-M6 已把 Scheduler 作为 Control Plane 内独立逻辑模块接入生产生命周期：
+Scheduler 已按企业内部短工作流的真实负载重构为持续准入闭环：
 
-- 公平身份只有 `project_id`，跨 Project 使用等权 Max-Min，低需求释放的容量可被其他 Project 借用；
-- Project 内严格按 `priority DESC, ready_at ASC, node_run_id ASC`；固定 Lane 使用稳定 FNV-1a Hash；
-- Credit Balancer 通过 Redis Lease/Fencing 单实例计算额度，所有 Scheduler 实例均可消费共享 Lane Credit；
-- Ready Hash、Active Project、Project Credit、Grant Queue、Inflight Reservation 全部使用 Lane Hash Tag 共槽并由 Lua 原子操作；
-- Global/Pool Dispatch Window 来源于健康槽位和 Buffer Factor，每 Epoch 的容量变化受共享 Window State 限幅；
-- PostgreSQL 对每个 Active Project 最多读取一个 Dispatch Window 的有序候选，既避免把完整 Ready 队列搬入 Control Plane，也保留低需求项目释放容量后的借用能力；
+- `ready_at` 截断为一秒时间桶，先按时间桶 FIFO；同桶内才比较跨 Builtin/Sandbox 的 `Project Load` 与最近准入序号；
+- 同一 Project、同一时间桶内按 `priority DESC, ready_at ASC, node_run_id ASC`；后来低负载 Project 不能越过更早时间桶；
+- Builtin/Sandbox 分别维护 Topic Queue Window，窗口由 Worker 最近实际完成速率 EWMA 乘约五秒缓冲计算，不使用 Worker Slot 分额度；
+- Topic Occupancy 只包含未确认 Reservation 与 Queued Attempt；Claim 后释放 Topic 空位，终态释放 Project Load；
+- Scheduling Redis 使用一个同槽逻辑分片和 Lua 原子维护 Ready、Project Load、Topic Occupancy、Reservation 与紧凑 Inflight，不再使用 Lane/Credit/每秒 Epoch；
+- Engine 提交后尽力登记新 Ready；Scheduler 持续准入、每五秒校准容量，并按 15～30 秒 Profile 周期或故障恢复需要从 PostgreSQL 重建 Generation、修复漏写和计数漂移；
 - PostgreSQL 事务原子完成 `ready → queued + Attempt + node_task_outbox`，数据库 CAS 是最终裁决；
-- Redis 为空、超时或丢失时暂停新准入，Balancer 从 PostgreSQL Ready/Queued/Running 重建后才重新开放。
+- Scheduling Redis 使用 `noeviction`、显式 `maxmemory` 和高/恢复水位；内存压力下停止扩充候选但继续排空，Redis 丢失后从 PostgreSQL Ready/Queued/Running 重建。
 
 M6 的 `node_task_outbox` 是 M7 Kafka Task Relay 的可靠输入；公平准入仍在 Kafka 之前完成，Kafka 不重新排序 Project。
 
@@ -177,7 +177,7 @@ M7 已跑通 `Scheduler Outbox → Kafka → Worker → Attempt Coordinator → 
 - 通用 Worker Runtime 只在本地 Slot 空闲时 Poll；数据库 Claim 成功后立即 ACK，执行和 ACK 解耦，Worker 崩溃由 Lease Reaper 标记 Lost；
 - Claim/Heartbeat/Complete/LoadExecutionContext 使用版本化内部 HTTP/JSON API，Worker 镜像和依赖规则均不包含 PostgreSQL Client；
 - Execution Context Gateway 只读装配不可变 Operation、Run Input、Resolved Input 与 Effective Upstream Output；Cache Redis Hit/Miss/Timeout/坏值均回源 PostgreSQL；Context 基础设施故障由 Lease Recovery 接管，不消耗业务重试；
-- Worker 启动和注册必须提供 Resource Class 完整能力集，Scheduling Redis 只统计匹配当前能力指纹且 TTL 有效的 Slot；
+- Worker 启动和注册必须提供 Resource Class 完整能力集；Scheduling Redis 保留带 TTL 的健康与能力登记供运维和 Claim 防线使用，但 Slot 不参与 Topic Queue Window 计算；
 - Kafka Consumer 在 `Poll → Claim/Inbox → ACK` 短窗口内阻塞 Rebalance，ACK 后立即释放，节点长时间执行不会阻塞分区再均衡；
 - 真实 PostgreSQL、Scheduling Redis、故障 Cache Redis 与 Kafka 集成测试验证两个 Control Plane API 副本、两个 Worker/Engine Consumer 副本、重复投递、Lease 过期、Lost/Recovery 和旧 Fencing Result 拒绝。
 
@@ -232,7 +232,7 @@ CLI 可以上传 IR，并下载平台生成的 DSL、Source Map 和诊断；不�
 ### 数据职责
 
 - PostgreSQL：Definition、Runtime、Output、Outbox/Inbox、权限与审计的唯一权威状态；
-- Scheduling Redis：Lane、Credit、Ready Index、Inflight Reservation，可从 PostgreSQL 重建；
+- Scheduling Redis：FIFO Ready Index、Project Load、Topic Window/Occupancy、Reservation 与紧凑 Inflight，可从 PostgreSQL 重建；
 - Cache Redis：Execution Snapshot、Run Context、Effective Output、Run Read Model，Cache Miss 时回源；
 - Kafka：Builtin Task、Sandbox Task、Runtime Event 的至少一次传输，不承担权威状态。
 
@@ -256,13 +256,12 @@ Code Sandbox 使用固定资源规格和 JSON Object 输入输出，不提供 Ne
 
 ## 调度与执行
 
-EvalFrog 不使用全局 FIFO。项目公平性的唯一身份是 `project_id`：
+EvalFrog 使用有界 Kafka 缓冲前的一秒时间桶 FIFO：
 
-- 竞争 Project 之间采用等权 Max-Min Fairness；
-- 空闲 Project 的额度可以被其他 Project 借用；
-- Project 内按 `priority DESC, ready_at ASC, node_run_id ASC` 稳定选择；
-- Kafka 前使用有界 Dispatch Window，禁止深度预派发；
-- Scheduling Redis 使用固定 Lane 和批量 Credit，数据库 CAS 是最终裁决。
+- 更早时间桶先执行，避免持续到来的小 Project 让大 Project 后继节点永久饥饿；
+- 同一秒内用 `Project Load` 打散并发突发，Load 相同按最近准入序号轮转；
+- Kafka 前只保留 Worker 约五秒实际完成能力对应的 Queued Task；
+- Scheduling Redis 原子预占，PostgreSQL CAS 是 `ready → queued` 的最终裁决。
 
 Worker 只有在本地执行槽可用时才领取 Task：
 

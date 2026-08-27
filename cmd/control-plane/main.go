@@ -117,6 +117,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 	)
 	store := postgres.NewStore(postgresClient.Pool())
 	store.SetRunViewInvalidator(cacheClient)
+	store.SetReadyRegistrar(schedulingClient)
 	accessService := access.NewService(store)
 	resourceResolver := resources.NewResolver(store, accessService)
 	definitionService := definition.NewBuiltinService(store, accessService, resourceResolver)
@@ -137,7 +138,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		return 1
 	}
 	server.Handle("/v1/", httpapi.New(accessService, application, cacheClient))
-	attemptCoordinator := attempt.NewBuiltinCoordinator(store)
+	attemptCoordinator := attempt.NewBuiltinCoordinator(store, schedulingClient)
 	contextGateway, err := runtimecontext.NewGateway(store, cacheClient,
 		configuration.Cache.ExecutionSnapshotTTL.Duration(), configuration.Cache.ActiveRunContextTTL.Duration(), metricRegistry)
 	if err != nil {
@@ -152,12 +153,28 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		return 1
 	}
 	projectScheduler, err := scheduling.New(store, schedulingClient,
-		schedulingClient, identity.UUIDv7Generator{}, clock.System{}, schedulerID, scheduling.Settings{
-			LaneCount: configuration.Scheduler.LaneCount, CreditGrantBatch: configuration.Scheduler.CreditGrantBatch,
-			CandidateBatch: configuration.Scheduler.RedisCandidateBatch, AdmissionConcurrency: configuration.Scheduler.AdmissionConcurrency,
-			Epoch: configuration.Scheduler.Epoch.Duration(), ActiveProjectTTL: configuration.Scheduler.ActiveProjectTTL.Duration(),
-			BalancerLease: configuration.Scheduler.ActiveProjectTTL.Duration(), ReservationTTL: configuration.Scheduler.InflightReservationTTL.Duration(),
-			DispatchBufferFactor: configuration.Scheduler.DispatchBufferFactor, CapacityChangeLimit: configuration.Scheduler.EpochCapacityChangeLimit,
+		identity.UUIDv7Generator{}, clock.System{}, schedulerID, scheduling.Settings{
+			CandidateBatch:              configuration.Scheduler.RedisCandidateBatch,
+			AdmissionConcurrency:        configuration.Scheduler.AdmissionConcurrency,
+			CapacityCalibrationInterval: configuration.Scheduler.CapacityCalibrationInterval.Duration(),
+			ReadyReconcileInterval:      configuration.Scheduler.ReadyReconcileInterval.Duration(),
+			ReconcileLease:              configuration.Scheduler.ReconcileLease.Duration(),
+			ReservationTTL:              configuration.Scheduler.ReservationTTL.Duration(),
+			IdlePoll:                    configuration.Scheduler.IdlePoll.Duration(), IdlePollMax: configuration.Scheduler.IdlePollMax.Duration(),
+			TopicWindow: scheduling.TopicWindowPolicy{
+				BufferDuration: configuration.Scheduler.TopicQueueBuffer.Duration(),
+				SampleInterval: configuration.Scheduler.CapacityCalibrationInterval.Duration(),
+				EWMAAlpha:      configuration.Scheduler.TopicEWMAAlpha,
+				Minimum: map[scheduling.ResourceClass]int{
+					scheduling.ResourceBuiltin: configuration.Scheduler.BuiltinMinQueue,
+					scheduling.ResourceSandbox: configuration.Scheduler.SandboxMinQueue,
+				},
+				Maximum: map[scheduling.ResourceClass]int{
+					scheduling.ResourceBuiltin: configuration.Scheduler.BuiltinMaxQueue,
+					scheduling.ResourceSandbox: configuration.Scheduler.SandboxMaxQueue,
+				},
+			},
+			Memory: scheduling.MemoryPolicy{HighWatermark: configuration.Scheduler.MemoryHighWatermark, ResumeWatermark: configuration.Scheduler.MemoryResumeWatermark},
 		}, metricRegistry)
 	if err != nil {
 		logger.Error("scheduler construction failed", "error", err)
@@ -204,7 +221,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("Kafka lag observer construction failed", "error", err)
 		return 1
 	}
-	engineConsumer, err := engine.NewConsumer(store)
+	engineConsumer, err := engine.NewConsumerWithConcurrency(store, configuration.Engine.MaxInflight)
 	if err != nil {
 		logger.Error("engine consumer construction failed", "error", err)
 		return 1

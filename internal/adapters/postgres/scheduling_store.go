@@ -22,30 +22,16 @@ func (store *Store) LoadSchedulingSnapshot(ctx context.Context, candidateWindow 
 	result := scheduling.AuthoritySnapshot{}
 	if candidateWindow > 0 {
 		rows, err := store.pool.Query(ctx, `
-			WITH active_projects AS (
-			  SELECT n.project_id
-			  FROM node_runs n
-			  JOIN workflow_runs r ON r.project_id=n.project_id AND r.run_id=n.run_id
-			  WHERE n.state='ready' AND r.state='running' AND r.termination_intent_json IS NULL
-			    AND r.deadline_at > clock_timestamp()
-			  GROUP BY n.project_id
-			)
-			SELECT candidate.project_id::text, candidate.run_id::text, candidate.node_run_id::text,
-			       candidate.execution_node_id, candidate.state_version, candidate.priority,
-			       candidate.ready_at, candidate.operation_type, candidate.operation_version,
-			       candidate.resource_class
-			FROM active_projects project
-			CROSS JOIN LATERAL (
-			  SELECT n.*
-			  FROM node_runs n
-			  JOIN workflow_runs r ON r.project_id=n.project_id AND r.run_id=n.run_id
-			  WHERE n.project_id=project.project_id AND n.state='ready'
-			    AND r.state='running' AND r.termination_intent_json IS NULL
-			    AND r.deadline_at > clock_timestamp()
-			  ORDER BY n.priority DESC, n.ready_at, n.node_run_id
-			  LIMIT $1
-			) candidate
-			ORDER BY candidate.project_id, candidate.priority DESC, candidate.ready_at, candidate.node_run_id`, candidateWindow)
+			SELECT n.project_id::text, n.run_id::text, n.node_run_id::text,
+			       n.execution_node_id, n.state_version, n.priority,
+			       n.ready_at, n.operation_type, n.operation_version,
+			       n.resource_class
+			FROM node_runs n
+			JOIN workflow_runs r ON r.project_id=n.project_id AND r.run_id=n.run_id
+			WHERE n.state='ready' AND r.state='running' AND r.termination_intent_json IS NULL
+			  AND r.deadline_at > clock_timestamp()
+			ORDER BY n.ready_at, n.project_id, n.node_run_id
+			LIMIT $1`, candidateWindow)
 		if err != nil {
 			return scheduling.AuthoritySnapshot{}, err
 		}
@@ -65,6 +51,7 @@ func (store *Store) LoadSchedulingSnapshot(ctx context.Context, candidateWindow 
 				return scheduling.AuthoritySnapshot{}, fmt.Errorf("operation %s@%d has no runtime routing policy", coordinate.Type, coordinate.Version)
 			}
 			candidate.ResourceClass = class
+			candidate = candidate.Normalized()
 			result.Candidates = append(result.Candidates, candidate)
 		}
 		if err = rows.Err(); err != nil {
@@ -74,7 +61,7 @@ func (store *Store) LoadSchedulingSnapshot(ctx context.Context, candidateWindow 
 		rows.Close()
 	}
 	rows, err := store.pool.Query(ctx, `
-		SELECT a.attempt_id::text, a.project_id::text,
+		SELECT a.attempt_id::text, a.project_id::text, a.state,
 		       n.operation_type, n.operation_version, n.resource_class
 		FROM node_attempts a
 		JOIN node_runs n ON n.project_id=a.project_id AND n.run_id=a.run_id AND n.node_run_id=a.node_run_id
@@ -86,9 +73,10 @@ func (store *Store) LoadSchedulingSnapshot(ctx context.Context, candidateWindow 
 	defer rows.Close()
 	for rows.Next() {
 		var value scheduling.Inflight
+		var state runtime.AttemptState
 		var coordinate dsl.Coordinate
 		var persistedClass scheduling.ResourceClass
-		if err = rows.Scan(&value.AttemptID, &value.ProjectID, &coordinate.Type, &coordinate.Version, &persistedClass); err != nil {
+		if err = rows.Scan(&value.AttemptID, &value.ProjectID, &state, &coordinate.Type, &coordinate.Version, &persistedClass); err != nil {
 			return scheduling.AuthoritySnapshot{}, err
 		}
 		class, exists := store.router.Resolve(coordinate)
@@ -96,6 +84,7 @@ func (store *Store) LoadSchedulingSnapshot(ctx context.Context, candidateWindow 
 			return scheduling.AuthoritySnapshot{}, fmt.Errorf("operation %s@%d has no runtime routing policy", coordinate.Type, coordinate.Version)
 		}
 		value.ResourceClass = class
+		value.QueueOccupied = state == runtime.AttemptQueued
 		result.Inflight = append(result.Inflight, value)
 	}
 	return result, rows.Err()

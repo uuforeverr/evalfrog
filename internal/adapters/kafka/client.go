@@ -195,6 +195,21 @@ func (client *Client) PublishRuntimeEvent(ctx context.Context, event eventing.Ru
 	return client.publish(ctx, client.configuration.Topics.RuntimeEvent, event.RunID, payload, nil)
 }
 
+func (client *Client) PublishRuntimeEvents(ctx context.Context, events []eventing.RuntimeEvent) []error {
+	requests := make([]publishRequest, len(events))
+	results := make([]error, len(events))
+	for index, event := range events {
+		payload, err := event.MarshalJSONMessage()
+		if err != nil {
+			results[index] = err
+			continue
+		}
+		requests[index] = publishRequest{topic: client.configuration.Topics.RuntimeEvent, key: event.RunID, payload: payload, valid: true}
+	}
+	client.publishBatch(ctx, requests, results)
+	return results
+}
+
 func (client *Client) PublishTask(ctx context.Context, message eventing.TaskMessage) error {
 	payload, err := message.MarshalJSONMessage()
 	if err != nil {
@@ -205,6 +220,57 @@ func (client *Client) PublishTask(ctx context.Context, message eventing.TaskMess
 		topic = client.configuration.Topics.SandboxTask
 	}
 	return client.publish(ctx, topic, message.AttemptID, payload, nil)
+}
+
+func (client *Client) PublishTasks(ctx context.Context, messages []eventing.TaskMessage) []error {
+	requests := make([]publishRequest, len(messages))
+	results := make([]error, len(messages))
+	for index, message := range messages {
+		payload, err := message.MarshalJSONMessage()
+		if err != nil {
+			results[index] = err
+			continue
+		}
+		topic := client.configuration.Topics.BuiltinTask
+		if message.ResourceClass == scheduling.ResourceSandbox {
+			topic = client.configuration.Topics.SandboxTask
+		}
+		requests[index] = publishRequest{topic: topic, key: message.AttemptID, payload: payload, valid: true}
+	}
+	client.publishBatch(ctx, requests, results)
+	return results
+}
+
+type publishRequest struct {
+	topic   config.KafkaTopicConfig
+	key     string
+	payload []byte
+	headers []kgo.RecordHeader
+	valid   bool
+}
+
+func (client *Client) publishBatch(ctx context.Context, requests []publishRequest, outcomes []error) {
+	records := make([]*kgo.Record, 0, len(requests))
+	indices := make([]int, 0, len(requests))
+	for index, request := range requests {
+		if !request.valid {
+			continue
+		}
+		if len(request.payload) == 0 || len(request.payload) > client.configuration.EnvelopeMaxBytes {
+			outcomes[index] = fmt.Errorf("Kafka envelope size must be in [1,%d]", client.configuration.EnvelopeMaxBytes)
+			continue
+		}
+		records = append(records, &kgo.Record{Topic: client.configuration.TopicPrefix + "." + request.topic.Name, Key: []byte(request.key), Value: request.payload, Headers: request.headers, Timestamp: time.Now().UTC()})
+		indices = append(indices, index)
+	}
+	if len(records) == 0 {
+		return
+	}
+	for resultIndex, result := range client.client.ProduceSync(ctx, records...) {
+		if result.Err != nil {
+			outcomes[indices[resultIndex]] = fmt.Errorf("publish Kafka record: %w", result.Err)
+		}
+	}
 }
 
 func (client *Client) publish(ctx context.Context, topic config.KafkaTopicConfig, key string, payload []byte, headers []kgo.RecordHeader) error {
@@ -222,6 +288,76 @@ type delivery struct {
 	owner   *Client
 	record  *kgo.Record
 	release sync.Once
+}
+
+type deliveryBatch struct {
+	owner   *Client
+	records []*kgo.Record
+	release sync.Once
+}
+
+func (client *Client) ReceiveBatch(ctx context.Context) (eventing.DeliveryBatch, error) {
+	client.deliveryMu.Lock()
+	defer client.deliveryMu.Unlock()
+	if client.outstanding {
+		return nil, fmt.Errorf("previous Kafka delivery is not settled")
+	}
+	for {
+		if len(client.pending) == 0 {
+			fetches := client.client.PollRecords(ctx, client.maxPoll)
+			if err := fetches.Err(); err != nil {
+				if retryErr := waitForConsumerRetry(ctx, err, consumerRetryBackoff); retryErr != nil {
+					return nil, fmt.Errorf("poll Kafka records: %w", retryErr)
+				}
+				continue
+			}
+			fetches.EachRecord(func(value *kgo.Record) { client.pending = append(client.pending, value) })
+		}
+		if len(client.pending) > 0 {
+			records := append([]*kgo.Record(nil), client.pending...)
+			client.pending = nil
+			client.outstanding = true
+			return &deliveryBatch{owner: client, records: records}, nil
+		}
+	}
+}
+
+func (batch *deliveryBatch) Messages() []eventing.BatchMessage {
+	result := make([]eventing.BatchMessage, len(batch.records))
+	for index, record := range batch.records {
+		result[index] = eventing.BatchMessage{Topic: record.Topic, Key: string(record.Key), Payload: append([]byte(nil), record.Value...)}
+	}
+	return result
+}
+
+func (batch *deliveryBatch) Nack() { batch.settle(false) }
+
+func (batch *deliveryBatch) Ack(ctx context.Context) error {
+	for {
+		err := batch.owner.client.CommitRecords(ctx, batch.records...)
+		if err == nil {
+			batch.settle(true)
+			return nil
+		}
+		if retryErr := waitForConsumerRetry(ctx, err, consumerRetryBackoff); retryErr != nil {
+			batch.settle(false)
+			return fmt.Errorf("commit Kafka record batch: %w", retryErr)
+		}
+	}
+}
+
+func (batch *deliveryBatch) DeadLetter(ctx context.Context, index int, reason string) error {
+	if index < 0 || index >= len(batch.records) {
+		return fmt.Errorf("dead-letter batch index is out of range")
+	}
+	record := batch.records[index]
+	metadata, _ := json.Marshal(map[string]any{"source_topic": record.Topic, "partition": record.Partition, "offset": record.Offset, "reason": reason})
+	headers := []kgo.RecordHeader{{Key: "evalfrog-dead-letter", Value: metadata}}
+	return batch.owner.publish(ctx, batch.owner.configuration.Topics.DLQ, string(record.Key), record.Value, headers)
+}
+
+func (batch *deliveryBatch) settle(success bool) {
+	batch.release.Do(func() { batch.owner.finishDelivery(success) })
 }
 
 func (client *Client) Receive(ctx context.Context) (eventing.Delivery, error) {
@@ -342,5 +478,8 @@ func (value *delivery) DeadLetter(ctx context.Context, reason string) error {
 }
 
 var _ eventing.MessagePublisher = (*Client)(nil)
+var _ eventing.BatchMessagePublisher = (*Client)(nil)
 var _ eventing.TaskPublisher = (*Client)(nil)
+var _ eventing.BatchTaskPublisher = (*Client)(nil)
 var _ eventing.Consumer = (*Client)(nil)
+var _ eventing.BatchConsumer = (*Client)(nil)

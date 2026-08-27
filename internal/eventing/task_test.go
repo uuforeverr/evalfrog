@@ -62,6 +62,18 @@ func TestTaskRelayIsAtLeastOnce(t *testing.T) {
 	}
 }
 
+func TestTaskRelayBatchMarksAndReleasesPartialKafkaResults(t *testing.T) {
+	first, second := testTask(), testTask()
+	first.TaskID, second.TaskID = "task-1", "task-2"
+	repository := &batchFakeTaskOutbox{fakeTaskOutbox: fakeTaskOutbox{claimed: []ClaimedTask{{Message: first, ClaimToken: "claim-1"}, {Message: second, ClaimToken: "claim-2"}}}}
+	publisher := &batchFakeTaskPublisher{outcomes: []error{errors.New("first failed"), nil}}
+	relay, _ := NewTaskRelay(repository, publisher, "owner", 2, time.Second, time.Millisecond)
+	count, err := relay.RelayOnce(context.Background())
+	if count != 1 || err == nil || len(repository.batchMarked) != 1 || repository.batchMarked[0].ID != second.TaskID || len(repository.batchReleased) != 1 || repository.batchReleased[0].ID != first.TaskID {
+		t.Fatalf("count=%d err=%v marked=%+v released=%+v", count, err, repository.batchMarked, repository.batchReleased)
+	}
+}
+
 type fakeTaskOutbox struct {
 	claimed          []ClaimedTask
 	marked, released int
@@ -82,6 +94,27 @@ func (value *fakeTaskOutbox) ReleaseTaskOutboxClaim(context.Context, string, str
 type fakeTaskPublisher struct{ err error }
 
 func (value *fakeTaskPublisher) PublishTask(context.Context, TaskMessage) error { return value.err }
+
+type batchFakeTaskOutbox struct {
+	fakeTaskOutbox
+	batchMarked, batchReleased []ClaimedIdentity
+}
+
+func (repository *batchFakeTaskOutbox) MarkTaskOutboxPublishedBatch(_ context.Context, values []ClaimedIdentity) error {
+	repository.batchMarked = append(repository.batchMarked, values...)
+	return nil
+}
+func (repository *batchFakeTaskOutbox) ReleaseTaskOutboxClaimsBatch(_ context.Context, values []ClaimedIdentity, _ time.Duration) error {
+	repository.batchReleased = append(repository.batchReleased, values...)
+	return nil
+}
+
+type batchFakeTaskPublisher struct{ outcomes []error }
+
+func (*batchFakeTaskPublisher) PublishTask(context.Context, TaskMessage) error { return nil }
+func (publisher *batchFakeTaskPublisher) PublishTasks(context.Context, []TaskMessage) []error {
+	return publisher.outcomes
+}
 
 func testTask() TaskMessage {
 	return TaskMessage{MessageVersion: 1, TaskID: "task", ProjectID: "project", RunID: "run", NodeRunID: "node-run", ExecutionNodeID: "node", AttemptID: "attempt", AttemptSequence: 1, ResourceClass: scheduling.ResourceSandbox, OccurredAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), TraceID: "trace"}

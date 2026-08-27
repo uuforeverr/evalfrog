@@ -37,10 +37,10 @@ services:
 
   redis-scheduling:
     image: redis:7.4.2-alpine
-    # Lane/Credit/Reservation are derived coordination state. Persisting them
+    # Ready/Load/Topic/Reservation/Inflight are derived coordination state. Persisting them
     # creates disk-fsync stalls without improving recovery: Control Plane
     # deliberately fails closed and rebuilds them from PostgreSQL instead.
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     ports:
       - "16379:6379"
     healthcheck:

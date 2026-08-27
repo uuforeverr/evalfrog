@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/uu999/evalfrog/internal/dsl"
@@ -15,6 +16,10 @@ const ConsumerName = "runtime-engine-v1"
 
 type TransactionManager interface {
 	WithRunTransaction(context.Context, eventing.RuntimeEvent, func(RunTransaction) error) error
+}
+
+type BatchTransactionManager interface {
+	WithRunBatchTransaction(context.Context, func(RunTransaction) error) error
 }
 
 type RunTransaction interface {
@@ -30,13 +35,18 @@ type RunTransaction interface {
 
 type Consumer struct {
 	transactions TransactionManager
+	maxInflight  int
 }
 
 func NewConsumer(transactions TransactionManager) (Consumer, error) {
-	if transactions == nil {
+	return NewConsumerWithConcurrency(transactions, 1)
+}
+
+func NewConsumerWithConcurrency(transactions TransactionManager, maxInflight int) (Consumer, error) {
+	if transactions == nil || maxInflight <= 0 {
 		return Consumer{}, fmt.Errorf("engine transaction manager is required")
 	}
-	return Consumer{transactions: transactions}, nil
+	return Consumer{transactions: transactions, maxInflight: maxInflight}, nil
 }
 
 func (consumer Consumer) Consume(ctx context.Context, event eventing.RuntimeEvent) error {
@@ -44,20 +54,95 @@ func (consumer Consumer) Consume(ctx context.Context, event eventing.RuntimeEven
 		return err
 	}
 	return consumer.transactions.WithRunTransaction(ctx, event, func(tx RunTransaction) error {
-		accepted, err := tx.AcceptInbox(ctx, ConsumerName, event)
-		if err != nil || !accepted {
+		return consumer.consumeInTransaction(ctx, tx, event)
+	})
+}
+
+func (consumer Consumer) consumeInTransaction(ctx context.Context, tx RunTransaction, event eventing.RuntimeEvent) error {
+	accepted, err := tx.AcceptInbox(ctx, ConsumerName, event)
+	if err != nil || !accepted {
+		return err
+	}
+	switch event.EventType {
+	case eventing.RunCreated:
+		return consumer.initialize(ctx, tx, event)
+	case eventing.AttemptCompleted, eventing.AttemptLost, eventing.RetryDue,
+		eventing.RunCancelRequested, eventing.RunDeadlineReached:
+		return consumer.advance(ctx, tx, event)
+	default:
+		return fmt.Errorf("runtime event type %q is unsupported by engine", event.EventType)
+	}
+}
+
+// ConsumeBatch groups a Kafka poll by Run. Events for one Run remain ordered
+// in one PostgreSQL transaction; different Runs execute with explicit bounded
+// concurrency so Kafka batch size never becomes database connection demand.
+func (consumer Consumer) ConsumeBatch(ctx context.Context, events []eventing.RuntimeEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	groups := make(map[string][]eventing.RuntimeEvent)
+	order := make([]string, 0)
+	for _, event := range events {
+		if err := event.Validate(); err != nil {
 			return err
 		}
-		switch event.EventType {
-		case eventing.RunCreated:
-			return consumer.initialize(ctx, tx, event)
-		case eventing.AttemptCompleted, eventing.AttemptLost, eventing.RetryDue,
-			eventing.RunCancelRequested, eventing.RunDeadlineReached:
-			return consumer.advance(ctx, tx, event)
-		default:
-			return fmt.Errorf("runtime event type %q is unsupported by engine", event.EventType)
+		if _, exists := groups[event.RunID]; !exists {
+			order = append(order, event.RunID)
 		}
-	})
+		groups[event.RunID] = append(groups[event.RunID], event)
+	}
+	jobs := make(chan []eventing.RuntimeEvent)
+	results := make(chan error, len(order))
+	workers := min(consumer.maxInflight, len(order))
+	var wait sync.WaitGroup
+	for index := 0; index < workers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for group := range jobs {
+				results <- consumer.consumeRunBatch(ctx, group)
+			}
+		}()
+	}
+	for _, runID := range order {
+		select {
+		case jobs <- groups[runID]:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			close(results)
+			return ctx.Err()
+		}
+	}
+	close(jobs)
+	wait.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (consumer Consumer) consumeRunBatch(ctx context.Context, events []eventing.RuntimeEvent) error {
+	if transactions, ok := consumer.transactions.(BatchTransactionManager); ok {
+		return transactions.WithRunBatchTransaction(ctx, func(tx RunTransaction) error {
+			for _, event := range events {
+				if err := consumer.consumeInTransaction(ctx, tx, event); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	for _, event := range events {
+		if err := consumer.Consume(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (consumer Consumer) initialize(ctx context.Context, tx RunTransaction, event eventing.RuntimeEvent) error {
@@ -114,9 +199,9 @@ func (consumer Consumer) initialize(ctx context.Context, tx RunTransaction, even
 		if failErr := failed.FailInitialization(failure, event.OccurredAt); failErr != nil {
 			return failErr
 		}
-		return tx.FailRunInitialization(ctx, runRecord, failed.Snapshot(), event.OccurredAt)
+		return tx.FailRunInitialization(ctx, runRecord, failed.Snapshot(), now)
 	}
-	return tx.InitializeRun(ctx, runRecord, instance.SnapshotState(), event.OccurredAt)
+	return tx.InitializeRun(ctx, runRecord, instance.SnapshotState(), now)
 }
 
 func (consumer Consumer) advancePendingDeadline(ctx context.Context, tx RunTransaction, event eventing.RuntimeEvent, before runtime.WorkflowRunRecord, at time.Time) error {
@@ -231,7 +316,7 @@ func (consumer Consumer) advance(ctx context.Context, tx RunTransaction, event e
 	if err != nil {
 		return err
 	}
-	return tx.AdvanceRun(ctx, before, instance.SnapshotState(), event.OccurredAt)
+	return tx.AdvanceRun(ctx, before, instance.SnapshotState(), now)
 }
 
 // cancelWinsDeadline turns two durable source facts into the first terminal

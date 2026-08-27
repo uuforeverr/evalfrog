@@ -100,6 +100,12 @@ type MessagePublisher interface {
 	PublishRuntimeEvent(context.Context, RuntimeEvent) error
 }
 
+// BatchMessagePublisher preserves one result per input message so a Relay can
+// mark only Kafka-acknowledged Outbox rows after a partially successful send.
+type BatchMessagePublisher interface {
+	PublishRuntimeEvents(context.Context, []RuntimeEvent) []error
+}
+
 type ClaimedEvent struct {
 	Event      RuntimeEvent
 	ClaimToken string
@@ -109,6 +115,16 @@ type OutboxRepository interface {
 	ClaimOutbox(context.Context, string, int, time.Duration) ([]ClaimedEvent, error)
 	MarkOutboxPublished(context.Context, string, string) error
 	ReleaseOutboxClaim(context.Context, string, string, time.Duration) error
+}
+
+type ClaimedIdentity struct {
+	ID         string
+	ClaimToken string
+}
+
+type BatchOutboxRepository interface {
+	MarkOutboxPublishedBatch(context.Context, []ClaimedIdentity) error
+	ReleaseOutboxClaimsBatch(context.Context, []ClaimedIdentity, time.Duration) error
 }
 
 type Relay struct {
@@ -134,20 +150,81 @@ func (relay Relay) RelayOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	published := 0
+	valid := make([]ClaimedEvent, 0, len(claimed))
+	failed := make([]ClaimedIdentity, 0)
+	var firstErr error
 	for _, message := range claimed {
 		if err := message.Event.Validate(); err != nil {
-			_ = relay.repository.ReleaseOutboxClaim(ctx, message.Event.EventID, message.ClaimToken, relay.retryDelay)
-			return published, err
+			failed = append(failed, ClaimedIdentity{ID: message.Event.EventID, ClaimToken: message.ClaimToken})
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
-		if err := relay.publisher.PublishRuntimeEvent(ctx, message.Event); err != nil {
-			_ = relay.repository.ReleaseOutboxClaim(ctx, message.Event.EventID, message.ClaimToken, relay.retryDelay)
-			return published, err
-		}
-		if err := relay.repository.MarkOutboxPublished(ctx, message.Event.EventID, message.ClaimToken); err != nil {
-			return published, err
-		}
-		published++
+		valid = append(valid, message)
 	}
-	return published, nil
+	outcomes := make([]error, len(valid))
+	if publisher, ok := relay.publisher.(BatchMessagePublisher); ok && len(valid) > 0 {
+		events := make([]RuntimeEvent, len(valid))
+		for index := range valid {
+			events[index] = valid[index].Event
+		}
+		outcomes = publisher.PublishRuntimeEvents(ctx, events)
+		if len(outcomes) != len(valid) {
+			return 0, fmt.Errorf("runtime batch publisher returned %d outcomes for %d messages", len(outcomes), len(valid))
+		}
+	} else {
+		for index := range valid {
+			outcomes[index] = relay.publisher.PublishRuntimeEvent(ctx, valid[index].Event)
+		}
+	}
+	succeeded := make([]ClaimedIdentity, 0, len(valid))
+	for index, outcome := range outcomes {
+		identity := ClaimedIdentity{ID: valid[index].Event.EventID, ClaimToken: valid[index].ClaimToken}
+		if outcome == nil {
+			succeeded = append(succeeded, identity)
+			continue
+		}
+		failed = append(failed, identity)
+		if firstErr == nil {
+			firstErr = outcome
+		}
+	}
+	if err = relay.markPublished(ctx, succeeded); err != nil {
+		return 0, err
+	}
+	if releaseErr := relay.releaseClaims(ctx, failed); releaseErr != nil && firstErr == nil {
+		firstErr = releaseErr
+	}
+	return len(succeeded), firstErr
+}
+
+func (relay Relay) markPublished(ctx context.Context, values []ClaimedIdentity) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if repository, ok := relay.repository.(BatchOutboxRepository); ok {
+		return repository.MarkOutboxPublishedBatch(ctx, values)
+	}
+	for _, value := range values {
+		if err := relay.repository.MarkOutboxPublished(ctx, value.ID, value.ClaimToken); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (relay Relay) releaseClaims(ctx context.Context, values []ClaimedIdentity) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if repository, ok := relay.repository.(BatchOutboxRepository); ok {
+		return repository.ReleaseOutboxClaimsBatch(ctx, values, relay.retryDelay)
+	}
+	for _, value := range values {
+		if err := relay.repository.ReleaseOutboxClaim(ctx, value.ID, value.ClaimToken, relay.retryDelay); err != nil {
+			return err
+		}
+	}
+	return nil
 }

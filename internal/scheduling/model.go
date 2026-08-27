@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"math"
 	"sort"
 	"time"
 
@@ -17,7 +15,8 @@ import (
 var (
 	ErrAdmissionPaused = errors.New("scheduling admission is paused")
 	ErrCandidateStale  = errors.New("ready candidate is stale")
-	ErrLeaseLost       = errors.New("credit balancer lease is lost")
+	ErrLeaseLost       = errors.New("scheduler reconciliation lease is lost")
+	ErrMemoryPressure  = errors.New("scheduling Redis is draining under memory pressure")
 )
 
 type ResourceClass string
@@ -25,7 +24,10 @@ type ResourceClass string
 const (
 	ResourceBuiltin ResourceClass = "builtin"
 	ResourceSandbox ResourceClass = "sandbox"
+	ReadyBucketSize               = time.Second
 )
+
+func ResourceClasses() []ResourceClass { return []ResourceClass{ResourceBuiltin, ResourceSandbox} }
 
 func (value ResourceClass) Valid() bool {
 	return value == ResourceBuiltin || value == ResourceSandbox
@@ -50,9 +52,6 @@ func BuiltinV1Router() StaticRouter {
 	}
 }
 
-// RequiredCapabilities returns the complete executor set for a first-phase
-// resource class. Pool members are deliberately homogeneous: Kafka may assign
-// any partition in a class topic to any member of its consumer group.
 func RequiredCapabilities(class ResourceClass) []dsl.Coordinate {
 	result := make([]dsl.Coordinate, 0, 2)
 	for coordinate, routedClass := range BuiltinV1Router() {
@@ -69,9 +68,6 @@ func RequiredCapabilities(class ResourceClass) []dsl.Coordinate {
 	return result
 }
 
-// CapabilityFingerprint lets a scheduler ignore stale workers from an older
-// routing-policy rollout. Validation prevents partial pools within one binary;
-// the fingerprint also keeps mixed-version rolling deployments fail-closed.
 func CapabilityFingerprint(class ResourceClass) string {
 	digest := sha256.New()
 	for _, coordinate := range RequiredCapabilities(class) {
@@ -80,6 +76,9 @@ func CapabilityFingerprint(class ResourceClass) string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
+// Candidate is a PostgreSQL-authoritative Ready node mirrored into Scheduling
+// Redis. ReadyBucket is derived from ReadyAt and persisted in Redis only so the
+// Lua hot path never has to parse timestamps.
 type Candidate struct {
 	ProjectID       string        `json:"project_id"`
 	RunID           string        `json:"run_id"`
@@ -88,20 +87,42 @@ type Candidate struct {
 	StateVersion    uint64        `json:"state_version"`
 	Priority        int           `json:"priority"`
 	ReadyAt         time.Time     `json:"ready_at"`
+	ReadyBucket     int64         `json:"ready_bucket"`
+	ReadyOrderKey   string        `json:"ready_order_key"`
 	ResourceClass   ResourceClass `json:"resource_class"`
+}
+
+func (candidate Candidate) Normalized() Candidate {
+	candidate.ReadyAt = candidate.ReadyAt.UTC()
+	candidate.ReadyBucket = candidate.ReadyAt.UnixMilli() / ReadyBucketSize.Milliseconds()
+	// PostgreSQL timestamps have microsecond precision. Keep the sortable value
+	// as a fixed-width string so Lua/cjson never rounds or rewrites it.
+	candidate.ReadyOrderKey = fmt.Sprintf("%020d", uint64(candidate.ReadyAt.UnixMicro())^(uint64(1)<<63))
+	return candidate
 }
 
 func (candidate Candidate) Validate() error {
 	if candidate.ProjectID == "" || candidate.RunID == "" || candidate.NodeRunID == "" || candidate.ExecutionNodeID == "" || candidate.StateVersion == 0 || candidate.ReadyAt.IsZero() || !candidate.ResourceClass.Valid() {
 		return fmt.Errorf("ready candidate identity, version, time and resource class are required")
 	}
+	normalized := candidate.Normalized()
+	if candidate.ReadyBucket != 0 && candidate.ReadyBucket != normalized.ReadyBucket {
+		return fmt.Errorf("ready candidate bucket does not match ready_at")
+	}
+	if candidate.ReadyOrderKey != "" && candidate.ReadyOrderKey != normalized.ReadyOrderKey {
+		return fmt.Errorf("ready candidate order key does not match ready_at")
+	}
 	return nil
 }
 
+// Inflight mirrors only the fields needed to reconstruct Project Load and
+// Topic Queue Occupancy. Running attempts retain Project Load but no longer
+// occupy the Kafka queue window.
 type Inflight struct {
-	AttemptID     string
-	ProjectID     string
-	ResourceClass ResourceClass
+	AttemptID     string        `json:"attempt_id"`
+	ProjectID     string        `json:"project_id"`
+	ResourceClass ResourceClass `json:"resource_class"`
+	QueueOccupied bool          `json:"queue_occupied"`
 }
 
 type AuthoritySnapshot struct {
@@ -132,82 +153,97 @@ type Task struct {
 }
 
 type Authority interface {
-	// LoadSchedulingSnapshot returns at most candidateWindow ordered Ready
-	// candidates per active project. The per-project bound preserves idle
-	// borrowing even when one project is the only source of remaining demand.
+	// candidateWindow bounds one reconciliation read. When more Ready rows
+	// exist, subsequent reconciliations refill Redis after the oldest rows drain.
 	LoadSchedulingSnapshot(context.Context, int) (AuthoritySnapshot, error)
 	DispatchReady(context.Context, DispatchCommand) (Task, error)
 }
 
-type BalancerLease struct {
+type ReconcileLease struct {
 	Owner        string
 	Token        string
 	FencingToken uint64
 	ExpiresAt    time.Time
 }
 
-type LaneState struct {
-	Lane              int
-	Candidates        []Candidate
-	Inflight          []Inflight
-	KeepReservations  map[string]struct{}
-	RenewReservations map[string]struct{}
-}
-
-type PlannedAdmission struct {
-	ProjectID     string
-	ResourceClass ResourceClass
-}
-
-type LanePlan struct {
-	Lane       int
-	Candidates []Candidate
-	Inflight   []Inflight
-	Admissions []PlannedAdmission
-}
-
-type Plan struct {
-	Epoch           uint64
-	GlobalWindow    int
-	PoolWindows     map[ResourceClass]int
-	Lanes           []LanePlan
-	TotalAdmissions int
-}
-
-type Windows struct {
-	Global int
-	Pools  map[ResourceClass]int
-}
-
 type Reservation struct {
 	AttemptID     string        `json:"attempt_id"`
 	ProjectID     string        `json:"project_id"`
-	Lane          int           `json:"lane"`
 	ResourceClass ResourceClass `json:"resource_class"`
 	Candidate     Candidate     `json:"candidate"`
-	Confirmed     bool          `json:"confirmed"`
-	Epoch         string        `json:"epoch"`
+}
+
+type TopicWindowPolicy struct {
+	BufferDuration time.Duration
+	SampleInterval time.Duration
+	EWMAAlpha      float64
+	Minimum        map[ResourceClass]int
+	Maximum        map[ResourceClass]int
+}
+
+func (policy TopicWindowPolicy) Validate() error {
+	if policy.BufferDuration <= 0 || policy.SampleInterval <= 0 || policy.EWMAAlpha <= 0 || policy.EWMAAlpha > 1 {
+		return fmt.Errorf("topic queue window timing and EWMA alpha are invalid")
+	}
+	for _, class := range ResourceClasses() {
+		minimum, minimumExists := policy.Minimum[class]
+		maximum, maximumExists := policy.Maximum[class]
+		if !minimumExists || !maximumExists || minimum <= 0 || maximum < minimum {
+			return fmt.Errorf("topic queue window bounds for %s are invalid", class)
+		}
+	}
+	return nil
+}
+
+type TopicState struct {
+	Window    int
+	Occupancy int
+	EWMA      float64
+}
+
+type ReconcileResult struct {
+	Generation     uint64
+	CandidateCount int
+	InflightCount  int
+	Topics         map[ResourceClass]TopicState
+}
+
+type MemoryPolicy struct {
+	HighWatermark   float64
+	ResumeWatermark float64
+}
+
+func (policy MemoryPolicy) Validate() error {
+	if policy.ResumeWatermark <= 0 || policy.HighWatermark <= policy.ResumeWatermark || policy.HighWatermark >= 1 {
+		return fmt.Errorf("scheduling Redis memory watermarks are invalid")
+	}
+	return nil
+}
+
+// ReadyRegistrar is a post-commit acceleration port. Failure must never roll
+// back an Engine transaction because PostgreSQL remains authoritative.
+type ReadyRegistrar interface {
+	RegisterReady(context.Context, []Candidate) error
+}
+
+// AttemptLifecycle closes Scheduling Redis accounting after authoritative
+// Attempt transactions. Implementations must be idempotent.
+type AttemptLifecycle interface {
+	MarkClaimed(context.Context, string) error
+	MarkTerminal(context.Context, string, bool) error
 }
 
 type CoordinationStore interface {
-	AcquireBalancerLease(context.Context, string, time.Duration) (BalancerLease, error)
-	BoundWindows(context.Context, BalancerLease, Windows, float64) (Windows, error)
-	PauseAdmissions(context.Context, BalancerLease, int) error
-	ListReservations(context.Context, int) ([]Reservation, error)
-	RebuildLane(context.Context, BalancerLease, LaneState, time.Duration, time.Duration) error
-	Grant(context.Context, BalancerLease, int, []PlannedAdmission) error
-	Activate(context.Context, BalancerLease, int, uint64) error
-	ReserveNext(context.Context, int, string, time.Duration) (Reservation, bool, error)
-	ConfirmReservation(context.Context, Reservation, time.Duration) error
+	ReadyRegistrar
+	AttemptLifecycle
+	AcquireReconcileLease(context.Context, string, time.Duration) (ReconcileLease, error)
+	RefreshMemoryPressure(context.Context, MemoryPolicy) (bool, error)
+	ListReservations(context.Context) ([]Reservation, error)
+	Rebuild(context.Context, ReconcileLease, AuthoritySnapshot, TopicWindowPolicy) (ReconcileResult, error)
+	CalibrateTopicWindows(context.Context, ReconcileLease, TopicWindowPolicy) (map[ResourceClass]TopicState, error)
+	ReserveNext(context.Context, ResourceClass, string, time.Duration) (Reservation, bool, error)
+	ConfirmReservation(context.Context, Reservation) error
 	AbortReservation(context.Context, Reservation, bool) error
-}
-
-type Capacity struct {
-	Pools map[ResourceClass]int
-}
-
-type CapacityProvider interface {
-	HealthyCapacity(context.Context) (Capacity, error)
 }
 
 type WorkerRegistration struct {
@@ -249,6 +285,15 @@ func (registration WorkerRegistration) Validate() error {
 	return nil
 }
 
+// Worker health/capability registration remains useful for operations and
+// routing compatibility, but it is intentionally absent from Scheduler's
+// Topic Queue Window calculation.
+type Capacity struct{ Pools map[ResourceClass]int }
+
+type CapacityProvider interface {
+	HealthyCapacity(context.Context) (Capacity, error)
+}
+
 type CapacityRegistry interface {
 	CapacityProvider
 	RegisterWorker(context.Context, WorkerRegistration) error
@@ -265,92 +310,47 @@ func (capacity FixedCapacity) HealthyCapacity(context.Context) (Capacity, error)
 }
 
 type Settings struct {
-	LaneCount            int
-	CreditGrantBatch     int
-	CandidateBatch       int
-	AdmissionConcurrency int
-	Epoch                time.Duration
-	ActiveProjectTTL     time.Duration
-	BalancerLease        time.Duration
-	ReservationTTL       time.Duration
-	DispatchBufferFactor float64
-	CapacityChangeLimit  float64
+	CandidateBatch              int
+	AdmissionConcurrency        int
+	CapacityCalibrationInterval time.Duration
+	ReadyReconcileInterval      time.Duration
+	ReconcileLease              time.Duration
+	ReservationTTL              time.Duration
+	IdlePoll                    time.Duration
+	IdlePollMax                 time.Duration
+	TopicWindow                 TopicWindowPolicy
+	Memory                      MemoryPolicy
 }
 
 func (settings Settings) Validate() error {
-	if settings.LaneCount <= 0 || settings.LaneCount&(settings.LaneCount-1) != 0 || settings.CreditGrantBatch <= 0 || settings.CandidateBatch <= 0 || settings.AdmissionConcurrency <= 0 || settings.Epoch <= 0 || settings.ActiveProjectTTL <= settings.Epoch || settings.BalancerLease <= settings.Epoch || settings.ReservationTTL <= 0 || settings.DispatchBufferFactor < 1 || settings.CapacityChangeLimit <= 0 || settings.CapacityChangeLimit > 1 {
-		return fmt.Errorf("scheduler settings are invalid")
+	if settings.CandidateBatch <= 0 || settings.AdmissionConcurrency <= 0 || settings.CapacityCalibrationInterval <= 0 || settings.ReadyReconcileInterval < settings.CapacityCalibrationInterval || settings.ReconcileLease <= 0 || settings.ReconcileLease >= settings.ReadyReconcileInterval || settings.ReservationTTL <= 0 || settings.IdlePoll <= 0 || settings.IdlePollMax < settings.IdlePoll {
+		return fmt.Errorf("scheduler batching, timing or concurrency settings are invalid")
 	}
-	return nil
-}
-
-func BoundWindows(previous, desired Windows, limit float64) (Windows, error) {
-	if desired.Global < 0 || limit <= 0 || limit > 1 {
-		return Windows{}, fmt.Errorf("capacity windows and change limit are invalid")
+	if settings.TopicWindow.SampleInterval != settings.CapacityCalibrationInterval {
+		return fmt.Errorf("topic sample interval must equal scheduler capacity calibration interval")
 	}
-	for class, value := range desired.Pools {
-		if !class.Valid() || value < 0 {
-			return Windows{}, fmt.Errorf("pool dispatch window is invalid")
-		}
+	if err := settings.TopicWindow.Validate(); err != nil {
+		return err
 	}
-	if previous.Pools == nil {
-		return Windows{Global: desired.Global, Pools: clonePoolWindows(desired.Pools)}, nil
-	}
-	result := Windows{Global: boundWindow(previous.Global, desired.Global, limit), Pools: make(map[ResourceClass]int, len(desired.Pools))}
-	poolTotal := 0
-	for class, desiredValue := range desired.Pools {
-		value := boundWindow(previous.Pools[class], desiredValue, limit)
-		result.Pools[class] = value
-		poolTotal += value
-	}
-	result.Global = min(result.Global, poolTotal)
-	return result, nil
-}
-
-func boundWindow(previous, desired int, limit float64) int {
-	if previous <= 0 || desired <= previous {
-		return desired
-	}
-	delta := max(1, int(math.Ceil(float64(previous)*limit)))
-	return min(desired, previous+delta)
-}
-
-func LaneFor(projectID string, laneCount int) (int, error) {
-	if projectID == "" || laneCount <= 0 || laneCount&(laneCount-1) != 0 {
-		return 0, fmt.Errorf("project identity and power-of-two lane count are required")
-	}
-	digest := fnv.New64a()
-	_, _ = digest.Write([]byte(projectID))
-	return int(digest.Sum64() & uint64(laneCount-1)), nil
-}
-
-func DispatchWindows(capacity Capacity, factor float64) (int, map[ResourceClass]int, error) {
-	if factor < 1 {
-		return 0, nil, fmt.Errorf("dispatch buffer factor must be at least one")
-	}
-	pools := make(map[ResourceClass]int, len(capacity.Pools))
-	totalSlots := 0
-	for class, slots := range capacity.Pools {
-		if !class.Valid() || slots < 0 {
-			return 0, nil, fmt.Errorf("healthy pool capacity is invalid")
-		}
-		window := int(math.Ceil(float64(slots) * factor))
-		pools[class] = window
-		totalSlots += slots
-	}
-	return int(math.Ceil(float64(totalSlots) * factor)), pools, nil
+	return settings.Memory.Validate()
 }
 
 func sortCandidates(values []Candidate) {
+	for index := range values {
+		values[index] = values[index].Normalized()
+	}
 	sort.Slice(values, func(left, right int) bool {
+		if values[left].ReadyBucket != values[right].ReadyBucket {
+			return values[left].ReadyBucket < values[right].ReadyBucket
+		}
 		if values[left].ProjectID != values[right].ProjectID {
 			return values[left].ProjectID < values[right].ProjectID
 		}
 		if values[left].Priority != values[right].Priority {
 			return values[left].Priority > values[right].Priority
 		}
-		if !values[left].ReadyAt.Equal(values[right].ReadyAt) {
-			return values[left].ReadyAt.Before(values[right].ReadyAt)
+		if values[left].ReadyOrderKey != values[right].ReadyOrderKey {
+			return values[left].ReadyOrderKey < values[right].ReadyOrderKey
 		}
 		return values[left].NodeRunID < values[right].NodeRunID
 	})

@@ -29,6 +29,24 @@ type fakeRepository struct {
 	completeOK bool
 }
 
+type fakeLifecycle struct {
+	claimed           []string
+	terminal          []string
+	terminalCompleted []bool
+	err               error
+}
+
+func (lifecycle *fakeLifecycle) MarkClaimed(_ context.Context, attemptID string) error {
+	lifecycle.claimed = append(lifecycle.claimed, attemptID)
+	return lifecycle.err
+}
+
+func (lifecycle *fakeLifecycle) MarkTerminal(_ context.Context, attemptID string, completed bool) error {
+	lifecycle.terminal = append(lifecycle.terminal, attemptID)
+	lifecycle.terminalCompleted = append(lifecycle.terminalCompleted, completed)
+	return lifecycle.err
+}
+
 func (repository *fakeRepository) Claim(_ context.Context, record ClaimRecord) (Lease, error) {
 	repository.claim = record
 	return Lease{Token: record.LeaseToken, Owner: record.WorkerID, FencingToken: 1, ExpiresAt: record.Now.Add(record.LeaseDuration)}, nil
@@ -126,6 +144,36 @@ func TestCoordinatorNormalizesNilSuccessfulOutputsBeforePersistence(t *testing.T
 	}
 	if repository.complete.Result.Outputs == nil || len(repository.complete.Result.Outputs) != 0 {
 		t.Fatalf("persisted outputs=%v", repository.complete.Result.Outputs)
+	}
+}
+
+func TestCoordinatorClosesSchedulingAccountingAfterCommitBestEffort(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	repository := &fakeRepository{completeOK: true}
+	lifecycle := &fakeLifecycle{err: errors.New("Redis unavailable")}
+	coordinator, err := NewCoordinatorWithLifecycle(repository, fixedIDs{"event"}, clock.NewFake(now), lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = coordinator.Claim(context.Background(), validClaim()); err != nil {
+		t.Fatalf("post-commit Redis failure changed Claim result: %v", err)
+	}
+	completion := CompleteCommand{ProjectID: "p", RunID: "r", AttemptID: "a", AttemptSequence: 1, LeaseToken: "lease", FencingToken: 1, TraceID: "trace", Result: runtime.AttemptResult{State: runtime.AttemptFailed, ErrorCode: "FAILED"}}
+	if accepted, completeErr := coordinator.Complete(context.Background(), completion); completeErr != nil || !accepted {
+		t.Fatalf("post-commit Redis failure changed Complete result: accepted=%t err=%v", accepted, completeErr)
+	}
+	if accepted, lostErr := coordinator.MarkExpiredLost(context.Background(), MarkLostCommand{ProjectID: "p", RunID: "r", AttemptID: "lost", AttemptSequence: 1, TraceID: "trace"}); lostErr != nil || !accepted {
+		t.Fatalf("post-commit Redis failure changed Lost result: accepted=%t err=%v", accepted, lostErr)
+	}
+	if len(lifecycle.claimed) != 1 || len(lifecycle.terminal) != 2 || !lifecycle.terminalCompleted[0] || lifecycle.terminalCompleted[1] {
+		t.Fatalf("unexpected lifecycle calls: %+v", lifecycle)
+	}
+	repository.completeOK = false
+	if accepted, completeErr := coordinator.Complete(context.Background(), completion); completeErr != nil || accepted {
+		t.Fatalf("duplicate completion result: accepted=%t err=%v", accepted, completeErr)
+	}
+	if len(lifecycle.terminal) != 2 {
+		t.Fatal("duplicate completion released Project Load twice")
 	}
 }
 

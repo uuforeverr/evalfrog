@@ -67,17 +67,24 @@ kafka:
     runtime_event: {name: "workflow-runtime-event-v1", partitions: 24, retention: 72h}
     dlq: {name: "workflow-dead-letter-v1", partitions: 12, retention: 336h}
 
+engine:
+  max_inflight: 12
+
 scheduler:
-  lane_count: 128
-  epoch: 1s
-  active_project_ttl: 5s
-  credit_grant_batch: 8
-  redis_candidate_batch: 32
-  admission_concurrency: 8
-  inflight_reservation_ttl: 300s
+  redis_candidate_batch: 4096
+  admission_concurrency: 16
+  capacity_calibration_interval: 5s
   ready_reconcile_interval: 30s
-  dispatch_buffer_factor: 1.2
-  epoch_capacity_change_limit: 0.10
+  reconcile_lease: 4s
+  reservation_ttl: 30s
+  topic_queue_buffer: 5s
+  topic_ewma_alpha: 0.4
+  builtin_min_queue: 8
+  builtin_max_queue: 10000
+  sandbox_min_queue: 4
+  sandbox_max_queue: 5000
+  memory_high_watermark: 0.75
+  memory_resume_watermark: 0.65
   idle_poll: 100ms
   idle_poll_max: 1s
 

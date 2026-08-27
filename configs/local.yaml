@@ -41,15 +41,26 @@ kafka:
     runtime_event: {partitions: 1, retention: 4h}
     dlq: {partitions: 1, retention: 24h}
 
+engine:
+  max_inflight: 3
+
 scheduler:
-  lane_count: 8
-  epoch: 500ms
-  active_project_ttl: 3s
-  credit_grant_batch: 4
-  redis_candidate_batch: 8
-  admission_concurrency: 2
-  inflight_reservation_ttl: 30s
-  ready_reconcile_interval: 5s
+  redis_candidate_batch: 512
+  admission_concurrency: 4
+  capacity_calibration_interval: 5s
+  ready_reconcile_interval: 15s
+  reconcile_lease: 4s
+  reservation_ttl: 15s
+  topic_queue_buffer: 5s
+  topic_ewma_alpha: 0.4
+  builtin_min_queue: 4
+  builtin_max_queue: 1024
+  sandbox_min_queue: 2
+  sandbox_max_queue: 512
+  memory_high_watermark: 0.75
+  memory_resume_watermark: 0.65
+  idle_poll: 20ms
+  idle_poll_max: 250ms
 
 worker:
   builtin_slots: 4

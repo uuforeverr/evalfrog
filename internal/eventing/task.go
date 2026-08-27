@@ -109,6 +109,10 @@ type TaskPublisher interface {
 	PublishTask(context.Context, TaskMessage) error
 }
 
+type BatchTaskPublisher interface {
+	PublishTasks(context.Context, []TaskMessage) []error
+}
+
 type ClaimedTask struct {
 	Message    TaskMessage
 	ClaimToken string
@@ -118,6 +122,11 @@ type TaskOutboxRepository interface {
 	ClaimTaskOutbox(context.Context, string, int, time.Duration) ([]ClaimedTask, error)
 	MarkTaskOutboxPublished(context.Context, string, string) error
 	ReleaseTaskOutboxClaim(context.Context, string, string, time.Duration) error
+}
+
+type BatchTaskOutboxRepository interface {
+	MarkTaskOutboxPublishedBatch(context.Context, []ClaimedIdentity) error
+	ReleaseTaskOutboxClaimsBatch(context.Context, []ClaimedIdentity, time.Duration) error
 }
 
 type TaskRelay struct {
@@ -141,20 +150,81 @@ func (relay TaskRelay) RelayOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	published := 0
+	valid := make([]ClaimedTask, 0, len(claimed))
+	failed := make([]ClaimedIdentity, 0)
+	var firstErr error
 	for _, task := range claimed {
 		if err := task.Message.Validate(); err != nil {
-			_ = relay.repository.ReleaseTaskOutboxClaim(ctx, task.Message.TaskID, task.ClaimToken, relay.retryDelay)
-			return published, err
+			failed = append(failed, ClaimedIdentity{ID: task.Message.TaskID, ClaimToken: task.ClaimToken})
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
-		if err := relay.publisher.PublishTask(ctx, task.Message); err != nil {
-			_ = relay.repository.ReleaseTaskOutboxClaim(ctx, task.Message.TaskID, task.ClaimToken, relay.retryDelay)
-			return published, err
-		}
-		if err := relay.repository.MarkTaskOutboxPublished(ctx, task.Message.TaskID, task.ClaimToken); err != nil {
-			return published, err
-		}
-		published++
+		valid = append(valid, task)
 	}
-	return published, nil
+	outcomes := make([]error, len(valid))
+	if publisher, ok := relay.publisher.(BatchTaskPublisher); ok && len(valid) > 0 {
+		messages := make([]TaskMessage, len(valid))
+		for index := range valid {
+			messages[index] = valid[index].Message
+		}
+		outcomes = publisher.PublishTasks(ctx, messages)
+		if len(outcomes) != len(valid) {
+			return 0, fmt.Errorf("task batch publisher returned %d outcomes for %d messages", len(outcomes), len(valid))
+		}
+	} else {
+		for index := range valid {
+			outcomes[index] = relay.publisher.PublishTask(ctx, valid[index].Message)
+		}
+	}
+	succeeded := make([]ClaimedIdentity, 0, len(valid))
+	for index, outcome := range outcomes {
+		identity := ClaimedIdentity{ID: valid[index].Message.TaskID, ClaimToken: valid[index].ClaimToken}
+		if outcome == nil {
+			succeeded = append(succeeded, identity)
+			continue
+		}
+		failed = append(failed, identity)
+		if firstErr == nil {
+			firstErr = outcome
+		}
+	}
+	if err = relay.markPublished(ctx, succeeded); err != nil {
+		return 0, err
+	}
+	if releaseErr := relay.releaseClaims(ctx, failed); releaseErr != nil && firstErr == nil {
+		firstErr = releaseErr
+	}
+	return len(succeeded), firstErr
+}
+
+func (relay TaskRelay) markPublished(ctx context.Context, values []ClaimedIdentity) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if repository, ok := relay.repository.(BatchTaskOutboxRepository); ok {
+		return repository.MarkTaskOutboxPublishedBatch(ctx, values)
+	}
+	for _, value := range values {
+		if err := relay.repository.MarkTaskOutboxPublished(ctx, value.ID, value.ClaimToken); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (relay TaskRelay) releaseClaims(ctx context.Context, values []ClaimedIdentity) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if repository, ok := relay.repository.(BatchTaskOutboxRepository); ok {
+		return repository.ReleaseTaskOutboxClaimsBatch(ctx, values, relay.retryDelay)
+	}
+	for _, value := range values {
+		if err := relay.repository.ReleaseTaskOutboxClaim(ctx, value.ID, value.ClaimToken, relay.retryDelay); err != nil {
+			return err
+		}
+	}
+	return nil
 }

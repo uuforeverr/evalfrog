@@ -107,6 +107,32 @@ func TestRuntimeConsumerAcksSuccessDeadLettersPoisonAndNacksRetryableFailure(t *
 	}
 }
 
+func TestRuntimeConsumerProcessesKafkaPollAsOneEngineBatch(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	valid, _ := testEvent().MarshalJSONMessage()
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := &testDeliveryBatch{messages: []BatchMessage{{Payload: valid}, {Payload: []byte(`{"bad":true}`)}}, after: cancel}
+	consumer := &testBatchConsumer{batch: batch}
+	handler := &testBatchRuntimeHandler{}
+	service, err := NewRuntimeConsumerService(consumer, handler, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = service.Run(ctx)
+	if batch.acked.Load() != 1 || batch.dead.Load() != 1 || batch.nacked.Load() != 0 || handler.events.Load() != 1 {
+		t.Fatalf("acked=%d dead=%d nacked=%d events=%d", batch.acked.Load(), batch.dead.Load(), batch.nacked.Load(), handler.events.Load())
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	batch = &testDeliveryBatch{messages: []BatchMessage{{Payload: valid}}, after: cancel}
+	consumer = &testBatchConsumer{batch: batch}
+	handler = &testBatchRuntimeHandler{err: errors.New("postgres unavailable")}
+	service, _ = NewRuntimeConsumerService(consumer, handler, logger)
+	if err = service.Run(ctx); err == nil || batch.nacked.Load() != 1 || batch.acked.Load() != 0 {
+		t.Fatalf("batch failure err=%v acked=%d nacked=%d", err, batch.acked.Load(), batch.nacked.Load())
+	}
+}
+
 func TestRelayServiceBackoffAndShutdown(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,6 +193,63 @@ type testRuntimeHandler struct {
 	after context.CancelFunc
 }
 
+type testDeliveryBatch struct {
+	messages            []BatchMessage
+	acked, nacked, dead atomic.Int32
+	after               context.CancelFunc
+}
+
+func (batch *testDeliveryBatch) Messages() []BatchMessage { return batch.messages }
+func (batch *testDeliveryBatch) Ack(context.Context) error {
+	batch.acked.Add(1)
+	if batch.after != nil {
+		batch.after()
+		batch.after = nil
+	}
+	return nil
+}
+func (batch *testDeliveryBatch) Nack() {
+	batch.nacked.Add(1)
+	if batch.after != nil {
+		batch.after()
+		batch.after = nil
+	}
+}
+func (batch *testDeliveryBatch) DeadLetter(context.Context, int, string) error {
+	batch.dead.Add(1)
+	return nil
+}
+
+type testBatchConsumer struct {
+	batch *testDeliveryBatch
+	used  bool
+}
+
+func (consumer *testBatchConsumer) Receive(context.Context) (Delivery, error) {
+	return nil, errors.New("single receive should not be used")
+}
+func (consumer *testBatchConsumer) ReceiveBatch(ctx context.Context) (DeliveryBatch, error) {
+	if !consumer.used {
+		consumer.used = true
+		return consumer.batch, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type testBatchRuntimeHandler struct {
+	events atomic.Int32
+	err    error
+}
+
+func (handler *testBatchRuntimeHandler) Consume(context.Context, RuntimeEvent) error {
+	return errors.New("single handler should not be used")
+}
+func (handler *testBatchRuntimeHandler) ConsumeBatch(_ context.Context, events []RuntimeEvent) error {
+	handler.events.Add(int32(len(events)))
+	return handler.err
+}
+
 func (value *testRuntimeHandler) Consume(context.Context, RuntimeEvent) error {
 	value.calls.Add(1)
 	if value.after != nil {
@@ -223,6 +306,18 @@ func TestRelayValidatesConstructionAndPropagatesRepositoryFailures(t *testing.T)
 	}
 }
 
+func TestRelayBatchMarksOnlyKafkaAcknowledgedRows(t *testing.T) {
+	first, second := testEvent(), testEvent()
+	first.EventID, second.EventID = "event-1", "event-2"
+	repository := &batchFakeOutbox{fakeOutbox: fakeOutbox{claimed: []ClaimedEvent{{Event: first, ClaimToken: "claim-1"}, {Event: second, ClaimToken: "claim-2"}}}}
+	publisher := &batchFakePublisher{outcomes: []error{nil, errors.New("broker rejected second record")}}
+	relay, _ := NewRelay(repository, publisher, "relay", 10, time.Minute, time.Second)
+	count, err := relay.RelayOnce(context.Background())
+	if count != 1 || err == nil || len(repository.batchMarked) != 1 || repository.batchMarked[0].ID != first.EventID || len(repository.batchReleased) != 1 || repository.batchReleased[0].ID != second.EventID {
+		t.Fatalf("count=%d err=%v marked=%+v released=%+v", count, err, repository.batchMarked, repository.batchReleased)
+	}
+}
+
 type fakeOutbox struct {
 	claimed  []ClaimedEvent
 	marked   int
@@ -247,6 +342,27 @@ type fakePublisher struct{ err error }
 
 func (publisher *fakePublisher) PublishRuntimeEvent(context.Context, RuntimeEvent) error {
 	return publisher.err
+}
+
+type batchFakeOutbox struct {
+	fakeOutbox
+	batchMarked, batchReleased []ClaimedIdentity
+}
+
+func (repository *batchFakeOutbox) MarkOutboxPublishedBatch(_ context.Context, values []ClaimedIdentity) error {
+	repository.batchMarked = append(repository.batchMarked, values...)
+	return nil
+}
+func (repository *batchFakeOutbox) ReleaseOutboxClaimsBatch(_ context.Context, values []ClaimedIdentity, _ time.Duration) error {
+	repository.batchReleased = append(repository.batchReleased, values...)
+	return nil
+}
+
+type batchFakePublisher struct{ outcomes []error }
+
+func (*batchFakePublisher) PublishRuntimeEvent(context.Context, RuntimeEvent) error { return nil }
+func (publisher *batchFakePublisher) PublishRuntimeEvents(context.Context, []RuntimeEvent) []error {
+	return publisher.outcomes
 }
 
 func testEvent() RuntimeEvent {

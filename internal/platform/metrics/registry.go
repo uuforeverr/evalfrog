@@ -19,6 +19,9 @@ type Registry struct {
 	PostgresPoolAcquireSeconds  *prometheus.HistogramVec
 	ExecutionContextCacheAccess *prometheus.CounterVec
 	SchedulingRedisRebuildTotal *prometheus.CounterVec
+	TopicQueueWindow             *prometheus.GaugeVec
+	TopicQueueOccupancy          *prometheus.GaugeVec
+	WorkerCompletionEWMA         *prometheus.GaugeVec
 	RecoveryWakeupsTotal        *prometheus.CounterVec
 }
 
@@ -65,17 +68,31 @@ func New(service string) *Registry {
 	}, []string{"kind", "outcome"})
 	redisRebuild := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "evalfrog", Name: "scheduling_redis_rebuild_total",
-		Help: "Full Scheduling Redis Lane rebuild outcomes; a failure leaves admission fail-closed.",
+		Help: "Scheduling Redis authority-generation rebuild outcomes; a failure leaves growth fail-closed.",
 	}, []string{"outcome"})
+	topicWindow := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "evalfrog", Name: "scheduler_topic_queue_window",
+		Help: "Target queued Task count derived from actual Worker completion throughput.",
+	}, []string{"resource_class"})
+	topicOccupancy := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "evalfrog", Name: "scheduler_topic_queue_occupancy",
+		Help: "Unconfirmed Reservations plus authoritative Queued Attempts.",
+	}, []string{"resource_class"})
+	completionEWMA := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "evalfrog", Name: "scheduler_worker_completion_ewma_per_second",
+		Help: "EWMA of Attempts actually completed by Workers per second.",
+	}, []string{"resource_class"})
 	recoveryWakeups := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "evalfrog", Name: "runtime_recovery_wakeups_total",
 		Help: "Durable recovery wake-up emission outcomes by bounded scanner and Runtime event type.",
 	}, []string{"source", "event_type", "outcome"})
-	registry.MustRegister(buildGauge, requests, outboxAge, kafkaLag, leaseLost, readyToQueued, postgresPoolAcquire, executionContextCache, redisRebuild, recoveryWakeups)
+	registry.MustRegister(buildGauge, requests, outboxAge, kafkaLag, leaseLost, readyToQueued, postgresPoolAcquire, executionContextCache, redisRebuild, topicWindow, topicOccupancy, completionEWMA, recoveryWakeups)
 	return &Registry{prometheus: registry, Requests: requests, OutboxOldestAgeSeconds: outboxAge,
 		KafkaConsumerLag: kafkaLag, LeaseLostTotal: leaseLost, ReadyToQueuedSeconds: readyToQueued,
 		PostgresPoolAcquireSeconds: postgresPoolAcquire, ExecutionContextCacheAccess: executionContextCache,
-		SchedulingRedisRebuildTotal: redisRebuild, RecoveryWakeupsTotal: recoveryWakeups}
+		SchedulingRedisRebuildTotal: redisRebuild, TopicQueueWindow: topicWindow,
+		TopicQueueOccupancy: topicOccupancy, WorkerCompletionEWMA: completionEWMA,
+		RecoveryWakeupsTotal: recoveryWakeups}
 }
 
 func (registry *Registry) ObserveOutboxOldestAge(value time.Duration) {
@@ -108,6 +125,12 @@ func (registry *Registry) ObserveExecutionContextCache(kind, outcome string) {
 
 func (registry *Registry) ObserveSchedulingRedisRebuild(outcome string) {
 	registry.SchedulingRedisRebuildTotal.WithLabelValues(outcome).Inc()
+}
+
+func (registry *Registry) ObserveTopicQueue(resourceClass string, window, occupancy int, ewma float64) {
+	registry.TopicQueueWindow.WithLabelValues(resourceClass).Set(float64(max(window, 0)))
+	registry.TopicQueueOccupancy.WithLabelValues(resourceClass).Set(float64(max(occupancy, 0)))
+	registry.WorkerCompletionEWMA.WithLabelValues(resourceClass).Set(max(ewma, 0))
 }
 
 func (registry *Registry) ObserveRecoveryWakeup(source, eventType, outcome string) {

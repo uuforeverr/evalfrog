@@ -37,7 +37,7 @@
         <mxCell id="11" value="Runtime Control&#xa;Run Command · Engine&#xa;Attempt Coordinator&#xa;Execution Context Gateway" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
           <mxGeometry x="810" y="190" width="300" height="150" as="geometry" />
         </mxCell>
-        <mxCell id="12" value="Scheduling&#xa;Project Max-Min Fairness&#xa;Lane · Credit · Dispatch Window&#xa;Ready → Queued CAS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
+        <mxCell id="12" value="Scheduling&#xa;1s Bucket FIFO · Project Load&#xa;5s Topic Queue Window&#xa;Ready → Queued CAS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
           <mxGeometry x="1190" y="190" width="300" height="150" as="geometry" />
         </mxCell>
         <mxCell id="13" value="Eventing &amp; Operations&#xa;Outbox · Inbox · Projection&#xa;Retry · Deadline · Reaper&#xa;Recovery · Reconcile · Notification" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
@@ -50,7 +50,7 @@
         <mxCell id="15" value="PostgreSQL&#xa;唯一权威 Definition / Runtime&#xa;Output / Outbox / Inbox / Audit" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
           <mxGeometry x="80" y="65" width="760" height="100" as="geometry" />
         </mxCell>
-        <mxCell id="16" value="Scheduling Redis&#xa;Lane · Credit · Ready Index · Reservation&#xa;noeviction · Fail Closed" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
+        <mxCell id="16" value="Scheduling Redis&#xa;Ready · Project Load · Topic Occupancy&#xa;Reservation · noeviction" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
           <mxGeometry x="940" y="65" width="300" height="100" as="geometry" />
         </mxCell>
         <mxCell id="17" value="Cache Redis&#xa;Snapshot · Run Context · Read Model&#xa;Cache-Aside · 可回源" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
@@ -117,7 +117,7 @@
         <mxCell id="40" value="Run / NodeRun / Attempt" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.9;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="11" target="15">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="41" value="Lane / Credit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.5;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="16">
+        <mxCell id="41" value="Reserve / Lifecycle" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.5;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="16">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="42" value="Cache-Aside" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.35;exitY=1;entryX=0.5;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="13" target="17">

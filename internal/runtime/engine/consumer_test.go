@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +17,12 @@ type fakeTransactions struct{ tx *fakeRunTx }
 
 func (manager *fakeTransactions) WithRunTransaction(_ context.Context, _ eventing.RuntimeEvent, operation func(RunTransaction) error) error {
 	return operation(manager.tx)
+}
+
+type failingTransactions struct{ err error }
+
+func (manager failingTransactions) WithRunTransaction(context.Context, eventing.RuntimeEvent, func(RunTransaction) error) error {
+	return manager.err
 }
 
 type fakeRunTx struct {
@@ -36,9 +44,11 @@ type fakeRunTx struct {
 	failInitError     error
 	advancedBefore    State
 	advancedAfter     State
+	acceptedEvents    []string
 }
 
-func (tx *fakeRunTx) AcceptInbox(context.Context, string, eventing.RuntimeEvent) (bool, error) {
+func (tx *fakeRunTx) AcceptInbox(_ context.Context, _ string, event eventing.RuntimeEvent) (bool, error) {
+	tx.acceptedEvents = append(tx.acceptedEvents, event.EventID)
 	return tx.accepted, tx.inboxError
 }
 func (tx *fakeRunTx) AuthorityNow(context.Context) (time.Time, error) {
@@ -93,6 +103,138 @@ func TestConsumerInitializesPendingRunAndDeduplicatesInbox(t *testing.T) {
 	tx.accepted, tx.initialized = false, false
 	if err = consumer.Consume(context.Background(), event); err != nil || tx.initialized {
 		t.Fatalf("duplicate initialized=%v err=%v", tx.initialized, err)
+	}
+}
+
+type batchCountingTransactions struct {
+	mu           sync.Mutex
+	active       int
+	maxActive    int
+	transactions []*fakeRunTx
+	delay        time.Duration
+}
+
+func (manager *batchCountingTransactions) WithRunTransaction(_ context.Context, _ eventing.RuntimeEvent, operation func(RunTransaction) error) error {
+	tx := &fakeRunTx{accepted: true, run: runtime.WorkflowRunRecord{State: runtime.RunRunning}}
+	return operation(tx)
+}
+
+func (manager *batchCountingTransactions) WithRunBatchTransaction(_ context.Context, operation func(RunTransaction) error) error {
+	tx := &fakeRunTx{accepted: true, run: runtime.WorkflowRunRecord{State: runtime.RunRunning}}
+	manager.mu.Lock()
+	manager.active++
+	manager.maxActive = max(manager.maxActive, manager.active)
+	manager.transactions = append(manager.transactions, tx)
+	manager.mu.Unlock()
+	delay := manager.delay
+	if delay == 0 {
+		delay = 10 * time.Millisecond
+	}
+	time.Sleep(delay)
+	err := operation(tx)
+	manager.mu.Lock()
+	manager.active--
+	manager.mu.Unlock()
+	return err
+}
+
+func TestConsumerBatchCapsOneThousandRunBurstAtDatabaseBudget(t *testing.T) {
+	manager := &batchCountingTransactions{delay: time.Millisecond}
+	consumer, err := NewConsumerWithConcurrency(manager, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	events := make([]eventing.RuntimeEvent, 1000)
+	for index := range events {
+		runID := fmt.Sprintf("run-%04d", index)
+		events[index] = testRuntimeEvent(eventing.RunCreated, runID, runID, at)
+		events[index].EventID = fmt.Sprintf("event-%04d", index)
+	}
+	if err = consumer.ConsumeBatch(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.transactions) != 1000 || manager.maxActive != 7 {
+		t.Fatalf("transactions=%d max_active=%d", len(manager.transactions), manager.maxActive)
+	}
+}
+
+func TestConsumerBatchSerializesOneRunAndBoundsDifferentRunTransactions(t *testing.T) {
+	manager := &batchCountingTransactions{}
+	consumer, err := NewConsumerWithConcurrency(manager, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	events := []eventing.RuntimeEvent{
+		testRuntimeEvent(eventing.RunCreated, "run-a", "run-a", at),
+		testRuntimeEvent(eventing.RunCreated, "run-b", "run-b", at),
+		testRuntimeEvent(eventing.RunCreated, "run-a", "run-a", at.Add(time.Millisecond)),
+		testRuntimeEvent(eventing.RunCreated, "run-c", "run-c", at),
+	}
+	for index := range events {
+		events[index].EventID = fmt.Sprintf("batch-event-%d", index)
+	}
+	if err = consumer.ConsumeBatch(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.transactions) != 3 || manager.maxActive != 2 {
+		t.Fatalf("run transactions=%d max_active=%d", len(manager.transactions), manager.maxActive)
+	}
+	foundOrderedRun := false
+	for _, tx := range manager.transactions {
+		if len(tx.acceptedEvents) == 2 {
+			foundOrderedRun = tx.acceptedEvents[0] == "batch-event-0" && tx.acceptedEvents[1] == "batch-event-2"
+		}
+	}
+	if !foundOrderedRun {
+		t.Fatalf("same-Run events were not serialized in Kafka order: %+v", manager.transactions)
+	}
+}
+
+func TestConsumerBatchValidatesInputAndSupportsLegacyTransactionManager(t *testing.T) {
+	consumer, _ := NewConsumer(&fakeTransactions{&fakeRunTx{accepted: true, run: runtime.WorkflowRunRecord{State: runtime.RunRunning}}})
+	if err := consumer.ConsumeBatch(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.ConsumeBatch(context.Background(), []eventing.RuntimeEvent{{}}); err == nil {
+		t.Fatal("invalid batch event was accepted")
+	}
+	at := time.Now().UTC()
+	events := []eventing.RuntimeEvent{
+		testRuntimeEvent(eventing.RunCreated, "run", "run", at),
+		testRuntimeEvent(eventing.RunCreated, "run", "run", at.Add(time.Millisecond)),
+	}
+	events[0].EventID, events[1].EventID = "one", "two"
+	if err := consumer.ConsumeBatch(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("transaction")
+	consumer, _ = NewConsumer(failingTransactions{err: failure})
+	if err := consumer.ConsumeBatch(context.Background(), events[:1]); !errors.Is(err, failure) {
+		t.Fatalf("legacy transaction failure=%v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := &batchCountingTransactions{}
+	consumer, _ = NewConsumerWithConcurrency(manager, 1)
+	otherRun := testRuntimeEvent(eventing.RunCreated, "other-run", "other-run", at)
+	otherRun.EventID = "other"
+	if err := consumer.ConsumeBatch(canceled, append(events[:1], otherRun)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled batch=%v", err)
+	}
+}
+
+func TestConsumerBatchTransactionRollsBackRunGroupOnEventFailure(t *testing.T) {
+	manager := &batchCountingTransactions{}
+	consumer, _ := NewConsumerWithConcurrency(manager, 1)
+	event := testRuntimeEvent(eventing.RuntimeEventType("unknown"), "run", "run", time.Now().UTC())
+	if err := consumer.ConsumeBatch(context.Background(), []eventing.RuntimeEvent{event}); err == nil {
+		t.Fatal("batch transaction event failure was hidden")
 	}
 }
 
