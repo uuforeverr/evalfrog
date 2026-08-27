@@ -1,12 +1,12 @@
 # 分布式调度与 Worker 执行边界
 
-> 状态：已冻结；第 11 节是当前实现基线
+> 状态：已冻结；第 12 节是最新目标基线，代码迁移待完成
 >
 > 范围：最近几轮关于分布式部署、项目公平调度、Kafka、Worker、Attempt 恢复的讨论
 >
 > 前置基线：[00_核心架构决策基线.md](./00_核心架构决策基线.md)
 
-本文只记录最近几轮新增或修正的决策，不重复 Definition、Draft/Published Version、IR/DSL、Source Map、Run/Node Run 基础生命周期等既有结论。第 1～10 节保留最初 M6/M7 的历史实现背景；其中 Max-Min、Lane/Credit、Worker Slot Dispatch Window 等调度规则已被第 11 节取代，不再指导当前代码。当前实现若与历史段落冲突，以第 11 节和第 12 节验收不变量为准；尚未冻结的参数不得被误写成领域规则。
+本文只记录最近几轮新增或修正的决策，不重复 Definition、Draft/Published Version、IR/DSL、Source Map、Run/Node Run 基础生命周期等既有结论。第 1～10 节保留最初 M6/M7 的历史实现背景；第 11 节记录已经实现并验证过的一秒时间桶 FIFO、Project Load、Topic Queue Window 和 Scheduling Redis 方案；第 12 节在进一步简化后废止独立 Scheduler 与 Scheduling Redis，是后续代码更新的最高优先级目标。第 12 节落盘不等于代码已经完成迁移；README、运行状态和验收结论在迁移验收前仍以实际代码为准。
 
 ## 1. 分布式范围与第一阶段部署形态
 
@@ -473,6 +473,8 @@ Cache TTL 覆盖：
 
 ## 11. Engine、Scheduler、Kafka、Worker 与 Cache 当前高并发实现
 
+> 历史实现说明：本节所述代码已经通过自动化正确性验收，但其中 11.4～11.8 的独立 Scheduler、Project Load、Topic Queue Window、Reservation/Inflight 和 Scheduling Redis 设计已被第 12 节废止。11.1～11.3 的 Engine 有界并发与集合式 SQL、Outbox 批量发布、Worker Claim/Lease/Fencing、Execution Context Gateway 和 Cache Redis 边界继续有效。
+
 > 状态：已实现并通过自动化正确性验收；生产容量结论仍待目标环境实测
 >
 > 日期：2026-08-27
@@ -869,5 +871,170 @@ Run Read Model是面向Web/CLI的只读运行视图，聚合Run、Node、Output�
 - Scheduling Redis达到高水位后不再增长Ready候选，已有候选仍能被派发并释放内存；降到恢复水位后能够从PostgreSQL补回期间遗漏的Ready Node；
 - Scheduling Redis OOM时保持Fail Closed，不发生自动Key淘汰、重复Attempt、Project Load或Topic Queue Occupancy负数，也不新增突破Topic Queue Window的Reservation；
 - 容量报告同时记录Engine吞吐与事务延迟、PostgreSQL Pool Acquire、Kafka缓冲秒数、最老Ready等待时间、Ready-to-Queued、同桶Project分布和两类Redis命中/内存指标。
+
+## 12. 最新冻结目标：Engine 直接形成执行意图，删除 Scheduler 与 Scheduling Redis
+
+> 决策状态：已确认，待代码迁移和重新验收
+>
+> 决策日期：2026-08-27
+>
+> 取代范围：第 1～11 节中所有独立 Scheduler、公平准入、Ready Redis 索引、Topic Queue Window、Project Load、Reservation/Inflight、Scheduling Redis Generation/Rebuild/OOM 排空规则
+
+### 12.1 决策背景与取舍
+
+EvalFrog 第一阶段用于企业内部日常评测：一个 Workflow 通常不超过 20 个拓扑 Node，Ready Task 随 Run 推进逐步产生；系统需要承受固定时间内大量 Workflow 调用，但不再要求大、小 Project 之间的公平份额，也不要求 Kafka 只保留 Worker 未来约 5 秒的任务。正常执行语义采用先产生、先进入公共任务队列，Worker 不足表现为 Outbox/Kafka 积压并通过扩容解决。
+
+在这些约束下，独立 Scheduler 的一秒时间桶、Project Load、Topic Queue Window、Reservation、Inflight 与 Scheduling Redis 只是在 PostgreSQL Ready 和 Kafka 之间增加第二次状态推进、额外事务和可重建协调状态。删除它们可以把执行意图的创建合并回已经拥有 Workflow/Node 状态机的 Engine，同时保留 PostgreSQL 权威、Outbox 原子性、Kafka 异步边界和 Worker Lease/Fencing，不牺牲业务正确性。
+
+本决策明确接受以下取舍：
+
+- Kafka 不再承诺约 5 秒的有界排队深度；当输入长期超过 Worker 能力时，积压会增长；
+- 不提供 Project 公平、优先级重排或全局严格 FIFO；
+- Kafka 只保证单 Partition 有序，多 Partition/多 Worker 下是近似先到先消费，Task 完成顺序不受保证；
+- 取消、Deadline 或旧 Attempt 对应的已发布 Task 可能仍被 Worker 领取，但 Claim 必须依据 PostgreSQL 当前事实拒绝并安全 ACK；
+- 容量不足通过 Outbox Age、Kafka Lag/最老消息年龄、Queued-to-Running 延迟、Worker Slot 利用率和存储水位暴露，而不是由 Scheduler 估算 Worker 完成速率。
+
+### 12.2 Engine 的新事务边界
+
+Engine 继续是 Run/Node 语义状态的唯一推进者，并新增“为刚满足执行条件的 Task Node 创建执行意图”的职责。它不执行 Task，也不直接写 Kafka。
+
+目标链路为：
+
+```text
+RunCreated / AttemptCompleted / AttemptLost / RetryDue / Cancel / Deadline Runtime Event
+→ Engine Inbox去重并锁定一个Run
+→ 依据不可变Snapshot与PostgreSQL权威状态计算拓扑
+→ Task Node在领域状态机中满足依赖并进入Ready
+→ Engine在同一领域计算中立即执行Ready → Queued
+→ 同一个Run事务内集合式写入：
+   Node状态变化
+   新Node Attempt
+   新Task Outbox
+   Run状态变化
+   Engine Inbox
+→ PostgreSQL提交
+→ Task消息发布器异步批量发送Kafka
+```
+
+必须满足：
+
+- Start、End、Branch等控制节点不创建Attempt；只有Task Node进入Queued时创建物理Attempt；
+- 初始化根Task、上游完成后出现的下游Task、业务Retry和基础设施Recovery都遵循同一事务边界；
+- 一个Run内新增的多个Attempt与Task Outbox使用集合式SQL，不能逐Node执行独立事务；
+- `Node queued + Attempt + Task Outbox`必须原子提交，任何一项失败都回滚整个Run事务；
+- 不把不同Run合并进一个数据库事务；不同Run仍按`engine.max_inflight`有界并发；
+- 重复Runtime Event由Inbox去重，竞争推进由Run行锁、Node State Version、Current Attempt和唯一约束收敛，不能创建两个有效Attempt；
+- 正常Task Node不再长期持久化为Ready并等待第二个组件推进。Ready可以继续作为领域状态机中的瞬时合法状态，但事务最终落库为Queued；
+- PostgreSQL或Task Outbox写入失败时不允许先发布Kafka，Runtime Event重放后重新计算；
+- Engine提交后不再登记Scheduling Redis Ready Candidate，也不执行任何Redis调度生命周期回调。
+
+### 12.3 为什么数据库已有 Attempt 仍需要 Kafka
+
+PostgreSQL中的Queued Attempt回答“这个执行意图是否权威存在、现在处于什么状态”；它不负责把任务高效交给某个Worker。Execution Context Gateway回答“一个已经通过Claim授权的Attempt执行时需要读取哪些Snapshot、Input、Effective Output和资源信息”；它也不负责发现待执行Attempt、竞争领取、公共积压、消费者扩缩容或消息重放。
+
+Kafka继续承担不可替代的传输职责：
+
+- 把Control Plane产生的Task异步分发到Builtin/Sandbox Worker Consumer Group；
+- 在Worker短时不足、重启或滚动发布时保存公共积压并削峰；
+- 通过Partition支持多个Worker并行消费和Rebalance；
+- 在Worker Claim前崩溃时重新投递尚未完成责任转移的Task；
+- 将任务发现流量留在Broker，避免所有Worker持续轮询PostgreSQL或Gateway；
+- 让Control Plane提交Run事务后立即释放数据库连接，不等待某个Worker在线。
+
+因此Worker链路保持：
+
+```text
+Kafka Task
+→ Worker本地有空闲Slot后领取
+→ Attempt Coordinator ClaimAttempt
+→ PostgreSQL queued → running + Lease/Fencing
+→ Claim成功后ACK Kafka
+→ Execution Context Gateway LoadExecutionContext
+→ Executor执行
+→ Attempt Coordinator CompleteAttempt
+```
+
+Gateway必须继续是只读、按Attempt授权的Context读取器。若让Worker通过Gateway轮询“下一个Attempt”，Gateway就会同时承担任务队列、竞争领取、长轮询、背压和故障重放，实际上重新实现一个性能与可靠性都更弱的Broker，并把高频空轮询压回PostgreSQL。Worker仍不得持有Workflow PostgreSQL凭证，也不得绕过Coordinator直接改变Attempt。
+
+### 12.4 Outbox与Kafka边界
+
+Engine不能在数据库事务内直接调用Kafka，也不能先写Kafka再更新PostgreSQL。目标Task链路固定为：
+
+```text
+Engine PostgreSQL事务
+  Node queued + Attempt + Task Outbox
+→ Task消息发布器批量Claim Outbox
+→ Kafka Producer批量发送Resource Class Topic
+→ PostgreSQL批量Mark成功记录为Published
+→ 失败记录释放Claim并退避重试
+```
+
+Kafka发布成功、Outbox Mark前崩溃仍可能产生重复Task。Worker Claim以Attempt当前状态、Sequence、Lease和Fencing幂等收敛；不能为了删除重复而引入跨PostgreSQL/Kafka分布式事务。Runtime Event继续使用Runtime Outbox、Kafka、Engine Inbox/CAS，职责不变。
+
+### 12.5 删除与保留的组件和数据
+
+后续代码迁移应删除：
+
+- Scheduler Service、Scheduler领域端口和`DispatchReady`路径；
+- Scheduling Redis Client及其Ready、Active、Candidate Index、Project Load、Last Granted、Topic Window/Occupancy、Completion EWMA、Reservation、Inflight、Generation、Lease/Fence数据；
+- Scheduling Redis Endpoint、`noeviction/maxmemory`专用部署、配置和故障恢复手册；
+- Attempt Coordinator中的Scheduling Redis `MarkClaimed/MarkTerminal`提交后回调；
+- Scheduler/Topic Window/Redis Rebuild相关指标、容量Profile和测试；
+- 只服务于Scheduler Ready/FIFO或Scheduling Inflight扫描的索引；删除索引必须通过新Migration完成，不能改写已发布Migration历史。
+
+继续保留：
+
+- PostgreSQL Workflow/Node/Attempt/Output/Outbox/Inbox权威状态；
+- Engine有界跨Run并发、同Run串行和集合式Node SQL；
+- Task与Runtime Outbox批量Claim/Publish/Mark；
+- Kafka Builtin Task、Sandbox Task、Runtime Event和DLQ Topic；
+- Worker本地Slot背压、Attempt Claim/Heartbeat/Complete、Lease/Reaper/Fencing；
+- Execution Context Gateway；
+- Cache Redis，用于不可变Snapshot、Run Input、Effective Output和Run Read Model，不参与Task准入。
+
+Worker Heartbeat若仅用于在线状态展示，可以交给部署平台/Prometheus，或作为允许TTL和淘汰的非权威数据写入Cache Redis；Worker能力完整性仍由Worker启动校验、Resource Class Topic隔离和Claim时校验保证，不能为了注册信息继续保留Scheduling Redis。
+
+### 12.6 过载、FIFO与运行观测
+
+删除Scheduler后，Kafka和未发布Task Outbox是正式的任务等待层。生产系统必须观测：
+
+- Runtime与Task Outbox未发布数量、最老Age和发布错误；
+- 各Task Consumer Group的Kafka Lag与最老消息年龄；
+- Attempt `queued → running` P50/P95/P99；
+- Worker Slot使用率、Claim失败、Lease Lost和任务完成速率；
+- Kafka磁盘、Retention和Broker健康；
+- PostgreSQL Pool Acquire、Engine事务延迟、WAL/IO和锁等待。
+
+当积压持续增长时，首选增加对应Resource Class Worker、增加Kafka Partition或排查Executor/外部依赖；若Kafka/PostgreSQL存储接近安全水位，则在External CreateRun入口实施全局容量保护、限流或明确拒绝，不能等到存储耗尽。该保护是系统过载边界，不重新引入Project公平Scheduler。
+
+Task使用`attempt_id`作为Partition Key以分散负载，因此只承诺单Partition顺序和Topic层面的近似先到先消费。Workflow依赖顺序由Engine只在上游Effective完成后创建下游Attempt保证，不依赖Kafka全局顺序。
+
+### 12.7 兼容迁移顺序
+
+为避免滚动发布期间旧Engine产生的Ready Node永久停留，代码迁移按以下顺序执行：
+
+1. 新版本Engine先支持在同一Run事务中直接创建Attempt与Task Outbox，但暂时保留旧Scheduler用于处理旧实例或升级前遗留的Ready Node；两者竞争时仍由PostgreSQL行锁/CAS保证只产生一个有效Attempt；
+2. 全部Control Plane实例升级后，确认PostgreSQL不存在可执行但长期停留的Ready Node，或使用一次性受控Drainer完成遗留派发；
+3. 禁用Scheduler角色并观察至少一个最大任务/Retry/Recovery周期，验证Task Outbox、Kafka Lag、Queued-to-Running和Run终态正常；
+4. 删除Scheduler代码、Scheduling Redis部署与生命周期回调；
+5. 通过追加Migration删除仅服务于旧Scheduler的索引，再更新README、架构图、运行手册和学习文档为“已实现”。
+
+不得先停Scheduler再滚动升级仍会持久化Ready等待调度的旧Engine，也不得通过直接修改数据库状态清理遗留Ready。
+
+### 12.8 后续代码验收不变量
+
+迁移完成至少需要证明：
+
+- Run初始化、上游完成、业务Retry和Recovery都能在一个Engine事务内原子形成`Node queued + Attempt + Task Outbox`；
+- 同一Run一次产生多个可运行Task时使用集合式Node、Attempt和Task Outbox SQL，任一行冲突使整个Run事务回滚；
+- 1000个不同Run同时推进时Engine并发不超过连接池预算，且不存在Scheduler或Scheduling Redis依赖；
+- Runtime Event重复100次、Kafka Task重复发布和多个Engine实例竞争时都只产生一个有效Attempt和一次业务推进；
+- Kafka不可用时Task停留在Outbox，恢复后可发布；Worker不足时Task积压在Kafka，扩容后能够继续消费；
+- Worker只在本地Slot可用时Poll，Claim成功后ACK；Claim前崩溃由Kafka重投，ACK后崩溃由Lease/Reaper恢复；
+- 取消、Deadline、旧Attempt和迟到Task在Claim时被权威状态拒绝，不启动Executor且不会永久重投；
+- Gateway只允许当前合法Running Attempt读取Context，不提供待执行Attempt发现或状态写入接口；
+- 删除Scheduling Redis后，Cache Redis全量清空仍只触发PostgreSQL回源，不影响Task创建、Kafka消费和Run推进；
+- 容量报告以Outbox Age、Kafka Lag/最老消息、Queued-to-Running、Worker Slot和Engine/PostgreSQL指标替代Ready-to-Queued、Topic Window、Project Load和Scheduling Redis指标；
+- 部署清单只包含Control Plane、Builtin Worker、Sandbox Worker、PostgreSQL、Kafka和Cache Redis，不残留未使用的Scheduler角色或Scheduling Redis实例。
 
 第一阶段节点能力和安全边界详见 [02_节点模型与执行能力边界.md](./02_节点模型与执行能力边界.md)。
