@@ -29,10 +29,6 @@ type ContextGateway interface {
 	Load(context.Context, runtimecontext.LoadCommand) (runtimecontext.ExecutionContext, error)
 }
 
-type CapacityRegistry interface {
-	RegisterWorker(context.Context, scheduling.WorkerRegistration) error
-}
-
 type ResourceResolver interface {
 	ResolveConnection(context.Context, resources.RuntimeResolveCommand) (resources.ConnectionRuntime, error)
 	ResolveServiceOperation(context.Context, resources.RuntimeResolveCommand) (resources.ServiceOperationRuntime, error)
@@ -41,53 +37,23 @@ type ResourceResolver interface {
 type Handler struct {
 	coordinator AttemptCoordinator
 	context     ContextGateway
-	registry    CapacityRegistry
 	resources   ResourceResolver
 	router      *http.ServeMux
 }
 
-func NewHandler(coordinator AttemptCoordinator, gateway ContextGateway, registry CapacityRegistry, resolvers ...ResourceResolver) *Handler {
+func NewHandler(coordinator AttemptCoordinator, gateway ContextGateway, resolvers ...ResourceResolver) *Handler {
 	var resourceResolver ResourceResolver
 	if len(resolvers) > 0 {
 		resourceResolver = resolvers[0]
 	}
-	handler := &Handler{coordinator: coordinator, context: gateway, registry: registry, resources: resourceResolver, router: http.NewServeMux()}
+	handler := &Handler{coordinator: coordinator, context: gateway, resources: resourceResolver, router: http.NewServeMux()}
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/claim", handler.claim)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/heartbeat", handler.heartbeat)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/complete", handler.complete)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/context", handler.loadContext)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/resources/connection", handler.resolveConnection)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/resources/service-operation", handler.resolveServiceOperation)
-	handler.router.HandleFunc("POST /internal/v1/workers/{worker_id}/heartbeat", handler.registerWorker)
 	return handler
-}
-
-type workerHeartbeatRequest struct {
-	ExecutorBuild string                   `json:"executor_build"`
-	ResourceClass scheduling.ResourceClass `json:"resource_class"`
-	Slots         int                      `json:"slots"`
-	Capabilities  []capability             `json:"capabilities"`
-	TTLMS         int64                    `json:"ttl_ms"`
-}
-
-func (handler *Handler) registerWorker(writer http.ResponseWriter, request *http.Request) {
-	var body workerHeartbeatRequest
-	if !decode(writer, request, &body) {
-		return
-	}
-	capabilities := make([]dsl.Coordinate, len(body.Capabilities))
-	for index, value := range body.Capabilities {
-		capabilities[index] = dsl.Coordinate{Type: value.Type, Version: value.Version}
-	}
-	err := handler.registry.RegisterWorker(request.Context(), scheduling.WorkerRegistration{
-		WorkerID: request.PathValue("worker_id"), ExecutorBuild: body.ExecutorBuild,
-		ResourceClass: body.ResourceClass, Slots: body.Slots, Capabilities: capabilities,
-		TTL: time.Duration(body.TTLMS) * time.Millisecond,
-	})
-	if writeDomainError(writer, err) {
-		return
-	}
-	writeJSON(writer, http.StatusOK, map[string]bool{"registered": true})
 }
 
 func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

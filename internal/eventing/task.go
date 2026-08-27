@@ -32,16 +32,6 @@ type TaskMessage struct {
 	TraceID         string                   `json:"trace_id"`
 }
 
-func TaskFromScheduling(value scheduling.Task) TaskMessage {
-	return TaskMessage{
-		MessageVersion: value.MessageVersion, TaskID: value.TaskID,
-		ProjectID: value.ProjectID, RunID: value.RunID, NodeRunID: value.NodeRunID,
-		ExecutionNodeID: value.ExecutionNodeID, AttemptID: value.AttemptID,
-		AttemptSequence: value.AttemptSequence, ResourceClass: value.ResourceClass,
-		OccurredAt: value.OccurredAt, TraceID: value.TraceID,
-	}
-}
-
 func (message TaskMessage) Validate() error {
 	if message.MessageVersion != TaskMessageVersion || message.TaskID == "" ||
 		message.ProjectID == "" || message.RunID == "" || message.NodeRunID == "" ||

@@ -1,12 +1,12 @@
 # 分布式调度与 Worker 执行边界
 
-> 状态：已冻结；第 12 节是最新目标基线，代码迁移待完成
+> 状态：已冻结；第 12 节目标已完成代码迁移和本地自动化验收
 >
 > 范围：最近几轮关于分布式部署、项目公平调度、Kafka、Worker、Attempt 恢复的讨论
 >
 > 前置基线：[00_核心架构决策基线.md](./00_核心架构决策基线.md)
 
-本文只记录最近几轮新增或修正的决策，不重复 Definition、Draft/Published Version、IR/DSL、Source Map、Run/Node Run 基础生命周期等既有结论。第 1～10 节保留最初 M6/M7 的历史实现背景；第 11 节记录已经实现并验证过的一秒时间桶 FIFO、Project Load、Topic Queue Window 和 Scheduling Redis 方案；第 12 节在进一步简化后废止独立 Scheduler 与 Scheduling Redis，是后续代码更新的最高优先级目标。第 12 节落盘不等于代码已经完成迁移；README、运行状态和验收结论在迁移验收前仍以实际代码为准。
+本文只记录最近几轮新增或修正的决策，不重复 Definition、Draft/Published Version、IR/DSL、Source Map、Run/Node Run 基础生命周期等既有结论。第 1～10 节保留最初 M6/M7 的历史实现背景；第 11 节记录曾实现并验证过的一秒时间桶 FIFO、Project Load、Topic Queue Window 和 Scheduling Redis 方案；第 12 节在进一步简化后废止独立 Scheduler 与 Scheduling Redis，并已完成对应代码、配置、部署、迁移和本地自动化验收。当前实现与验收以第 12 节为准。
 
 ## 1. 分布式范围与第一阶段部署形态
 
@@ -874,7 +874,7 @@ Run Read Model是面向Web/CLI的只读运行视图，聚合Run、Node、Output�
 
 ## 12. 最新冻结目标：Engine 直接形成执行意图，删除 Scheduler 与 Scheduling Redis
 
-> 决策状态：已确认，待代码迁移和重新验收
+> 决策状态：已确认；代码迁移与本地自动化验收已完成
 >
 > 决策日期：2026-08-27
 >

@@ -4,7 +4,7 @@
 
 EvalFrog 是一个同时面向 Human Web 与 Agent CLI 的企业级 Workflow Platform。它的目标不是在第一阶段提供大量节点和外围功能，而是先建立一个边界清晰、可恢复、可追踪、可以长期演进的 Workflow 核心。
 
-当前状态：**M0-M11 已完成；M12 Release Candidate 验收进行中**。Agent CLI 与 Human Web 已通过同一 External API 跑通 IR 编辑、Draft Test、Publish、Production Run、Status、Cancel、Source Map 错误回映，以及可恢复的 Runtime 观测与故障恢复闭环。M12 已加入连接池/缓存容量指标、可达依赖扫描、Sandbox Runtime Controller 与零信任部署断言；Engine/Scheduler/Kafka/Worker 高并发闭环重构已通过本地 Unit/Race/覆盖率、真实依赖集成和完整 Compose E2E，GitHub Runner 上的真实 `runsc` Containment Probe 与 1,000 次生命周期压力也已通过。但目标环境容量报告、最终不可变镜像扫描，以及目标环境的恢复/网络策略演练尚未完成，因此当前只能称为 Product Core Loop Ready / Release Candidate，不能称为 Production Ready。验收方法见 [发布与容量验收手册](./docs/operations/发布与容量验收手册.md)。
+当前状态：**M0-M11 已完成；M12 Release Candidate 验收进行中**。Agent CLI 与 Human Web 已通过同一 External API 跑通 IR 编辑、Draft Test、Publish、Production Run、Status、Cancel、Source Map 错误回映，以及可恢复的 Runtime 观测与故障恢复闭环。M12 已加入连接池/缓存容量指标、可达依赖扫描、Sandbox Runtime Controller 与零信任部署断言；当前闭环已简化为 Engine 事务内直派 Attempt/Task Outbox、Kafka 缓冲、Worker 执行和 Runtime Event 回推，不再部署 Scheduler 或 Scheduling Redis。目标环境容量报告、最终不可变镜像扫描，以及目标环境的恢复/网络策略演练仍未完成，因此当前只能称为 Product Core Loop Ready / Release Candidate，不能称为 Production Ready。验收方法见 [发布与容量验收手册](./docs/operations/发布与容量验收手册.md)。
 
 ## 为什么是 EvalFrog
 
@@ -36,18 +36,18 @@ Human Web + evalfrog CLI + Enterprise API
                  ↓
 Modular Control Plane（同一代码库与部署单元，可多副本）
                  ↓
-PostgreSQL + Scheduling Redis + Cache Redis + Kafka
+PostgreSQL + Cache Redis + Kafka
                  ↓
 Builtin Worker Pool + Sandbox Worker Pool
 ```
 
-Control Plane 是模块化单体，不是一个没有边界的大 Service。Definition、Compiler、Runtime Engine、Scheduler、Attempt Coordinator、Execution Context、Eventing 和 Recovery 拥有独立职责，可以同进程部署，但不能互相绕过状态所有权。
+Control Plane 是模块化单体，不是一个没有边界的大 Service。Definition、Compiler、Runtime Engine、Attempt Coordinator、Execution Context、Eventing 和 Recovery 拥有独立职责，可以同进程部署，但不能互相绕过状态所有权。
 
 ## M0 Quick Start
 
 前置条件：Go `1.26+`、Docker 与 Docker Compose。
 
-Windows 使用一条命令构建并启动 PostgreSQL、Scheduling Redis、Cache Redis、Kafka、Migration、Control Plane 和两个 Worker，随后运行 CLI Doctor：
+Windows 使用一条命令构建并启动 PostgreSQL、Cache Redis、Kafka、Migration、Control Plane 和两个 Worker，随后运行 CLI Doctor：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1
@@ -67,7 +67,6 @@ Linux/macOS：
 | Builtin Worker Health | `http://localhost:8081/health/ready` |
 | Sandbox Worker Health | `http://localhost:8082/health/ready` |
 | PostgreSQL | `localhost:15432` |
-| Scheduling Redis | `localhost:16379` |
 | Cache Redis | `localhost:16380` |
 | Kafka | `localhost:29092` |
 
@@ -153,33 +152,24 @@ M5 已将 M4 Aggregate 映射到真实 PostgreSQL 权威状态与可恢复事件
 
 M5 定义的 Runtime Event DTO 与 Publisher Port 已在 M7 接入真实 Kafka；M6 的 `ready → queued + Attempt + Node Task Outbox` 也已通过 Task Relay 进入 Worker 链路。
 
-## FIFO Topic Window Scheduler
+## Engine 直接形成执行意图
 
-Scheduler 已按企业内部短工作流的真实负载重构为持续准入闭环：
+企业内部 Workflow 通常少于 20 个节点，Ready Task 随上游完成逐步产生。当前实现不再设置独立 Scheduler：Engine 在拥有 Run 行锁的事务中完成拓扑推进，并把刚变为 Ready 的 Task 立即批量写成 `queued Node + queued Attempt + node_task_outbox`。不同 Run 由 Engine Consumer 在 PostgreSQL 连接池预算内有界并发，同一 Run 的事件保持顺序。
 
-- `ready_at` 截断为一秒时间桶，先按时间桶 FIFO；同桶内才比较跨 Builtin/Sandbox 的 `Project Load` 与最近准入序号；
-- 同一 Project、同一时间桶内按 `priority DESC, ready_at ASC, node_run_id ASC`；后来低负载 Project 不能越过更早时间桶；
-- Builtin/Sandbox 分别维护 Topic Queue Window，窗口由 Worker 最近实际完成速率 EWMA 乘约五秒缓冲计算，不使用 Worker Slot 分额度；
-- Topic Occupancy 只包含未确认 Reservation 与 Queued Attempt；Claim 后释放 Topic 空位，终态释放 Project Load；
-- Scheduling Redis 使用一个同槽逻辑分片和 Lua 原子维护 Ready、Project Load、Topic Occupancy、Reservation 与紧凑 Inflight，不再使用 Lane/Credit/每秒 Epoch；
-- Engine 提交后尽力登记新 Ready；Scheduler 持续准入、每五秒校准容量，并按 15～30 秒 Profile 周期或故障恢复需要从 PostgreSQL 重建 Generation、修复漏写和计数漂移；
-- PostgreSQL 事务原子完成 `ready → queued + Attempt + node_task_outbox`，数据库 CAS 是最终裁决；
-- Scheduling Redis 使用 `noeviction`、显式 `maxmemory` 和高/恢复水位；内存压力下停止扩充候选但继续排空，Redis 丢失后从 PostgreSQL Ready/Queued/Running 重建。
-
-M6 的 `node_task_outbox` 是 M7 Kafka Task Relay 的可靠输入；公平准入仍在 Kafka 之前完成，Kafka 不重新排序 Project。
+Task Outbox Relay 批量发布到 Builtin/Sandbox Kafka Topic；Kafka 和未发布 Outbox 是正式等待层。Worker 通过 Consumer Group、Local Slot、Claim/Lease/Fencing 消费，积压通过 Outbox Age、Kafka Lag、Queued-to-Running 延迟和 Worker Slot 利用率观测。系统不再维护 Project Load、Topic Window、Reservation、Inflight 或 Scheduling Redis。
 
 ## M7 Kafka 与 Worker Runtime
 
-M7 已跑通 `Scheduler Outbox → Kafka → Worker → Attempt Coordinator → Runtime Event → Engine` 的分布式协议骨架：
+M7 已跑通 `Engine Task Outbox → Kafka → Worker → Attempt Coordinator → Runtime Event → Engine` 的分布式协议骨架：
 
 - Task 与 Runtime Event 使用独立 v1 JSON Contract，分别以 `attempt_id`、`run_id` 为 Kafka Key；Envelope 限制 64 KiB，不携带 DSL、Execution Context、Output 或 Secret；
 - Task/Runtime Outbox Relay 以 PostgreSQL Claim Lease 和 `SKIP LOCKED` 支持多副本至少一次发布；Poison Message 进入 DLQ，可识别 Attempt 的坏 Task 会先形成明确失败；
 - 通用 Worker Runtime 只在本地 Slot 空闲时 Poll；数据库 Claim 成功后立即 ACK，执行和 ACK 解耦，Worker 崩溃由 Lease Reaper 标记 Lost；
 - Claim/Heartbeat/Complete/LoadExecutionContext 使用版本化内部 HTTP/JSON API，Worker 镜像和依赖规则均不包含 PostgreSQL Client；
 - Execution Context Gateway 只读装配不可变 Operation、Run Input、Resolved Input 与 Effective Upstream Output；Cache Redis Hit/Miss/Timeout/坏值均回源 PostgreSQL；Context 基础设施故障由 Lease Recovery 接管，不消耗业务重试；
-- Worker 启动和注册必须提供 Resource Class 完整能力集；Scheduling Redis 保留带 TTL 的健康与能力登记供运维和 Claim 防线使用，但 Slot 不参与 Topic Queue Window 计算；
+- Worker 启动时必须提供 Resource Class 完整能力集，Claim 时数据库再次校验 Operation、Resource Class、Build 与能力坐标；在线状态交给部署平台和监控采集；
 - Kafka Consumer 在 `Poll → Claim/Inbox → ACK` 短窗口内阻塞 Rebalance，ACK 后立即释放，节点长时间执行不会阻塞分区再均衡；
-- 真实 PostgreSQL、Scheduling Redis、故障 Cache Redis 与 Kafka 集成测试验证两个 Control Plane API 副本、两个 Worker/Engine Consumer 副本、重复投递、Lease 过期、Lost/Recovery 和旧 Fencing Result 拒绝。
+- 真实 PostgreSQL、故障 Cache Redis 与 Kafka 集成测试验证两个 Control Plane API 副本、两个 Worker/Engine Consumer 副本、重复投递、Lease 过期、Lost/Recovery 和旧 Fencing Result 拒绝。
 
 M7 仅用 local/test Echo Executor 验证分布式协议；M8 已接入真实 HTTP/RPC 与 Managed Resource Runtime，M9 已用 Per-Attempt Python Sandbox 替代 Sandbox Pool 的 Echo Executor。`production-default` 仅接受 hardened runtime 配置。
 
@@ -196,7 +186,7 @@ go build ./cmd/...
 go test -tags=integration ./tests/integration
 ```
 
-架构测试会扫描仓库依赖，并拒绝 Domain 导入 Adapter、Compiler 导入 HTTP/PostgreSQL/Redis/Kafka Client、Worker 导入 PostgreSQL Adapter、Runtime 读取作者态模型、Scheduler 导入 Engine 或基础设施 Client，以及新增 `common/utils/service/pkg` 等逃逸边界的目录。
+架构测试会扫描仓库依赖，并拒绝 Domain 导入 Adapter、Compiler 导入 HTTP/PostgreSQL/Redis/Kafka Client、Worker 导入 PostgreSQL Adapter、Runtime 读取作者态模型，以及新增 `common/utils/service/pkg` 等逃逸边界的目录。
 
 ## 核心架构原则
 
@@ -223,8 +213,7 @@ CLI 可以上传 IR，并下载平台生成的 DSL、Source Map 和诊断；不�
 
 | 组件 | 负责 |
 |---|---|
-| Engine | Run/NodeRun 语义推进、Branch、Retry、Skipped、终态 |
-| Scheduler | Project 公平准入、创建并派发 Attempt |
+| Engine | Run/NodeRun 语义推进、Branch、Retry、Skipped、终态，并原子创建 Attempt 与 Task Outbox |
 | Attempt Coordinator | Claim、Heartbeat、Complete、Lease、Fencing、Output Candidate |
 | Execution Context Gateway | 向 Worker 只读装配 Snapshot、Input、Effective Output |
 | Worker | 执行一个 Attempt，不修改 Workflow 状态 |
@@ -232,7 +221,6 @@ CLI 可以上传 IR，并下载平台生成的 DSL、Source Map 和诊断；不�
 ### 数据职责
 
 - PostgreSQL：Definition、Runtime、Output、Outbox/Inbox、权限与审计的唯一权威状态；
-- Scheduling Redis：FIFO Ready Index、Project Load、Topic Window/Occupancy、Reservation 与紧凑 Inflight，可从 PostgreSQL 重建；
 - Cache Redis：Execution Snapshot、Run Context、Effective Output、Run Read Model，Cache Miss 时回源；
 - Kafka：Builtin Task、Sandbox Task、Runtime Event 的至少一次传输，不承担权威状态。
 
@@ -256,12 +244,7 @@ Code Sandbox 使用固定资源规格和 JSON Object 输入输出，不提供 Ne
 
 ## 调度与执行
 
-EvalFrog 使用有界 Kafka 缓冲前的一秒时间桶 FIFO：
-
-- 更早时间桶先执行，避免持续到来的小 Project 让大 Project 后继节点永久饥饿；
-- 同一秒内用 `Project Load` 打散并发突发，Load 相同按最近准入序号轮转；
-- Kafka 前只保留 Worker 约五秒实际完成能力对应的 Queued Task；
-- Scheduling Redis 原子预占，PostgreSQL CAS 是 `ready → queued` 的最终裁决。
+EvalFrog 由 Engine 在同一 PostgreSQL Run 事务中批量推进 Node，并原子写入 queued Attempt 与 Task Outbox。Task Relay 将其批量发布到按 Resource Class 隔离的 Kafka Topic；Kafka Consumer Group 提供分区内顺序、至少一次投递、缓冲和 Worker 横向扩展。
 
 Worker 只有在本地执行槽可用时才领取 Task：
 
@@ -346,7 +329,7 @@ Infrastructure Adapter
 
 - Go：Control Plane、CLI、Worker Runtime 与 Builtin Executor；
 - PostgreSQL：权威 Definition/Runtime 数据、Outbox/Inbox；
-- Redis：Scheduling Store 与 Cache Store；
+- Redis：仅用于可淘汰、可回源的 Cache Store；
 - Kafka：TaskBus 与 Runtime Event；
 - Python Sandbox：Code Node 隔离执行；
 - HTTP/JSON：External API 与第一阶段 Worker API；
@@ -388,7 +371,7 @@ Infrastructure Adapter
 
 ## 开发状态
 
-M0-M11 已完成仓库护栏、作者态 IR/Catalog、Compiler/DSL/Source Map、Definition 生命周期、Runtime Engine 与 PostgreSQL、Outbox/Inbox、Project 公平 Scheduler、Scheduling Redis、Kafka/Worker 分布式执行骨架、受管 HTTP/RPC Builtin Executor、Python Per-Attempt Sandbox、External Run API、Agent CLI/Human Web 闭环，以及 Retry/Recovery/可观测性与故障恢复闭环。当前可称为 Product Core Loop Ready；M12 的自动化 `runsc` 与 Compose 门禁已通过，但容量、最终镜像扫描与目标环境发布门槛仍未完成。
+M0-M11 已完成仓库护栏、作者态 IR/Catalog、Compiler/DSL/Source Map、Definition 生命周期、Runtime Engine 与 PostgreSQL、Outbox/Inbox、Kafka/Worker 分布式执行骨架、受管 HTTP/RPC Builtin Executor、Python Per-Attempt Sandbox、External Run API、Agent CLI/Human Web 闭环，以及 Retry/Recovery/可观测性与故障恢复闭环。M12 已把历史公平 Scheduler/Scheduling Redis 路径收敛为 Engine 事务内直派；当前可称为 Product Core Loop Ready，但容量、最终镜像扫描与目标环境发布门槛仍未完成。
 
 ### M10 Product Core Loop
 

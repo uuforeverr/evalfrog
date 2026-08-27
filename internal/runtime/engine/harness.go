@@ -9,7 +9,7 @@ import (
 	"github.com/uu999/evalfrog/internal/runtime"
 )
 
-// Harness is deterministic test infrastructure. It does not model Scheduler,
+// Harness is deterministic test infrastructure. It does not model persistence,
 // Kafka or Worker internals; it only feeds domain facts into Engine operations.
 type Harness struct {
 	Engine     *Engine

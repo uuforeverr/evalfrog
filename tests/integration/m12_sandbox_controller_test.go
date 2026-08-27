@@ -21,7 +21,7 @@ import (
 
 // This is deliberately opt-in because it needs the deployed local Compose
 // stack. It proves the path that an in-process test cannot prove:
-// Scheduler -> Kafka -> socket-free Sandbox Worker -> private Controller ->
+// Engine Task Outbox -> Kafka -> socket-free Sandbox Worker -> private Controller ->
 // OCI container -> Worker API -> Engine. The CI integration job enables it.
 func TestM12ComposeSandboxControllerCompletesProductionRun(t *testing.T) {
 	if os.Getenv("EVALFROG_M12_COMPOSE") != "1" {

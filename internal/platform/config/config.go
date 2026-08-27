@@ -31,7 +31,6 @@ type Config struct {
 	Redis         RedisConfig         `yaml:"redis"`
 	Kafka         KafkaConfig         `yaml:"kafka"`
 	Engine        EngineConfig        `yaml:"engine"`
-	Scheduler     SchedulerConfig     `yaml:"scheduler"`
 	Worker        WorkerConfig        `yaml:"worker"`
 	Sandbox       SandboxConfig       `yaml:"sandbox"`
 	Outbox        OutboxConfig        `yaml:"outbox"`
@@ -70,8 +69,7 @@ type PostgresConfig struct {
 }
 
 type RedisConfig struct {
-	Scheduling RedisEndpointConfig `yaml:"scheduling"`
-	Cache      RedisEndpointConfig `yaml:"cache"`
+	Cache RedisEndpointConfig `yaml:"cache"`
 }
 
 type RedisEndpointConfig struct {
@@ -119,25 +117,6 @@ type KafkaTopicConfig struct {
 
 type EngineConfig struct {
 	MaxInflight int `yaml:"max_inflight"`
-}
-
-type SchedulerConfig struct {
-	RedisCandidateBatch         int      `yaml:"redis_candidate_batch"`
-	AdmissionConcurrency        int      `yaml:"admission_concurrency"`
-	CapacityCalibrationInterval Duration `yaml:"capacity_calibration_interval"`
-	ReadyReconcileInterval      Duration `yaml:"ready_reconcile_interval"`
-	ReconcileLease              Duration `yaml:"reconcile_lease"`
-	ReservationTTL              Duration `yaml:"reservation_ttl"`
-	TopicQueueBuffer            Duration `yaml:"topic_queue_buffer"`
-	TopicEWMAAlpha              float64  `yaml:"topic_ewma_alpha"`
-	BuiltinMinQueue             int      `yaml:"builtin_min_queue"`
-	BuiltinMaxQueue             int      `yaml:"builtin_max_queue"`
-	SandboxMinQueue             int      `yaml:"sandbox_min_queue"`
-	SandboxMaxQueue             int      `yaml:"sandbox_max_queue"`
-	MemoryHighWatermark         float64  `yaml:"memory_high_watermark"`
-	MemoryResumeWatermark       float64  `yaml:"memory_resume_watermark"`
-	IdlePoll                    Duration `yaml:"idle_poll"`
-	IdlePollMax                 Duration `yaml:"idle_poll_max"`
 }
 
 type WorkerConfig struct {
@@ -320,7 +299,6 @@ func applyEnvironment(config *Config, lookup func(string) (string, bool)) {
 	setString("EVALFROG_HTTP_ADDRESS", &config.HTTP.ControlPlaneAddress)
 	setString("EVALFROG_CONTROL_PLANE_URL", &config.Endpoints.ControlPlaneURL)
 	setString("EVALFROG_POSTGRES_DSN", &config.Postgres.DSN)
-	setString("EVALFROG_SCHEDULING_REDIS_ADDRESS", &config.Redis.Scheduling.Address)
 	setString("EVALFROG_CACHE_REDIS_ADDRESS", &config.Redis.Cache.Address)
 	setString("EVALFROG_MIGRATIONS_DIR", &config.Migrations.Directory)
 	setString("EVALFROG_SANDBOX_IMAGE", &config.Sandbox.Image)
@@ -381,13 +359,7 @@ func (config Config) Validate() error {
 		add(value.OperationTimeout.Duration() <= 0, "redis.%s.operation_timeout must be positive", name)
 		add(!strings.Contains(value.KeyPrefix, ":"+config.Profile+":"), "redis.%s.key_prefix must be isolated for profile %q", name, config.Profile)
 	}
-	validateRedis("scheduling", config.Redis.Scheduling)
 	validateRedis("cache", config.Redis.Cache)
-	add(config.Redis.Scheduling.EvictionPolicy != "noeviction", "scheduling Redis must use noeviction")
-	if config.Redis.Scheduling.Address == config.Redis.Cache.Address && config.Redis.Scheduling.DB == config.Redis.Cache.DB {
-		add(config.Profile != "local", "only local profile may share Redis endpoints")
-		add(config.Redis.Cache.EvictionPolicy != "noeviction", "shared local Redis must use noeviction for all keys")
-	}
 
 	add(len(config.Kafka.Brokers) == 0, "kafka.brokers is required")
 	for _, broker := range config.Kafka.Brokers {
@@ -410,15 +382,6 @@ func (config Config) Validate() error {
 	add(config.Kafka.Topics.SandboxTask.Partitions < config.Worker.ExpectedSandboxConsumers, "sandbox task partitions must cover expected consumers")
 	add(config.Kafka.Topics.RuntimeEvent.Partitions < config.Worker.ExpectedRuntimeEventConsumers, "runtime event partitions must cover expected consumers")
 	add(config.Engine.MaxInflight <= 0 || int32(config.Engine.MaxInflight) >= config.Postgres.PoolMax, "engine.max_inflight must be positive and leave PostgreSQL pool capacity for other control-plane modules")
-
-	add(config.Scheduler.RedisCandidateBatch <= 0 || config.Scheduler.AdmissionConcurrency <= 0, "scheduler batch and concurrency values must be positive")
-	add(config.Scheduler.CapacityCalibrationInterval.Duration() <= 0 || config.Scheduler.ReadyReconcileInterval.Duration() < config.Scheduler.CapacityCalibrationInterval.Duration(), "scheduler reconciliation interval must cover the positive capacity calibration interval")
-	add(config.Scheduler.ReconcileLease.Duration() <= 0 || config.Scheduler.ReconcileLease.Duration() >= config.Scheduler.ReadyReconcileInterval.Duration(), "scheduler reconcile lease must be positive and shorter than reconciliation interval")
-	add(config.Scheduler.ReservationTTL.Duration() <= 0, "scheduler reservation TTL must be positive")
-	add(config.Scheduler.TopicQueueBuffer.Duration() <= 0 || config.Scheduler.TopicEWMAAlpha <= 0 || config.Scheduler.TopicEWMAAlpha > 1, "scheduler topic queue buffer and EWMA alpha are invalid")
-	add(config.Scheduler.BuiltinMinQueue <= 0 || config.Scheduler.BuiltinMaxQueue < config.Scheduler.BuiltinMinQueue || config.Scheduler.SandboxMinQueue <= 0 || config.Scheduler.SandboxMaxQueue < config.Scheduler.SandboxMinQueue, "scheduler topic queue bounds are invalid")
-	add(config.Scheduler.MemoryResumeWatermark <= 0 || config.Scheduler.MemoryHighWatermark <= config.Scheduler.MemoryResumeWatermark || config.Scheduler.MemoryHighWatermark >= 1, "scheduler memory watermarks are invalid")
-	add(config.Scheduler.IdlePoll.Duration() <= 0 || config.Scheduler.IdlePollMax.Duration() < config.Scheduler.IdlePoll.Duration(), "scheduler idle polling bounds are invalid")
 
 	heartbeat := config.Worker.HeartbeatInterval.Duration()
 	lease := config.Worker.LeaseDuration.Duration()

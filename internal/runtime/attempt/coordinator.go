@@ -99,39 +99,24 @@ func (coordinator Coordinator) MarkExpiredLost(ctx context.Context, command Mark
 	if err != nil {
 		return false, err
 	}
-	accepted, err := coordinator.repository.MarkExpiredLost(ctx, MarkLostRecord{MarkLostCommand: command, EventID: eventID, Now: coordinator.clock.Now().UTC()})
-	if err == nil && accepted && coordinator.lifecycle != nil {
-		// PostgreSQL is already committed. Redis cleanup is deliberately
-		// best-effort and a Reaper-produced Lost is not worker throughput.
-		_ = coordinator.lifecycle.MarkTerminal(ctx, command.AttemptID, false)
-	}
-	return accepted, err
+	return coordinator.repository.MarkExpiredLost(ctx, MarkLostRecord{MarkLostCommand: command, EventID: eventID, Now: coordinator.clock.Now().UTC()})
 }
 
 type Coordinator struct {
 	repository Repository
 	ids        identity.Generator
 	clock      clock.Clock
-	lifecycle  scheduling.AttemptLifecycle
 }
 
 func NewCoordinator(repository Repository, ids identity.Generator, valueClock clock.Clock) (Coordinator, error) {
-	return NewCoordinatorWithLifecycle(repository, ids, valueClock, nil)
-}
-
-func NewCoordinatorWithLifecycle(repository Repository, ids identity.Generator, valueClock clock.Clock, lifecycle scheduling.AttemptLifecycle) (Coordinator, error) {
 	if repository == nil || ids == nil || valueClock == nil {
 		return Coordinator{}, fmt.Errorf("attempt coordinator dependencies are required")
 	}
-	return Coordinator{repository: repository, ids: ids, clock: valueClock, lifecycle: lifecycle}, nil
+	return Coordinator{repository: repository, ids: ids, clock: valueClock}, nil
 }
 
-func NewBuiltinCoordinator(repository Repository, lifecycle ...scheduling.AttemptLifecycle) Coordinator {
-	var hook scheduling.AttemptLifecycle
-	if len(lifecycle) > 0 {
-		hook = lifecycle[0]
-	}
-	value, err := NewCoordinatorWithLifecycle(repository, identity.UUIDv7Generator{}, clock.System{}, hook)
+func NewBuiltinCoordinator(repository Repository) Coordinator {
+	value, err := NewCoordinator(repository, identity.UUIDv7Generator{}, clock.System{})
 	if err != nil {
 		panic(err)
 	}
@@ -151,12 +136,7 @@ func (coordinator Coordinator) Claim(ctx context.Context, command ClaimCommand) 
 	if err != nil {
 		return Lease{}, err
 	}
-	lease, err := coordinator.repository.Claim(ctx, ClaimRecord{ClaimCommand: command, LeaseToken: token, Now: coordinator.clock.Now().UTC()})
-	if err == nil && coordinator.lifecycle != nil {
-		// Duplicate Claim is safe: MarkClaimed changes queue_occupied only once.
-		_ = coordinator.lifecycle.MarkClaimed(ctx, command.AttemptID)
-	}
-	return lease, err
+	return coordinator.repository.Claim(ctx, ClaimRecord{ClaimCommand: command, LeaseToken: token, Now: coordinator.clock.Now().UTC()})
 }
 
 func (coordinator Coordinator) Heartbeat(ctx context.Context, command HeartbeatCommand) (Lease, error) {
@@ -192,9 +172,5 @@ func (coordinator Coordinator) Complete(ctx context.Context, command CompleteCom
 	if err != nil {
 		return false, err
 	}
-	accepted, err := coordinator.repository.Complete(ctx, CompleteRecord{CompleteCommand: command, EventID: eventID, Now: coordinator.clock.Now().UTC()})
-	if err == nil && accepted && coordinator.lifecycle != nil {
-		_ = coordinator.lifecycle.MarkTerminal(ctx, command.AttemptID, true)
-	}
-	return accepted, err
+	return coordinator.repository.Complete(ctx, CompleteRecord{CompleteCommand: command, EventID: eventID, Now: coordinator.clock.Now().UTC()})
 }

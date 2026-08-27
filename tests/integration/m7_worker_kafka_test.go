@@ -21,7 +21,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/uu999/evalfrog/internal/adapters/cacheredis"
 	"github.com/uu999/evalfrog/internal/adapters/kafka"
-	"github.com/uu999/evalfrog/internal/adapters/schedulingredis"
 	"github.com/uu999/evalfrog/internal/adapters/workerapi"
 	"github.com/uu999/evalfrog/internal/dsl"
 	"github.com/uu999/evalfrog/internal/eventing"
@@ -39,15 +38,8 @@ func TestM7KafkaWorkerCoordinatorEngineEndToEnd(t *testing.T) {
 	workflow, snapshot := harness.createCodeWorkflow(t, false)
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m7-e2e-run")
 	harness.initializeRun(t, run)
-	authority, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 10)
-	if err != nil || len(authority.Candidates) != 1 {
-		t.Fatalf("candidate=%+v err=%v", authority.Candidates, err)
-	}
-	taskID, attemptID := newID(t), newID(t)
-	task, err := harness.store.DispatchReady(harness.ctx, scheduling.DispatchCommand{Candidate: authority.Candidates[0], AttemptID: attemptID, TaskID: taskID, TraceID: "m7-e2e", Now: time.Now().UTC()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task := queuedTask(t, harness, run.ID)
+	attemptID := task.AttemptID
 	queued := struct {
 		ID       string
 		Sequence uint32
@@ -79,13 +71,9 @@ func TestM7KafkaWorkerCoordinatorEngineEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schedulingConfig := configuration.Redis.Scheduling
-	schedulingConfig.KeyPrefix += "m7:" + identifier + ":"
-	capacityRegistry := schedulingredis.Open(schedulingConfig)
-	defer capacityRegistry.Close()
 	controlPlanes := []*httptest.Server{
-		httptest.NewServer(workerapi.NewHandler(harness.coordinator, gateway, capacityRegistry)),
-		httptest.NewServer(workerapi.NewHandler(harness.coordinator, gateway, capacityRegistry)),
+		httptest.NewServer(workerapi.NewHandler(harness.coordinator, gateway)),
+		httptest.NewServer(workerapi.NewHandler(harness.coordinator, gateway)),
 	}
 	defer controlPlanes[0].Close()
 	defer controlPlanes[1].Close()
@@ -113,9 +101,6 @@ func TestM7KafkaWorkerCoordinatorEngineEndToEnd(t *testing.T) {
 		if workerErr != nil {
 			t.Fatal(workerErr)
 		}
-		if registerErr := workerClients[replica].RegisterWorker(ctx, scheduling.WorkerRegistration{WorkerID: workerID, ExecutorBuild: "m7-test", ResourceClass: scheduling.ResourceSandbox, Slots: 1, Capabilities: catalog.Capabilities(), TTL: 5 * time.Second}); registerErr != nil {
-			t.Fatal(registerErr)
-		}
 		runtimeConsumer, consumerErr := kafka.OpenConsumer(configuration.Kafka, "m7-runtime-"+identifier+suffix, "m7-runtime-"+identifier, []config.KafkaTopicConfig{configuration.Kafka.Topics.RuntimeEvent}, 1)
 		if consumerErr != nil {
 			t.Fatal(consumerErr)
@@ -127,10 +112,6 @@ func TestM7KafkaWorkerCoordinatorEngineEndToEnd(t *testing.T) {
 		}
 		go func() { done <- worker.Run(ctx) }()
 		go func() { done <- engineService.Run(ctx) }()
-	}
-	capacity, err := capacityRegistry.HealthyCapacity(ctx)
-	if err != nil || capacity.Pools[scheduling.ResourceSandbox] != 2 {
-		t.Fatalf("registered capacity=%+v err=%v", capacity, err)
 	}
 	// Both group members must enter Poll before publishing, otherwise the first
 	// record can be consumed before Kafka has exercised replica assignment.
@@ -154,7 +135,7 @@ func TestM7KafkaWorkerCoordinatorEngineEndToEnd(t *testing.T) {
 	waitFor(t, ctx, func() bool { return runState(t, harness, run.ID) == "succeeded" }, "engine effective output")
 	// A Kafka redelivery after completion must be ACKed as stale and cannot
 	// create a second output candidate or effective result.
-	if err = publisher.PublishTask(ctx, eventing.TaskFromScheduling(task)); err != nil {
+	if err = publisher.PublishTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -180,17 +161,8 @@ func TestM7ExecutionContextLoadsEntryNodeInput(t *testing.T) {
 	workflow, snapshot := harness.createEntryRefCodeWorkflow(t)
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m7-entry-input")
 	harness.initializeRun(t, run)
-	authority, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 10)
-	if err != nil || len(authority.Candidates) != 1 {
-		t.Fatalf("candidate=%+v err=%v", authority.Candidates, err)
-	}
-	task, err := harness.store.DispatchReady(harness.ctx, scheduling.DispatchCommand{
-		Candidate: authority.Candidates[0], AttemptID: newID(t), TaskID: newID(t),
-		TraceID: "m7-entry-input", Now: time.Now().UTC(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task := queuedTask(t, harness, run.ID)
+	var err error
 	lease, err := harness.coordinator.Claim(harness.ctx, attempt.ClaimCommand{
 		ProjectID: task.ProjectID, RunID: task.RunID, AttemptID: task.AttemptID,
 		AttemptSequence: task.AttemptSequence, WorkerID: "worker-entry-input", ExecutorBuild: "m7-test",
@@ -298,14 +270,8 @@ func TestM7ExpiredLeaseBecomesLostAndStaleResultIsRejected(t *testing.T) {
 	workflow, snapshot := harness.createCodeWorkflow(t, false)
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m7-lease-recovery")
 	harness.initializeRun(t, run)
-	authority, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 10)
-	if err != nil || len(authority.Candidates) != 1 {
-		t.Fatalf("candidate=%+v err=%v", authority.Candidates, err)
-	}
-	task, err := harness.store.DispatchReady(harness.ctx, scheduling.DispatchCommand{Candidate: authority.Candidates[0], AttemptID: newID(t), TaskID: newID(t), TraceID: "m7-recovery", Now: time.Now().UTC()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	task := queuedTask(t, harness, run.ID)
+	var err error
 	lease, err := harness.coordinator.Claim(harness.ctx, attempt.ClaimCommand{ProjectID: task.ProjectID, RunID: task.RunID, AttemptID: task.AttemptID, AttemptSequence: task.AttemptSequence, WorkerID: "crashed-worker", ExecutorBuild: "m7-test", ResourceClass: scheduling.ResourceSandbox, Capabilities: []dsl.Coordinate{{Type: "task.python", Version: 1}}, LeaseDuration: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -335,38 +301,31 @@ func TestM7ExpiredLeaseBecomesLostAndStaleResultIsRejected(t *testing.T) {
 	}
 }
 
-func TestM7WorkerCapacityRegistrationExpires(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
-	}
-	configuration, err := config.Load(config.LoadOptions{Directory: filepath.Join(root, "configs"), Profile: "local"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	configuration.Redis.Scheduling.KeyPrefix += "m7-capacity:" + uuid.NewString() + ":"
-	registry := schedulingredis.Open(configuration.Redis.Scheduling)
-	defer registry.Close()
-	registration := scheduling.WorkerRegistration{WorkerID: "worker", ExecutorBuild: "m7", ResourceClass: scheduling.ResourceSandbox, Slots: 3, Capabilities: scheduling.RequiredCapabilities(scheduling.ResourceSandbox), TTL: 100 * time.Millisecond}
-	if err = registry.RegisterWorker(context.Background(), registration); err != nil {
-		t.Fatal(err)
-	}
-	capacity, err := registry.HealthyCapacity(context.Background())
-	if err != nil || capacity.Pools[scheduling.ResourceSandbox] != 3 {
-		t.Fatalf("active capacity=%+v err=%v", capacity, err)
-	}
-	time.Sleep(150 * time.Millisecond)
-	capacity, err = registry.HealthyCapacity(context.Background())
-	if err != nil || capacity.Pools[scheduling.ResourceSandbox] != 0 {
-		t.Fatalf("expired capacity=%+v err=%v", capacity, err)
-	}
-}
-
 // M7 uses a unique topic prefix. This wrapper additionally verifies ownership
 // and message keys so a transport isolation regression fails loudly.
 type projectConsumer struct {
 	eventing.Consumer
 	projectID, runID, expectedKey string
+}
+
+func queuedTask(t *testing.T, harness *m5Harness, runID string) eventing.TaskMessage {
+	t.Helper()
+	var task eventing.TaskMessage
+	err := harness.client.Pool().QueryRow(harness.ctx, `
+		SELECT message_version, task_id::text, project_id::text, run_id::text,
+		       node_run_id::text, execution_node_id, attempt_id::text,
+		       attempt_seq, resource_class, occurred_at, trace_id
+		FROM node_task_outbox
+		WHERE project_id=$1 AND run_id=$2
+		ORDER BY created_at, task_id
+		LIMIT 1`, harness.projectID, runID).Scan(
+		&task.MessageVersion, &task.TaskID, &task.ProjectID, &task.RunID,
+		&task.NodeRunID, &task.ExecutionNodeID, &task.AttemptID,
+		&task.AttemptSequence, &task.ResourceClass, &task.OccurredAt, &task.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task
 }
 
 func (value *projectConsumer) Receive(ctx context.Context) (eventing.Delivery, error) {

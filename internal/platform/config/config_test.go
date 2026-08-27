@@ -33,7 +33,7 @@ func TestLoadRejectsProfileMixing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	content = []byte(strings.Replace(string(content), "evalfrog:local:sched:", "evalfrog:test:sched:", 1))
+	content = []byte(strings.Replace(string(content), "evalfrog:local:cache:", "evalfrog:test:cache:", 1))
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -79,9 +79,6 @@ func TestValidateCapacityConstraints(t *testing.T) {
 		{"invalid HTTP port", func(value *Config) { value.HTTP.ControlPlaneAddress = ":0" }, "control_plane_address"},
 		{"heartbeat", func(value *Config) { value.Worker.HeartbeatInterval = Duration(4 * time.Second) }, "heartbeat_interval"},
 		{"lost threshold", func(value *Config) { value.Worker.LostAfter = Duration(10 * time.Second) }, "lost_after"},
-		{"reservation", func(value *Config) { value.Scheduler.ReservationTTL = 0 }, "reservation TTL"},
-		{"topic bounds", func(value *Config) { value.Scheduler.BuiltinMaxQueue = 0 }, "topic queue bounds"},
-		{"memory hysteresis", func(value *Config) { value.Scheduler.MemoryResumeWatermark = value.Scheduler.MemoryHighWatermark }, "memory watermarks"},
 		{"consumer partitions", func(value *Config) { value.Worker.ExpectedBuiltinConsumers = 2 }, "partitions"},
 		{"engine database budget", func(value *Config) { value.Engine.MaxInflight = int(value.Postgres.PoolMax) }, "engine.max_inflight"},
 		{"database budget", func(value *Config) { value.Postgres.ExpectedControlPlaneInstances = 100 }, "70% safety budget"},

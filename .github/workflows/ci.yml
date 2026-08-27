@@ -39,7 +39,7 @@ jobs:
           npm test
           npm run build
       - name: Authoring, definition and runtime contract repeatability
-        run: go test -count=20 ./contracts/ir ./contracts/dsl ./contracts/source-map ./contracts/openapi ./contracts/messages ./internal/ir ./internal/catalog ./internal/dsl ./internal/sourcemap ./internal/compiler ./internal/access ./internal/resources ./internal/adapters/httpapi ./internal/adapters/workerapi ./internal/runtime ./internal/runtime/engine ./internal/runtime/attempt ./internal/runtime/context ./internal/eventing ./internal/recovery ./internal/scheduling ./internal/worker/runtime
+        run: go test -count=20 ./contracts/ir ./contracts/dsl ./contracts/source-map ./contracts/openapi ./contracts/messages ./internal/ir ./internal/catalog ./internal/dsl ./internal/sourcemap ./internal/compiler ./internal/access ./internal/resources ./internal/adapters/httpapi ./internal/adapters/workerapi ./internal/runtime ./internal/runtime/engine ./internal/runtime/attempt ./internal/runtime/context ./internal/eventing ./internal/recovery ./internal/worker/runtime
       - name: Core package coverage gate
         shell: bash
         run: |
@@ -60,7 +60,6 @@ jobs:
           check_coverage ./internal/compiler
           check_coverage ./internal/runtime/engine
           check_coverage ./internal/runtime/attempt
-          check_coverage ./internal/scheduling
           check_coverage ./internal/runtime/context
       - name: Bounded IR fuzzing
         run: |
@@ -107,7 +106,6 @@ jobs:
             -e EVALFROG_M12_COMPOSE=1 \
             -e EVALFROG_INTEGRATION_POSTGRES_DSN=postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable \
             -e EVALFROG_M12_POSTGRES_DSN=postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable \
-            -e EVALFROG_SCHEDULING_REDIS_ADDRESS=redis-scheduling:6379 \
             -e EVALFROG_CACHE_REDIS_ADDRESS=redis-cache:6379 \
             -e EVALFROG_KAFKA_BROKERS=kafka:9092 \
             evalfrog-integration-runner \

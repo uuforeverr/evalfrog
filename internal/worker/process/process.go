@@ -138,15 +138,7 @@ func RunProcess(ctx context.Context, arguments []string, resourceClass string, o
 		logger.Error("worker runtime construction failed", "error", err)
 		return 1
 	}
-	registration, err := workerruntime.NewRegistrationService(controlPlane, scheduling.WorkerRegistration{
-		WorkerID: workerID, ExecutorBuild: version, ResourceClass: class, Slots: slots,
-		Capabilities: catalog.Capabilities(), TTL: configuration.Worker.LostAfter.Duration(),
-	}, configuration.Worker.HeartbeatInterval.Duration(), logger)
-	if err != nil {
-		logger.Error("worker registration construction failed", "error", err)
-		return 1
-	}
-	if err := lifecycle.Run(ctx, configuration.Shutdown.Timeout.Duration(), logger, server, registration, workerRuntime); err != nil {
+	if err := lifecycle.Run(ctx, configuration.Shutdown.Timeout.Duration(), logger, server, workerRuntime); err != nil {
 		logger.Error("worker stopped with error", "error", err)
 		return 1
 	}

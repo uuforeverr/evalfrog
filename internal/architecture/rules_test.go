@@ -41,8 +41,6 @@ func TestRulesRejectForbiddenImports(t *testing.T) {
 		{"HTTP API database", "internal/adapters/httpapi", "internal/adapters/postgres", "application ports"},
 		{"runtime authoring", "internal/runtime/engine", "internal/ir", "authoring models"},
 		{"runtime root authoring", "internal/runtime", "internal/definition", "authoring models"},
-		{"scheduler engine", "internal/scheduling", "internal/runtime/engine", "control semantics"},
-		{"scheduler Redis", "internal/scheduling", "github.com/redis/go-redis/v9", "coordination ports"},
 		{"compiler kafka", "internal/compiler", "github.com/twmb/franz-go", "compiler must remain deterministic"},
 	}
 	for _, test := range tests {

@@ -530,7 +530,6 @@ func TestM5OutboxRelayRecoversBeforeAndAfterPublishCrash(t *testing.T) {
 func TestM5RuntimeIndexesServeFrozenAccessPaths(t *testing.T) {
 	harness := newM5Harness(t)
 	queries := map[string]string{
-		"node_runs_ready_idx":     `SELECT node_run_id FROM node_runs WHERE project_id='00000000-0000-0000-0000-000000000001' AND state='ready' ORDER BY priority DESC, ready_at, node_run_id LIMIT 100`,
 		"node_runs_retry_idx":     `SELECT node_run_id FROM node_runs WHERE state='retry_wait' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, node_run_id LIMIT 100`,
 		"node_attempts_lease_idx": `SELECT attempt_id FROM node_attempts WHERE state='running' AND lease_expires_at <= clock_timestamp() ORDER BY lease_expires_at, attempt_id LIMIT 100`,
 		"outbox_events_relay_idx": `SELECT event_id FROM outbox_events WHERE published_at IS NULL AND available_at <= clock_timestamp() ORDER BY available_at, event_id LIMIT 100`,
@@ -615,15 +614,18 @@ func assertNodeCurrent(t *testing.T, harness *m5Harness, runID, nodeID string, w
 func readyNodeID(t *testing.T, harness *m5Harness, runID string) string {
 	t.Helper()
 	var id string
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT execution_node_id FROM node_runs WHERE project_id=$1 AND run_id=$2 AND state='ready'`, harness.projectID, runID).Scan(&id); err != nil {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `
+		SELECT execution_node_id FROM node_runs
+		WHERE project_id=$1 AND run_id=$2 AND kind='task' AND state IN ('ready','queued')
+		ORDER BY execution_node_id LIMIT 1`, harness.projectID, runID).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	return id
 }
 
-// dispatchFixture constructs the queued Attempt that M6 Scheduler will own.
-// M5 intentionally has no production ready->queued method because M6 must add
-// NodeTask Outbox to that exact transaction.
+// dispatchFixture returns the Attempt queued atomically by Engine. The fallback
+// keeps older state-transition fixtures usable when they deliberately construct
+// a Ready Node without passing through the production initialization path.
 func dispatchFixture(t *testing.T, harness *m5Harness, runID, nodeID string) runtimepkg.NodeAttemptRecord {
 	t.Helper()
 	tx, err := harness.client.Pool().Begin(harness.ctx)
@@ -636,12 +638,28 @@ func dispatchFixture(t *testing.T, harness *m5Harness, runID, nodeID string) run
 	var stateVersion uint64
 	var sequence, business, recovery uint32
 	var kind runtimepkg.RetryKind
+	var currentAttemptID *string
 	err = tx.QueryRow(harness.ctx, `
 		SELECT node_run_id::text, state, state_version, next_attempt_seq,
-		       next_attempt_kind, business_attempt_count, recovery_count
+		       next_attempt_kind, business_attempt_count, recovery_count,
+		       current_attempt_id::text
 		FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3
 		FOR UPDATE`, harness.projectID, runID, nodeID).
-		Scan(&nodeRunID, &state, &stateVersion, &sequence, &kind, &business, &recovery)
+		Scan(&nodeRunID, &state, &stateVersion, &sequence, &kind, &business, &recovery, &currentAttemptID)
+	if err == nil && state == runtimepkg.NodeQueued && currentAttemptID != nil {
+		var queued runtimepkg.NodeAttemptRecord
+		err = tx.QueryRow(harness.ctx, `
+			SELECT attempt_id::text, attempt_seq, attempt_kind, state, state_version
+			FROM node_attempts
+			WHERE project_id=$1 AND run_id=$2 AND attempt_id=$3`,
+			harness.projectID, runID, *currentAttemptID).
+			Scan(&queued.ID, &queued.Sequence, &queued.Kind, &queued.State, &queued.StateVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued.NodeRunID = runID + ":" + nodeID
+		return queued
+	}
 	if err != nil || state != runtimepkg.NodeReady {
 		t.Fatalf("dispatch fixture state=%s err=%v", state, err)
 	}

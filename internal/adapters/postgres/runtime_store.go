@@ -393,12 +393,11 @@ func commandName(purpose runtime.RunPurpose) string {
 }
 
 type runtimeTransaction struct {
-	tx              pgx.Tx
-	router          scheduling.Router
-	snapshot        *engine.Snapshot
-	store           *Store
-	dirtyRunID      string
-	readyCandidates []scheduling.Candidate
+	tx         pgx.Tx
+	router     scheduling.Router
+	snapshot   *engine.Snapshot
+	store      *Store
+	dirtyRunID string
 }
 
 func (store *Store) WithRunTransaction(ctx context.Context, event eventing.RuntimeEvent, operation func(engine.RunTransaction) error) error {
@@ -423,7 +422,6 @@ func (store *Store) withRuntimeTransaction(ctx context.Context, operation func(e
 		return err
 	}
 	store.invalidateRunView(ctx, adapter.dirtyRunID)
-	store.registerReady(ctx, adapter.readyCandidates)
 	return nil
 }
 
@@ -602,6 +600,7 @@ func (transaction *runtimeTransaction) InitializeRun(ctx context.Context, before
 		RecoveryCount        uint32                    `json:"recovery_count"`
 		NextAttemptKind      runtime.RetryKind         `json:"next_attempt_kind"`
 		ReadyAt              *time.Time                `json:"ready_at"`
+		CurrentAttemptID     string                    `json:"current_attempt_id"`
 		NextRetryAt          *time.Time                `json:"next_retry_at"`
 		Failure              any                       `json:"failure"`
 		CancelReason         string                    `json:"cancel_reason"`
@@ -638,15 +637,9 @@ func (transaction *runtimeTransaction) InitializeRun(ctx context.Context, before
 			Activated: node.Activated, SelectedRoute: node.SelectedRoute, ResolvedInputs: node.ResolvedInputs,
 			NextAttemptSequence: node.NextAttemptSeq, BusinessAttemptCount: node.BusinessAttemptCount,
 			RecoveryCount: node.RecoveryCount, NextAttemptKind: node.NextAttemptKind,
-			ReadyAt: readyAt, NextRetryAt: nextRetryAt, Failure: node.Failure, CancelReason: node.CancelReason,
+			ReadyAt: readyAt, CurrentAttemptID: node.CurrentAttemptID, NextRetryAt: nextRetryAt,
+			Failure: node.Failure, CancelReason: node.CancelReason,
 		})
-		if node.State == runtime.NodeReady && node.Kind == runtime.NodeTask {
-			transaction.readyCandidates = append(transaction.readyCandidates, scheduling.Candidate{
-				ProjectID: after.Run.ProjectID, RunID: after.Run.ID, NodeRunID: nodeRunID,
-				ExecutionNodeID: node.ExecutionNodeID, StateVersion: node.StateVersion,
-				ReadyAt: at, ResourceClass: *resourceClass,
-			}.Normalized())
-		}
 	}
 	rawInserts, err := json.Marshal(inserts)
 	if err != nil {
@@ -657,7 +650,7 @@ func (transaction *runtimeTransaction) InitializeRun(ctx context.Context, before
 			node_run_id, project_id, run_id, execution_node_id, kind, state, state_version,
 			operation_type, operation_version, resource_class, activated, selected_route,
 			resolved_inputs_json, next_attempt_seq, business_attempt_count, recovery_count,
-			next_attempt_kind, priority, ready_at, next_retry_at, failure_json,
+			next_attempt_kind, priority, ready_at, current_attempt_id, next_retry_at, failure_json,
 			cancel_reason, created_at, updated_at
 		)
 		SELECT value.node_run_id::uuid, value.project_id::uuid, value.run_id::uuid,
@@ -665,7 +658,7 @@ func (transaction *runtimeTransaction) InitializeRun(ctx context.Context, before
 		       value.operation_type, value.operation_version, value.resource_class,
 		       value.activated, value.selected_route, value.resolved_inputs,
 		       value.next_attempt_sequence, value.business_attempt_count, value.recovery_count,
-		       value.next_attempt_kind, 0, value.ready_at, value.next_retry_at,
+		       value.next_attempt_kind, 0, value.ready_at, NULLIF(value.current_attempt_id, '')::uuid, value.next_retry_at,
 		       value.failure, value.cancel_reason, $2, $2
 		FROM jsonb_to_recordset($1::jsonb) AS value(
 			node_run_id text, project_id text, run_id text, execution_node_id text,
@@ -673,13 +666,17 @@ func (transaction *runtimeTransaction) InitializeRun(ctx context.Context, before
 			operation_version integer, resource_class text, activated boolean,
 			selected_route text, resolved_inputs jsonb, next_attempt_sequence integer,
 			business_attempt_count integer, recovery_count integer, next_attempt_kind text,
-			ready_at timestamptz, next_retry_at timestamptz, failure jsonb, cancel_reason text
+			ready_at timestamptz, current_attempt_id text, next_retry_at timestamptz,
+			failure jsonb, cancel_reason text
 		)`, rawInserts, at)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() != int64(len(inserts)) {
 		return runtime.ErrRunConflict
+	}
+	if err = transaction.insertNewDispatches(ctx, nil, after, definitions, before.TraceID, at); err != nil {
+		return err
 	}
 	if err := transaction.updateRunCAS(ctx, before, after.Run, at); err != nil {
 		return err
@@ -767,25 +764,6 @@ func (transaction *runtimeTransaction) AdvanceRun(ctx context.Context, before, a
 			RecoveryCount: node.RecoveryCount, NextAttemptKind: node.NextAttemptKind,
 			ReadyAt: readyAt, NextRetryAt: nextRetryAt, Failure: node.Failure, CancelReason: node.CancelReason,
 		})
-		if node.State == runtime.NodeReady && node.Kind == runtime.NodeTask {
-			if transaction.snapshot == nil || transaction.router == nil {
-				return fmt.Errorf("runtime snapshot and routing policy are required to register Ready nodes")
-			}
-			definition, definitionExists := definitions[node.ExecutionNodeID]
-			if !definitionExists {
-				return fmt.Errorf("runtime node %q is absent from immutable snapshot", node.ExecutionNodeID)
-			}
-			resourceClass, routable := transaction.router.Resolve(definition.Operation.Coordinate())
-			if !routable {
-				return fmt.Errorf("runtime operation %s@%d has no routing policy", definition.Operation.Type, definition.Operation.Version)
-			}
-			transaction.readyCandidates = append(transaction.readyCandidates, scheduling.Candidate{
-				ProjectID: after.Run.ProjectID, RunID: after.Run.ID,
-				NodeRunID:       deterministicNodeRunID(after.Run.ID, node.ExecutionNodeID),
-				ExecutionNodeID: node.ExecutionNodeID, StateVersion: node.StateVersion,
-				ReadyAt: at, ResourceClass: resourceClass,
-			}.Normalized())
-		}
 		nodesChanged = true
 	}
 	if len(changes) > 0 {
@@ -825,6 +803,9 @@ func (transaction *runtimeTransaction) AdvanceRun(ctx context.Context, before, a
 			return runtime.ErrRunConflict
 		}
 	}
+	if err := transaction.insertNewDispatches(ctx, before.Attempts, after, definitions, before.Run.TraceID, at); err != nil {
+		return err
+	}
 	if after.Run.StateVersion != before.Run.StateVersion {
 		if err := transaction.updateRunCAS(ctx, before.Run, after.Run, at); err != nil {
 			return err
@@ -835,6 +816,110 @@ func (transaction *runtimeTransaction) AdvanceRun(ctx context.Context, before, a
 	// unchanged (for example a dispatched task becoming running).
 	if nodesChanged || after.Run.StateVersion != before.Run.StateVersion {
 		transaction.dirtyRunID = after.Run.ID
+	}
+	return nil
+}
+
+func (transaction *runtimeTransaction) insertNewDispatches(ctx context.Context, before []runtime.NodeAttemptRecord, after engine.State, definitions map[string]dsl.Node, traceID string, at time.Time) error {
+	known := make(map[string]struct{}, len(before))
+	for _, value := range before {
+		known[value.ID] = struct{}{}
+	}
+	nodes := make(map[string]runtime.NodeRunRecord, len(after.Nodes))
+	for _, node := range after.Nodes {
+		nodes[after.Run.ID+":"+node.ExecutionNodeID] = node
+	}
+	type dispatchInsert struct {
+		AttemptID       string                   `json:"attempt_id"`
+		ProjectID       string                   `json:"project_id"`
+		RunID           string                   `json:"run_id"`
+		NodeRunID       string                   `json:"node_run_id"`
+		ExecutionNodeID string                   `json:"execution_node_id"`
+		AttemptSequence uint32                   `json:"attempt_sequence"`
+		AttemptKind     runtime.RetryKind        `json:"attempt_kind"`
+		AttemptState    runtime.AttemptState     `json:"attempt_state"`
+		StateVersion    uint64                   `json:"state_version"`
+		RetryCount      uint32                   `json:"retry_count"`
+		RecoveryCount   uint32                   `json:"recovery_count"`
+		ResourceClass   scheduling.ResourceClass `json:"resource_class"`
+	}
+	values := make([]dispatchInsert, 0)
+	for _, attempt := range after.Attempts {
+		if _, exists := known[attempt.ID]; exists {
+			continue
+		}
+		node, exists := nodes[attempt.NodeRunID]
+		if !exists || node.Kind != runtime.NodeTask || node.CurrentAttemptID != attempt.ID || node.State != runtime.NodeQueued || attempt.State != runtime.AttemptQueued {
+			return fmt.Errorf("new attempt %q is not the current queued task attempt", attempt.ID)
+		}
+		definition, exists := definitions[node.ExecutionNodeID]
+		if !exists || transaction.router == nil {
+			return fmt.Errorf("runtime node %q has no routing definition", node.ExecutionNodeID)
+		}
+		resourceClass, routable := transaction.router.Resolve(definition.Operation.Coordinate())
+		if !routable {
+			return fmt.Errorf("runtime operation %s@%d has no routing policy", definition.Operation.Type, definition.Operation.Version)
+		}
+		retryCount := uint32(0)
+		if node.BusinessAttemptCount > 0 {
+			retryCount = node.BusinessAttemptCount - 1
+		}
+		values = append(values, dispatchInsert{
+			AttemptID: attempt.ID, ProjectID: after.Run.ProjectID, RunID: after.Run.ID,
+			NodeRunID: deterministicNodeRunID(after.Run.ID, node.ExecutionNodeID), ExecutionNodeID: node.ExecutionNodeID,
+			AttemptSequence: attempt.Sequence, AttemptKind: attempt.Kind, AttemptState: attempt.State,
+			StateVersion: attempt.StateVersion, RetryCount: retryCount, RecoveryCount: node.RecoveryCount,
+			ResourceClass: resourceClass,
+		})
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	tag, err := transaction.tx.Exec(ctx, `
+		INSERT INTO node_attempts (
+			attempt_id, project_id, run_id, node_run_id, attempt_seq, attempt_kind,
+			state, state_version, retry_count, recovery_count, created_at, updated_at
+		)
+		SELECT value.attempt_id::uuid, value.project_id::uuid, value.run_id::uuid,
+		       value.node_run_id::uuid, value.attempt_sequence, value.attempt_kind,
+		       value.attempt_state, value.state_version, value.retry_count,
+		       value.recovery_count, $2, $2
+		FROM jsonb_to_recordset($1::jsonb) AS value(
+			attempt_id text, project_id text, run_id text, node_run_id text,
+			execution_node_id text, attempt_sequence integer, attempt_kind text,
+			attempt_state text, state_version bigint, retry_count integer,
+			recovery_count integer, resource_class text
+		)`, raw, at)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(values)) {
+		return runtime.ErrRunConflict
+	}
+	tag, err = transaction.tx.Exec(ctx, `
+		INSERT INTO node_task_outbox (
+			task_id, project_id, run_id, node_run_id, execution_node_id,
+			attempt_id, attempt_seq, resource_class, message_version,
+			occurred_at, trace_id, available_at
+		)
+		SELECT value.attempt_id::uuid, value.project_id::uuid, value.run_id::uuid,
+		       value.node_run_id::uuid, value.execution_node_id, value.attempt_id::uuid,
+		       value.attempt_sequence, value.resource_class, 1, $2, $3, clock_timestamp()
+		FROM jsonb_to_recordset($1::jsonb) AS value(
+			attempt_id text, project_id text, run_id text, node_run_id text,
+			execution_node_id text, attempt_sequence integer, attempt_kind text,
+			attempt_state text, state_version bigint, retry_count integer,
+			recovery_count integer, resource_class text
+		)`, raw, at, traceID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(values)) {
+		return runtime.ErrRunConflict
 	}
 	return nil
 }

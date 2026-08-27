@@ -27,14 +27,6 @@ postgres:
   idle_in_transaction_timeout: 10s
 
 redis:
-  scheduling:
-    address: "scheduling-redis:6379"
-    password: ""
-    db: 0
-    key_prefix: "evalfrog:production-default:sched:"
-    operation_timeout: 500ms
-    max_retries: 1
-    eviction_policy: "noeviction"
   cache:
     address: "cache-redis:6379"
     password: ""
@@ -69,24 +61,6 @@ kafka:
 
 engine:
   max_inflight: 12
-
-scheduler:
-  redis_candidate_batch: 4096
-  admission_concurrency: 16
-  capacity_calibration_interval: 5s
-  ready_reconcile_interval: 30s
-  reconcile_lease: 4s
-  reservation_ttl: 30s
-  topic_queue_buffer: 5s
-  topic_ewma_alpha: 0.4
-  builtin_min_queue: 8
-  builtin_max_queue: 10000
-  sandbox_min_queue: 4
-  sandbox_max_queue: 5000
-  memory_high_watermark: 0.75
-  memory_resume_watermark: 0.65
-  idle_poll: 100ms
-  idle_poll_max: 1s
 
 worker:
   builtin_slots: 32

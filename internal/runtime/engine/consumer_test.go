@@ -44,6 +44,7 @@ type fakeRunTx struct {
 	failInitError     error
 	advancedBefore    State
 	advancedAfter     State
+	initializedState  State
 	acceptedEvents    []string
 }
 
@@ -69,10 +70,15 @@ func (tx *fakeRunTx) LoadSnapshot(context.Context, string, string) (Snapshot, er
 func (tx *fakeRunTx) LoadEngineState(context.Context, string, string) (State, error) {
 	return tx.state, tx.loadStateError
 }
-func (tx *fakeRunTx) InitializeRun(_ context.Context, _ runtime.WorkflowRunRecord, _ State, _ time.Time) error {
+func (tx *fakeRunTx) InitializeRun(_ context.Context, _ runtime.WorkflowRunRecord, state State, _ time.Time) error {
 	tx.initialized = true
+	tx.initializedState = state
 	return tx.initializeError
 }
+
+type consumerIDs string
+
+func (value consumerIDs) New() (string, error) { return string(value), nil }
 func (tx *fakeRunTx) AdvanceRun(_ context.Context, before, after State, _ time.Time) error {
 	tx.advanced = true
 	tx.advancedBefore, tx.advancedAfter = before, after
@@ -95,10 +101,22 @@ func TestConsumerInitializesPendingRunAndDeduplicatesInbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	tx := &fakeRunTx{accepted: true, authorityNow: harness.Now(), run: pending.Snapshot(), snapshot: harness.Engine.snapshot}
-	consumer, _ := NewConsumer(&fakeTransactions{tx})
+	consumer, _ := NewConsumerWithIdentity(&fakeTransactions{tx}, consumerIDs("00000000-0000-7000-8000-000000000001"), 1)
 	event := testRuntimeEvent(eventing.RunCreated, state.Run.ID, state.Run.ID, state.Run.CreatedAt)
 	if err = consumer.Consume(context.Background(), event); err != nil || !tx.initialized {
 		t.Fatalf("initialized=%v err=%v", tx.initialized, err)
+	}
+	ready, queued := 0, 0
+	for _, node := range tx.initializedState.Nodes {
+		if node.State == runtime.NodeReady {
+			ready++
+		}
+		if node.State == runtime.NodeQueued {
+			queued++
+		}
+	}
+	if ready != 0 || queued != 1 || len(tx.initializedState.Attempts) != 1 || tx.initializedState.Attempts[0].State != runtime.AttemptQueued {
+		t.Fatalf("ready=%d queued=%d attempts=%+v", ready, queued, tx.initializedState.Attempts)
 	}
 	tx.accepted, tx.initialized = false, false
 	if err = consumer.Consume(context.Background(), event); err != nil || tx.initialized {

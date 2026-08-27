@@ -19,19 +19,11 @@ import (
 func TestWorkerAPIClientAndHandlerRoundTrip(t *testing.T) {
 	coordinator := &fakeCoordinator{}
 	gateway := &fakeGateway{}
-	registry := &fakeRegistry{}
-	server := httptest.NewServer(NewHandler(coordinator, gateway, registry))
+	server := httptest.NewServer(NewHandler(coordinator, gateway))
 	defer server.Close()
 	client := New(server.URL+"/", time.Second)
 	ctx := context.Background()
 	capabilities := []dsl.Coordinate{{Type: "task.python", Version: 1}}
-	registration := scheduling.WorkerRegistration{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Slots: 2, Capabilities: capabilities, TTL: time.Minute}
-	if err := client.RegisterWorker(ctx, registration); err != nil {
-		t.Fatal(err)
-	}
-	if registry.value.WorkerID != "worker" || registry.value.Slots != 2 {
-		t.Fatalf("registration=%+v", registry.value)
-	}
 	lease, err := client.Claim(ctx, attempt.ClaimCommand{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Capabilities: capabilities, LeaseDuration: time.Minute})
 	if err != nil || lease.Token != "lease" || coordinator.claim.AttemptID != "attempt" {
 		t.Fatalf("lease=%+v claim=%+v err=%v", lease, coordinator.claim, err)
@@ -52,7 +44,7 @@ func TestWorkerAPIClientAndHandlerRoundTrip(t *testing.T) {
 
 func TestWorkerAPIRejectsUnknownFieldsAndMapsDomainErrors(t *testing.T) {
 	coordinator := &fakeCoordinator{err: attempt.ErrCapabilityMismatch}
-	server := httptest.NewServer(NewHandler(coordinator, &fakeGateway{}, &fakeRegistry{}))
+	server := httptest.NewServer(NewHandler(coordinator, &fakeGateway{}))
 	defer server.Close()
 	client := New(server.URL, time.Second)
 	_, err := client.Claim(context.Background(), attempt.ClaimCommand{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Capabilities: []dsl.Coordinate{{Type: "task.python", Version: 1}}, LeaseDuration: time.Minute})
@@ -94,11 +86,4 @@ type fakeGateway struct{ command runtimecontext.LoadCommand }
 func (value *fakeGateway) Load(_ context.Context, command runtimecontext.LoadCommand) (runtimecontext.ExecutionContext, error) {
 	value.command = command
 	return runtimecontext.ExecutionContext{ContextVersion: 1, AttemptID: command.AttemptID}, nil
-}
-
-type fakeRegistry struct{ value scheduling.WorkerRegistration }
-
-func (value *fakeRegistry) RegisterWorker(_ context.Context, registration scheduling.WorkerRegistration) error {
-	value.value = registration
-	return nil
 }

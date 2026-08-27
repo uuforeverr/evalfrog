@@ -173,7 +173,7 @@ func TestStaleCompletionAndHeartbeatFailureCannotBecomeEffective(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- worker.receiveAndExecute(context.Background()) }()
 	<-executor.started
-	time.Sleep(20 * time.Millisecond)
+	<-attempts.heartbeatCalled
 	close(executor.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -234,40 +234,6 @@ func TestCatalogResourceClassAndSettingsValidation(t *testing.T) {
 	}
 }
 
-func TestRegistrationServiceReportsCapacityAndStops(t *testing.T) {
-	registry := &fakeRegistry{}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service, err := NewRegistrationService(registry, scheduling.WorkerRegistration{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Slots: 2, Capabilities: []dsl.Coordinate{{Type: "task.python", Version: 1}}, TTL: 30 * time.Millisecond}, 10*time.Millisecond, logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- service.Run(ctx) }()
-	deadline := time.After(time.Second)
-	for registry.calls.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("registration did not run")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if service.Name() == "" {
-		t.Fatal("service name missing")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("registration did not stop")
-	}
-	_ = service.Shutdown(context.Background())
-	if _, err = NewRegistrationService(nil, scheduling.WorkerRegistration{}, 0, logger); err == nil {
-		t.Fatal("invalid registration accepted")
-	}
-}
-
 type fakeDelivery struct{ owner *fakeConsumer }
 
 func (value *fakeDelivery) Topic() string   { return "tasks" }
@@ -305,6 +271,7 @@ type fakeAttempts struct {
 	completes                           atomic.Int32
 	loads                               atomic.Int32
 	completed                           chan struct{}
+	heartbeatCalled                     chan struct{}
 	operation                           dsl.Coordinate
 	attemptTimeout                      time.Duration
 	complete                            attempt.CompleteCommand
@@ -322,6 +289,10 @@ func (value *fakeAttempts) Claim(context.Context, attempt.ClaimCommand) (attempt
 	return lease, nil
 }
 func (value *fakeAttempts) Heartbeat(context.Context, attempt.HeartbeatCommand) (attempt.Lease, error) {
+	select {
+	case value.heartbeatCalled <- struct{}{}:
+	default:
+	}
 	return value.heartbeatLease, value.heartbeatErr
 }
 func (value *fakeAttempts) Complete(_ context.Context, command attempt.CompleteCommand) (bool, error) {
@@ -385,7 +356,7 @@ func runtimeFixture(t *testing.T, executor Executor) (*Runtime, *fakeConsumer, *
 	message := eventing.TaskMessage{MessageVersion: 1, TaskID: "task", ProjectID: "project", RunID: "run", NodeRunID: "node-run", ExecutionNodeID: "code", AttemptID: "attempt", AttemptSequence: 1, ResourceClass: scheduling.ResourceSandbox, OccurredAt: time.Now().UTC(), TraceID: "trace"}
 	payload, _ := message.MarshalJSONMessage()
 	consumer := &fakeConsumer{payload: payload}
-	attempts := &fakeAttempts{completed: make(chan struct{}, 1)}
+	attempts := &fakeAttempts{completed: make(chan struct{}, 1), heartbeatCalled: make(chan struct{}, 1)}
 	catalog, err := NewCatalog(scheduling.ResourceSandbox, executor)
 	if err != nil {
 		t.Fatal(err)
@@ -398,10 +369,3 @@ func runtimeFixture(t *testing.T, executor Executor) (*Runtime, *fakeConsumer, *
 }
 
 var _ = errors.New
-
-type fakeRegistry struct{ calls atomic.Int32 }
-
-func (value *fakeRegistry) RegisterWorker(context.Context, scheduling.WorkerRegistration) error {
-	value.calls.Add(1)
-	return nil
-}

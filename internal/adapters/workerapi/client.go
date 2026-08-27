@@ -13,26 +13,11 @@ import (
 	"github.com/uu999/evalfrog/internal/resources"
 	"github.com/uu999/evalfrog/internal/runtime/attempt"
 	runtimecontext "github.com/uu999/evalfrog/internal/runtime/context"
-	"github.com/uu999/evalfrog/internal/scheduling"
 )
 
 type Client struct {
 	baseURL string
 	http    *http.Client
-}
-
-func (client *Client) RegisterWorker(ctx context.Context, registration scheduling.WorkerRegistration) error {
-	capabilities := make([]capability, len(registration.Capabilities))
-	for index, value := range registration.Capabilities {
-		capabilities[index] = capability{Type: value.Type, Version: value.Version}
-	}
-	body := workerHeartbeatRequest{ExecutorBuild: registration.ExecutorBuild,
-		ResourceClass: registration.ResourceClass, Slots: registration.Slots,
-		Capabilities: capabilities, TTLMS: registration.TTL.Milliseconds()}
-	var response struct {
-		Registered bool `json:"registered"`
-	}
-	return client.post(ctx, "/internal/v1/workers/"+registration.WorkerID+"/heartbeat", body, &response)
 }
 
 func New(baseURL string, timeout time.Duration) *Client {

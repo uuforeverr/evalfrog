@@ -64,7 +64,7 @@ func TestWorkersReceiveNoAuthoritativeStoreCredentials(t *testing.T) {
 	if !hasNetwork(document.Services["control-plane"].Networks, "edge") || !hasNetworkAlias(document.Services["control-plane"].Networks, "edge", "evalfrog-control-plane") {
 		t.Fatalf("control-plane must publish the deployment-level edge DNS alias: %v", document.Services["control-plane"].Networks)
 	}
-	for _, service := range []string{"postgres", "redis-scheduling", "redis-cache"} {
+	for _, service := range []string{"postgres", "redis-cache"} {
 		if !hasNetwork(document.Services[service].Networks, "authority") || hasNetwork(document.Services[service].Networks, "worker") {
 			t.Fatalf("%s must not be attached to the Worker network: %v", service, document.Services[service].Networks)
 		}

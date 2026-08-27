@@ -9,7 +9,6 @@ x-common-environment: &common-environment
 x-control-plane-environment: &control-plane-environment
   <<: *common-environment
   EVALFROG_POSTGRES_DSN: postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable
-  EVALFROG_SCHEDULING_REDIS_ADDRESS: redis-scheduling:6379
   EVALFROG_CACHE_REDIS_ADDRESS: redis-cache:6379
   EVALFROG_MIGRATIONS_DIR: /app/migrations
 
@@ -33,23 +32,6 @@ services:
       retries: 30
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    networks: [authority]
-
-  redis-scheduling:
-    image: redis:7.4.2-alpine
-    # Ready/Load/Topic/Reservation/Inflight are derived coordination state. Persisting them
-    # creates disk-fsync stalls without improving recovery: Control Plane
-    # deliberately fails closed and rebuilds them from PostgreSQL instead.
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
-    ports:
-      - "16379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
-    volumes:
-      - scheduling-redis-data:/data
     networks: [authority]
 
   redis-cache:
@@ -133,8 +115,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis-scheduling:
-        condition: service_healthy
       redis-cache:
         condition: service_healthy
       kafka-init:
@@ -249,11 +229,10 @@ services:
 
 volumes:
   postgres-data:
-  scheduling-redis-data:
   kafka-data:
 
 networks:
-  # Workers can reach only Kafka and the Worker API. PostgreSQL and both Redis
+  # Workers can reach only Kafka and the Worker API. PostgreSQL and Cache Redis
   # endpoints have no Worker network attachment, so credential loss alone
   # cannot become an authority-store network path.
   authority:

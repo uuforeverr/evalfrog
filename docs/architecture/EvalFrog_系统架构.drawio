@@ -34,10 +34,10 @@
         <mxCell id="10" value="Definition &amp; Compilation&#xa;Workflow · Draft Revision · Version&#xa;IR · Compiler · Node Catalog&#xa;DSL · Source Map · Snapshot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
           <mxGeometry x="430" y="190" width="300" height="150" as="geometry" />
         </mxCell>
-        <mxCell id="11" value="Runtime Control&#xa;Run Command · Engine&#xa;Attempt Coordinator&#xa;Execution Context Gateway" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
+        <mxCell id="11" value="Runtime Control&#xa;Run Command · Engine&#xa;Direct Attempt + Task Outbox&#xa;Attempt Coordinator · Context Gateway" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
           <mxGeometry x="810" y="190" width="300" height="150" as="geometry" />
         </mxCell>
-        <mxCell id="12" value="Scheduling&#xa;1s Bucket FIFO · Project Load&#xa;5s Topic Queue Window&#xa;Ready → Queued CAS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
+        <mxCell id="12" value="Task Delivery&#xa;Task Outbox Relay · Batch Publish&#xa;Kafka Lag / Outbox Age&#xa;Resource Class Topic Routing" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
           <mxGeometry x="1190" y="190" width="300" height="150" as="geometry" />
         </mxCell>
         <mxCell id="13" value="Eventing &amp; Operations&#xa;Outbox · Inbox · Projection&#xa;Retry · Deadline · Reaper&#xa;Recovery · Reconcile · Notification" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="7">
@@ -49,9 +49,6 @@
         </mxCell>
         <mxCell id="15" value="PostgreSQL&#xa;唯一权威 Definition / Runtime&#xa;Output / Outbox / Inbox / Audit" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
           <mxGeometry x="80" y="65" width="760" height="100" as="geometry" />
-        </mxCell>
-        <mxCell id="16" value="Scheduling Redis&#xa;Ready · Project Load · Topic Occupancy&#xa;Reservation · noeviction" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
-          <mxGeometry x="940" y="65" width="300" height="100" as="geometry" />
         </mxCell>
         <mxCell id="17" value="Cache Redis&#xa;Snapshot · Run Context · Read Model&#xa;Cache-Aside · 可回源" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontFamily=Helvetica;fontSize=13;" vertex="1" parent="14">
           <mxGeometry x="1300" y="65" width="300" height="100" as="geometry" />
@@ -82,7 +79,7 @@
         <mxCell id="27" value="Authoritative / Cache Store" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;" vertex="1" parent="23"><mxGeometry x="55" y="57" width="170" height="20" as="geometry" /></mxCell>
         <mxCell id="28" value="" style="rounded=0;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="23"><mxGeometry x="15" y="85" width="30" height="16" as="geometry" /></mxCell>
         <mxCell id="29" value="Message Bus" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;" vertex="1" parent="23"><mxGeometry x="55" y="82" width="170" height="20" as="geometry" /></mxCell>
-        <mxCell id="30" value="边界不变量&#xa;· PostgreSQL 是唯一权威状态，Redis 与 Kafka 可丢失后重建或重放。&#xa;· Control Plane 可同进程部署，但模块不能绕过状态所有权。&#xa;· Worker 无 Workflow PostgreSQL 凭证，只通过 Worker API 获取 Attempt 与 Execution Context。&#xa;· Runtime 只执行不可变 Execution Snapshot；Web 与 CLI 只提交 IR。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=middle;spacing=12;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="30" value="边界不变量&#xa;· PostgreSQL 是唯一权威状态；Cache Redis 可丢失回源，Kafka 可重放。&#xa;· Engine 同一 Run 事务原子写 Node、Attempt 与 Task Outbox，不存在独立 Scheduler。&#xa;· Worker 无 Workflow PostgreSQL 凭证，只通过 Worker API 获取 Attempt 与 Execution Context。&#xa;· Runtime 只执行不可变 Execution Snapshot；Web 与 CLI 只提交 IR。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;verticalAlign=middle;spacing=12;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="350" y="1330" width="1690" height="120" as="geometry" />
         </mxCell>
 
@@ -117,7 +114,7 @@
         <mxCell id="40" value="Run / NodeRun / Attempt" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.9;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="11" target="15">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="41" value="Reserve / Lifecycle" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.5;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="16">
+        <mxCell id="41" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.5;exitY=1;entryX=0.25;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="18">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="42" value="Cache-Aside" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=classic;endFill=1;labelBackgroundColor=#ffffff;fontSize=11;exitX=0.35;exitY=1;entryX=0.5;entryY=0;exitDx=0;exitDy=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="13" target="17">

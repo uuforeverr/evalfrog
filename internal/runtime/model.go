@@ -1,6 +1,6 @@
 // Package runtime owns Workflow Run, Node Run, and Node Attempt domain state.
 //
-// State fields are private by design: Engine, Scheduler and Attempt Coordinator
+// State fields are private by design: Engine and Attempt Coordinator
 // must use explicit domain operations rather than updating status strings.
 package runtime
 

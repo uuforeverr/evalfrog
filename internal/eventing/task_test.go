@@ -13,10 +13,6 @@ import (
 
 func TestTaskContractIsStrictLightweightAndBounded(t *testing.T) {
 	message := testTask()
-	converted := TaskFromScheduling(scheduling.Task{MessageVersion: 1, TaskID: message.TaskID, ProjectID: message.ProjectID, RunID: message.RunID, NodeRunID: message.NodeRunID, ExecutionNodeID: message.ExecutionNodeID, AttemptID: message.AttemptID, AttemptSequence: message.AttemptSequence, ResourceClass: message.ResourceClass, OccurredAt: message.OccurredAt, TraceID: message.TraceID})
-	if !reflect.DeepEqual(converted, message) {
-		t.Fatalf("converted=%+v", converted)
-	}
 	payload, err := message.MarshalJSONMessage()
 	if err != nil {
 		t.Fatal(err)

@@ -16,12 +16,6 @@ postgres:
   expected_control_plane_instances: 1
 
 redis:
-  scheduling:
-    address: "localhost:16379"
-    key_prefix: "evalfrog:local:sched:"
-    operation_timeout: 500ms
-    max_retries: 1
-    eviction_policy: "noeviction"
   cache:
     address: "localhost:16380"
     key_prefix: "evalfrog:local:cache:"
@@ -43,24 +37,6 @@ kafka:
 
 engine:
   max_inflight: 3
-
-scheduler:
-  redis_candidate_batch: 512
-  admission_concurrency: 4
-  capacity_calibration_interval: 5s
-  ready_reconcile_interval: 15s
-  reconcile_lease: 4s
-  reservation_ttl: 15s
-  topic_queue_buffer: 5s
-  topic_ewma_alpha: 0.4
-  builtin_min_queue: 4
-  builtin_max_queue: 1024
-  sandbox_min_queue: 2
-  sandbox_max_queue: 512
-  memory_high_watermark: 0.75
-  memory_resume_watermark: 0.65
-  idle_poll: 20ms
-  idle_poll_max: 250ms
 
 worker:
   builtin_slots: 4

@@ -55,13 +55,14 @@ func NewCatalog(resourceClass scheduling.ResourceClass, executors ...Executor) (
 		result.values[coordinate] = executor
 		result.coordinates = append(result.coordinates, coordinate)
 	}
-	registration := scheduling.WorkerRegistration{
-		WorkerID: "catalog-validation", ExecutorBuild: "catalog-validation",
-		ResourceClass: resourceClass, Slots: 1, Capabilities: result.coordinates,
-		TTL: time.Second,
+	required := scheduling.RequiredCapabilities(resourceClass)
+	if len(result.coordinates) != len(required) {
+		return Catalog{}, fmt.Errorf("executor catalog must provide the complete %s capability set", resourceClass)
 	}
-	if err := registration.Validate(); err != nil {
-		return Catalog{}, fmt.Errorf("executor catalog is not pool-homogeneous: %w", err)
+	for _, coordinate := range required {
+		if _, exists := result.values[coordinate]; !exists {
+			return Catalog{}, fmt.Errorf("executor catalog is missing %s@%d", coordinate.Type, coordinate.Version)
+		}
 	}
 	return result, nil
 }

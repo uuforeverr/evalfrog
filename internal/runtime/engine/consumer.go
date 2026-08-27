@@ -9,6 +9,7 @@ import (
 
 	"github.com/uu999/evalfrog/internal/dsl"
 	"github.com/uu999/evalfrog/internal/eventing"
+	"github.com/uu999/evalfrog/internal/platform/identity"
 	"github.com/uu999/evalfrog/internal/runtime"
 )
 
@@ -35,6 +36,7 @@ type RunTransaction interface {
 
 type Consumer struct {
 	transactions TransactionManager
+	ids          identity.Generator
 	maxInflight  int
 }
 
@@ -43,10 +45,14 @@ func NewConsumer(transactions TransactionManager) (Consumer, error) {
 }
 
 func NewConsumerWithConcurrency(transactions TransactionManager, maxInflight int) (Consumer, error) {
-	if transactions == nil || maxInflight <= 0 {
+	return NewConsumerWithIdentity(transactions, identity.UUIDv7Generator{}, maxInflight)
+}
+
+func NewConsumerWithIdentity(transactions TransactionManager, ids identity.Generator, maxInflight int) (Consumer, error) {
+	if transactions == nil || ids == nil || maxInflight <= 0 {
 		return Consumer{}, fmt.Errorf("engine transaction manager is required")
 	}
-	return Consumer{transactions: transactions, maxInflight: maxInflight}, nil
+	return Consumer{transactions: transactions, ids: ids, maxInflight: maxInflight}, nil
 }
 
 func (consumer Consumer) Consume(ctx context.Context, event eventing.RuntimeEvent) error {
@@ -201,6 +207,9 @@ func (consumer Consumer) initialize(ctx context.Context, tx RunTransaction, even
 		}
 		return tx.FailRunInitialization(ctx, runRecord, failed.Snapshot(), now)
 	}
+	if err = consumer.queueReadyTasks(instance); err != nil {
+		return err
+	}
 	return tx.InitializeRun(ctx, runRecord, instance.SnapshotState(), now)
 }
 
@@ -316,7 +325,30 @@ func (consumer Consumer) advance(ctx context.Context, tx RunTransaction, event e
 	if err != nil {
 		return err
 	}
+	if err = consumer.queueReadyTasks(instance); err != nil {
+		return err
+	}
 	return tx.AdvanceRun(ctx, before, instance.SnapshotState(), now)
+}
+
+// queueReadyTasks closes the Engine scheduling decision inside the current Run
+// transaction. A task node may pass through Ready in memory, but the persisted
+// state is Queued together with its Attempt and Task Outbox record.
+func (consumer Consumer) queueReadyTasks(instance *Engine) error {
+	for _, nodeID := range instance.ReadyNodeIDs() {
+		node, exists := instance.Node(nodeID)
+		if !exists || node.Kind() != runtime.NodeTask {
+			continue
+		}
+		attemptID, err := consumer.ids.New()
+		if err != nil {
+			return fmt.Errorf("generate attempt identity: %w", err)
+		}
+		if _, err = instance.QueueNode(nodeID, attemptID); err != nil {
+			return fmt.Errorf("queue task node %s: %w", nodeID, err)
+		}
+	}
+	return nil
 }
 
 // cancelWinsDeadline turns two durable source facts into the first terminal

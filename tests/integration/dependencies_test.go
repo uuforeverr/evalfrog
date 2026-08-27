@@ -15,7 +15,6 @@ import (
 	"github.com/uu999/evalfrog/internal/adapters/cacheredis"
 	"github.com/uu999/evalfrog/internal/adapters/kafka"
 	"github.com/uu999/evalfrog/internal/adapters/postgres"
-	"github.com/uu999/evalfrog/internal/adapters/schedulingredis"
 	"github.com/uu999/evalfrog/internal/platform/config"
 	"github.com/uu999/evalfrog/internal/platform/migrations"
 )
@@ -43,11 +42,6 @@ func TestLocalDependenciesAndMigrationRunner(t *testing.T) {
 	}
 	defer postgresClient.Close()
 	if err := postgresClient.Check(ctx); err != nil {
-		t.Fatal(err)
-	}
-	schedulingClient := schedulingredis.Open(configuration.Redis.Scheduling)
-	defer schedulingClient.Close()
-	if err := schedulingClient.Check(ctx); err != nil {
 		t.Fatal(err)
 	}
 	cacheClient := cacheredis.Open(configuration.Redis.Cache)

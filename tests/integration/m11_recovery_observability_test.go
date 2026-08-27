@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/uu999/evalfrog/internal/dsl"
 	"github.com/uu999/evalfrog/internal/eventing"
 	"github.com/uu999/evalfrog/internal/projection"
@@ -123,8 +122,9 @@ func TestM11DeadlineBlocksRetryRecoveryAndDiagnosticsAuditAreSafe(t *testing.T) 
 	if got := runState(t, harness, run.ID); got != string(runtimepkg.RunTimedOut) {
 		t.Fatalf("run state=%s", got)
 	}
-	if candidates, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 10); err != nil || len(candidates.Candidates) != 0 {
-		t.Fatalf("deadline Run remained schedulable: %+v err=%v", candidates, err)
+	var readyNodes int
+	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM node_runs WHERE project_id=$1 AND run_id=$2 AND state='ready'`, harness.projectID, run.ID).Scan(&readyNodes); err != nil || readyNodes != 0 {
+		t.Fatalf("deadline Run retained ready nodes: count=%d err=%v", readyNodes, err)
 	}
 
 	control := runtimepkg.NewBuiltinRunControl(harness.store, harness.access)
@@ -156,16 +156,11 @@ func TestM11TraceIsPreservedFromRunThroughTaskAndCompletion(t *testing.T) {
 		t.Fatal("run trace was not persisted")
 	}
 	harness.initializeRun(t, run)
-	authority, err := harness.store.LoadSchedulingSnapshot(harness.ctx, 1)
-	if err != nil || len(authority.Candidates) != 1 {
-		t.Fatalf("authority=%+v err=%v", authority, err)
+	task := queuedTask(t, harness, run.ID)
+	if task.TraceID != run.TraceID {
+		t.Fatalf("task=%+v run=%+v", task, run)
 	}
-	task, err := harness.store.DispatchReady(harness.ctx, scheduling.DispatchCommand{
-		Candidate: authority.Candidates[0], AttemptID: uuid.NewString(), TaskID: uuid.NewString(), TraceID: "scheduler-local-trace", Now: time.Now().UTC(),
-	})
-	if err != nil || task.TraceID != run.TraceID {
-		t.Fatalf("task=%+v err=%v run=%+v", task, err, run)
-	}
+	var err error
 	lease, err := harness.coordinator.Claim(harness.ctx, attempt.ClaimCommand{
 		ProjectID: task.ProjectID, RunID: task.RunID, AttemptID: task.AttemptID, AttemptSequence: task.AttemptSequence,
 		WorkerID: "m11-trace-worker", ExecutorBuild: "m11", ResourceClass: scheduling.ResourceSandbox, Capabilities: sandboxCapability, LeaseDuration: time.Minute,

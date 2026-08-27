@@ -8,7 +8,7 @@
 - Retry Timer、Deadline Scanner、Attempt Reaper、Reconciler 只补发 durable wake-up；
 - Engine 是唯一能够推进 Workflow 语义状态的组件；
 - `trace_id` 是一次 Run 的根关联 ID，跨 Outbox、Kafka、Worker、Completion、Recovery 与 Audit 保留；
-- Scheduling Redis 重建失败时停止新准入；Cache Redis 丢失时回源 PostgreSQL；
+- Cache Redis 丢失时回源 PostgreSQL，不影响任务创建和状态推进；
 - DLQ 是诊断线索，绝不是任意 Kafka 重放或状态修复入口。
 
 ## 告警与第一响应
@@ -18,9 +18,7 @@
 | `evalfrog_outbox_oldest_unpublished_age_seconds` | Runtime + Node Task Outbox | Relay、Kafka 连接、Outbox Claim/Publish | Relay 重启后至少一次发布，Consumer Inbox 收敛重复 |
 | `evalfrog_kafka_consumer_lag_records` | Kafka Group/Topic offset | Consumer 健康、partition/rebalance、Worker Slot | 恢复消费后 Lag 下降；Offset 不代表 Run 成功 |
 | `evalfrog_attempt_lease_lost_total` | PostgreSQL Lease Reaper | Worker 崩溃、Heartbeat、执行时长、网络 | Lost → Engine 的独立 Recovery Budget；旧结果被 Fencing 拒绝 |
-| `evalfrog_ready_to_queued_seconds` | PostgreSQL ready/dispatch 时间 | 最老时间桶、Topic Window/Occupancy、Redis 内存、Worker 完成速率 | Scheduling Redis 校准或重建后恢复准入 |
-| `evalfrog_scheduler_topic_queue_window` / `occupancy` | Scheduling Redis 派生计数 | Worker Completion EWMA、Claim 回调、Queued 权威事实 | Claim 释放 Topic 空位；低频 PostgreSQL 校准修复漂移 |
-| `evalfrog_scheduling_redis_rebuild_total` | Scheduler 重建结果 | Redis 可用性/内存策略/连接 | 失败继续 Fail Closed，不允许深度预派发 |
+| Queued-to-Running 延迟 | PostgreSQL Attempt 时间 | Kafka Lag、Worker Slot、Claim/API 延迟 | Worker 恢复或扩容后回落 |
 | `evalfrog_runtime_recovery_wakeups_total` | Recovery Scanner/Emitter | 条件是否仍 actionable、扫描器日志、Outbox | 重复 wake-up 由 cooldown、Inbox 与 CAS 收敛 |
 
 阈值由当前 Profile 的 SLO、Worker 容量与业务时限制定；不得把示例秒数写入领域代码。告警触发后，先按 `project_id + run_id` 获取诊断并保留 `trace_id`，不要先重启全部组件或修改数据库。
@@ -31,7 +29,7 @@
 告警 / 用户报告 Run 卡住
   → GET Run，确认当前状态
   → run diagnose，读取 Attempt、Audit、trace_id
-  → 检查 Outbox Age / Kafka Lag / Worker / Redis 健康
+  → 检查 Outbox Age / Kafka Lag / Worker / PostgreSQL 健康
   → 等待相应 Scanner 或 Relay 自动恢复
   → 仅在事实仍 actionable 且自动恢复未及时发生时，Project Admin 使用受限 Replay
 ```
@@ -55,17 +53,13 @@ Replay 只能选择 `run.created`、`run.cancel_requested`、`attempt.completed`
 
 恢复 Broker/Consumer 后，Runtime Outbox Relay 会至少一次发布；Engine Inbox 与 CAS 允许重复和乱序。Kafka adapter 会对短暂网络错误、`COORDINATOR_NOT_AVAILABLE`、`NOT_COORDINATOR` 及需要 rejoin 的 rebalance/generation/member 信号退避、重新 Poll/join group，Control Plane 与 Worker 不应因此退出。对于长时间的 Lag，先确认 Outbox Age、Consumer group、partition 数和 Worker Slot；不可重试的认证、Topic、协议或 static member fencing 错误需要修复部署配置，不能无限重试。不要因为 Task 已在 Kafka 中就把数据库 Attempt 标记为完成。
 
-### Scheduling Redis 丢失
-
-保持新准入暂停。Scheduler 必须从 PostgreSQL Ready、Queued/Running Attempt 重建新的 Redis Generation：Queued 恢复 Topic Occupancy，Queued+Running 恢复 Project Load；不存在 PostgreSQL 事实的短 Reservation 失效。重建完成后才恢复持续准入，此期间已运行 Attempt 仍可通过 Lease/Completion 正常收敛。不要使用 Cache Redis 或人工写 Redis Key 代替重建。
-
 ### Cache Redis 全量清空
 
 不需要手工修复 Runtime 状态。Execution Context 和 Run View Cache Miss 会从 PostgreSQL 回源并回填；读取延迟可能短暂升高。若读失败，检查 PostgreSQL 与授权，而不是将缓存临时改为权威写入。
 
 ### PostgreSQL 短时不可用或连接池耗尽
 
-Control Plane、Relay、Scanner、Scheduler 和 Worker Gateway 会返回可重试基础设施错误；不要把这类错误记成业务失败。恢复数据库连接后，Outbox、Scanner 与 Reconciler 重新读取事实并继续。检查连接池总预算是否仍满足所有副本 `PoolMax` 总和不超过 PostgreSQL `max_connections` 的 70%。
+Control Plane、Relay、Scanner 和 Worker Gateway 会返回可重试基础设施错误；不要把这类错误记成业务失败。恢复数据库连接后，Outbox、Scanner 与 Reconciler 重新读取事实并继续。检查连接池总预算是否仍满足所有副本 `PoolMax` 总和不超过 PostgreSQL `max_connections` 的 70%。
 
 ### Deadline 与 Cancel 竞争
 
