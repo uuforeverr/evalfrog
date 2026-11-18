@@ -30,13 +30,16 @@ jobs:
         run: go vet ./...
       - name: Unit and architecture tests
         run: go test ./...
+      - name: Go reachable-vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Human Web Canvas contract and build
         working-directory: web
         run: |
+          npm audit --omit=dev --audit-level=high
           npm test
           npm run build
       - name: Authoring, definition and runtime contract repeatability
-        run: go test -count=20 ./contracts/ir ./contracts/dsl ./contracts/source-map ./contracts/openapi ./contracts/messages ./internal/ir ./internal/catalog ./internal/dsl ./internal/sourcemap ./internal/compiler ./internal/access ./internal/resources ./internal/adapters/httpapi ./internal/adapters/workerapi ./internal/runtime ./internal/runtime/engine ./internal/runtime/attempt ./internal/runtime/context ./internal/eventing ./internal/recovery ./internal/scheduling ./internal/worker/runtime
+        run: go test -count=20 ./contracts/ir ./contracts/dsl ./contracts/source-map ./contracts/openapi ./contracts/messages ./internal/ir ./internal/catalog ./internal/dsl ./internal/sourcemap ./internal/compiler ./internal/access ./internal/resources ./internal/adapters/httpapi ./internal/adapters/workerapi ./internal/runtime ./internal/runtime/engine ./internal/runtime/attempt ./internal/runtime/context ./internal/eventing ./internal/recovery ./internal/worker/runtime
       - name: Core package coverage gate
         shell: bash
         run: |
@@ -57,7 +60,6 @@ jobs:
           check_coverage ./internal/compiler
           check_coverage ./internal/runtime/engine
           check_coverage ./internal/runtime/attempt
-          check_coverage ./internal/scheduling
           check_coverage ./internal/runtime/context
       - name: Bounded IR fuzzing
         run: |
@@ -88,13 +90,67 @@ jobs:
       - name: Validate Compose model
         run: docker compose -f deployments/compose.yaml config --quiet
       - name: Start stack
-        run: docker compose -f deployments/compose.yaml up -d --build --wait
+        run: |
+          docker build -t evalfrog-sandbox-python:dev -f deployments/sandbox/Dockerfile deployments/sandbox
+          docker compose -f deployments/compose.yaml up -d --build --wait
       - name: CLI doctor
         run: docker compose -f deployments/compose.yaml run --build --rm --no-deps evalfrog-cli doctor --profile local --config-dir /app/configs
-      - name: PostgreSQL integration tests
+      - name: Integration tests in authority network
         run: |
           docker build -t evalfrog-sandbox-python:test -f deployments/sandbox/Dockerfile deployments/sandbox
-          go test -tags=integration ./tests/integration ./internal/adapters/sandbox
+          # Resolve modules while building on the normal CI network. The test
+          # process itself then runs with no authority-network egress.
+          docker build --target integration-test-runner -t evalfrog-integration-runner .
+          docker run --rm \
+            --network evalfrog-local_authority \
+            -e EVALFROG_M12_COMPOSE=1 \
+            -e 'EVALFROG_INTEGRATION_MYSQL_DSN=root:evalfrog-root@tcp(mysql:3306)/' \
+            -e 'EVALFROG_M12_MYSQL_DSN=evalfrog:evalfrog@tcp(mysql:3306)/evalfrog_local' \
+            -e EVALFROG_KAFKA_BROKERS=kafka:9092 \
+            evalfrog-integration-runner \
+            go test -tags=integration ./tests/integration
+          # This adapter test intentionally exercises the Runner Docker daemon.
+          # It must stay outside the socket-free authority-network test runner.
+          go test -tags=integration ./internal/adapters/sandbox
       - name: Stop M0 stack
         if: always()
         run: docker compose -f deployments/compose.yaml down -v --remove-orphans
+
+  sandbox-runsc:
+    name: sandbox-runsc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install and register the gVisor Docker runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          sudo runsc install
+          sudo systemctl restart docker
+          runsc --version
+          docker info --format 'runtimes={{json .Runtimes}} default={{.DefaultRuntime}}'
+          docker run --rm --runtime=runsc hello-world
+      - name: Build fixed Python sandbox image
+        run: docker build -t evalfrog-sandbox-python:test -f deployments/sandbox/Dockerfile deployments/sandbox
+      - name: Verify Sandbox contract through runsc
+        env:
+          EVALFROG_SANDBOX_INTEGRATION_RUNTIME: runsc
+        run: go test -count=1 -v -tags=integration ./internal/adapters/sandbox -run '^TestDockerSandboxIntegration$'
+      - name: Verify 1000 runsc create destroy cycles
+        env:
+          EVALFROG_M12_RUNSC_STRESS: "1"
+        run: go test -count=1 -v -timeout 30m -tags='integration stress' ./internal/adapters/sandbox -run '^TestDockerSandboxRunscCreateDestroyStress$'
+      - name: Assert no managed Sandbox container remains
+        if: always()
+        run: test -z "$(docker ps -aq --filter 'label=evalfrog.sandbox=python-v1')"

@@ -109,7 +109,7 @@ func (creator RunCreator) create(ctx context.Context, record CreatePendingRunRec
 	if _, err := cloneJSONObject(record.WorkflowInput); err != nil {
 		return WorkflowRunRecord{}, fmt.Errorf("%w: workflow input: %v", ErrInvalidRun, err)
 	}
-	// PostgreSQL timestamptz has microsecond precision. Normalize before request
+	// MySQL timestamptz has microsecond precision. Normalize before request
 	// hashing so an idempotent replay using the returned deadline hashes equally.
 	record.CreatedAt = creator.clock.Now().UTC().Truncate(time.Microsecond)
 	record.DeadlineAt = record.DeadlineAt.UTC().Truncate(time.Microsecond)

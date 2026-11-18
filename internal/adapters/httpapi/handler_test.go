@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/uu999/evalfrog/internal/access"
 	"github.com/uu999/evalfrog/internal/catalog"
@@ -30,11 +31,14 @@ func (authenticatorStub) Authenticate(_ context.Context, token string) (access.P
 type applicationStub struct {
 	createCalled  bool
 	getError      error
+	saveError     error
 	createRunErr  error
 	run           projection.RunView
 	cancelApplied bool
 	cancelCalled  bool
 	replayCalled  bool
+	versions      []projection.RunVersion
+	versionCalls  int
 }
 
 func (stub *applicationStub) CreateWorkflow(context.Context, definition.CreateWorkflowCommand) (definition.Workflow, definition.DraftRevision, []ir.Diagnostic, error) {
@@ -47,8 +51,8 @@ func (stub *applicationStub) GetWorkflow(context.Context, string, string, string
 func (*applicationStub) GetDraft(context.Context, string, string, string) (definition.Draft, error) {
 	return definition.Draft{}, nil
 }
-func (*applicationStub) SaveDraft(context.Context, definition.SaveDraftCommand) (definition.DraftRevision, []ir.Diagnostic, error) {
-	return definition.DraftRevision{}, nil, nil
+func (stub *applicationStub) SaveDraft(context.Context, definition.SaveDraftCommand) (definition.DraftRevision, []ir.Diagnostic, error) {
+	return definition.DraftRevision{}, nil, stub.saveError
 }
 func (*applicationStub) ValidateDraft(context.Context, string, string, string, int64) ([]ir.Diagnostic, error) {
 	return nil, nil
@@ -81,6 +85,14 @@ func (stub *applicationStub) CancelRun(context.Context, string, string, string, 
 func (stub *applicationStub) GetRun(context.Context, string, string, string) (projection.RunView, error) {
 	return stub.run, stub.getError
 }
+func (stub *applicationStub) GetRunVersion(context.Context, string, string, string) (projection.RunVersion, error) {
+	if len(stub.versions) > 0 {
+		index := min(stub.versionCalls, len(stub.versions)-1)
+		stub.versionCalls++
+		return stub.versions[index], stub.getError
+	}
+	return projection.RunVersion{State: stub.run.State, StateVersion: stub.run.StateVersion}, stub.getError
+}
 func (stub *applicationStub) GetDiagnostics(context.Context, string, string, string) (projection.DiagnosticView, error) {
 	return projection.DiagnosticView{Run: stub.run}, stub.getError
 }
@@ -89,6 +101,9 @@ func (stub *applicationStub) ReplayRun(context.Context, string, string, string, 
 	return true, nil
 }
 func (*applicationStub) NodeTypes() []catalog.NodeDescription { return nil }
+func (*applicationStub) NodeTypesForRevision(revision string) ([]catalog.NodeDescription, bool) {
+	return catalog.BuiltinDirectory().DescriptionsForRevision(revision)
+}
 func (*applicationStub) Connections(context.Context, string, string) ([]resources.ConnectionSummary, error) {
 	return nil, nil
 }
@@ -105,6 +120,41 @@ func TestAuthoringAPIRejectsClientDSLAndSourceMap(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		if response.Code != http.StatusBadRequest || application.createCalled {
 			t.Fatalf("field %s status=%d create_called=%v body=%s", forbidden, response.Code, application.createCalled, response.Body.String())
+		}
+	}
+}
+
+func TestNodeTypesResolveImmutableCatalogRevision(t *testing.T) {
+	handler := New(authenticatorStub{}, &applicationStub{})
+	for _, test := range []struct {
+		revision string
+		status   int
+		mode     catalog.OutputMode
+	}{
+		{"catalog-v1", http.StatusOK, catalog.OutputFixed},
+		{"catalog-v2", http.StatusOK, catalog.OutputAuthorDeclared},
+		{"catalog-missing", http.StatusNotFound, ""},
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/v1/node-types?catalog_revision="+test.revision, nil)
+		request.Header.Set("Authorization", "Bearer 0123456789abcdef")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("revision %s status=%d body=%s", test.revision, response.Code, response.Body.String())
+		}
+		if test.status != http.StatusOK {
+			continue
+		}
+		var body struct {
+			NodeTypes []catalog.NodeDescription `json:"node_types"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, node := range body.NodeTypes {
+			if node.Type == "start" && node.Outputs.Mode != test.mode {
+				t.Fatalf("revision %s Start mode=%s", test.revision, node.Outputs.Mode)
+			}
 		}
 	}
 }
@@ -141,6 +191,40 @@ func TestDomainErrorsUseStableHTTPContract(t *testing.T) {
 	}
 	if envelope.Error.Code != definition.CodeDraftRevisionConflict || envelope.Error.RequestID == "" {
 		t.Fatalf("unexpected error envelope: %+v", envelope)
+	}
+}
+
+func TestSaveConflictReturnsThreeWayIR(t *testing.T) {
+	base := json.RawMessage(`{"ir_version":"1","nodes":[],"edges":[],"layout":{}}`)
+	application := &applicationStub{saveError: &definition.Error{
+		Code: definition.CodeDraftRevisionConflict, Message: "draft revision has changed",
+		Details: map[string]any{"base_revision": int64(1), "current_revision": int64(2),
+			"base_ir": base, "current_ir": base, "submitted_ir": base},
+	}}
+	handler := New(authenticatorStub{}, application)
+	request := httptest.NewRequest(http.MethodPut, "/v1/projects/project-1/workflows/workflow-1/draft", strings.NewReader(`{"expected_revision":1,"ir":{"ir_version":"1"}}`))
+	request.Header.Set("Authorization", "Bearer 0123456789abcdef")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code    string                     `json:"code"`
+			Details map[string]json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != definition.CodeDraftRevisionConflict {
+		t.Fatalf("code=%s", envelope.Error.Code)
+	}
+	for _, key := range []string{"base_ir", "current_ir", "submitted_ir"} {
+		if !json.Valid(envelope.Error.Details[key]) {
+			t.Fatalf("missing %s: %s", key, response.Body.String())
+		}
 	}
 }
 
@@ -206,7 +290,10 @@ func TestRunEventsAreWakeupsAndNeverCarryRuntimeState(t *testing.T) {
 	updates := make(chan string, 1)
 	updates <- "run-1"
 	close(updates)
-	handler := New(authenticatorStub{}, &applicationStub{run: projection.RunView{RunID: "run-1", ProjectID: "project-1", State: runtime.RunFailed}}, updateSubscriberStub{updates: updates})
+	handler := New(authenticatorStub{}, &applicationStub{
+		run:      projection.RunView{RunID: "run-1", ProjectID: "project-1", State: runtime.RunRunning},
+		versions: []projection.RunVersion{{State: runtime.RunRunning, StateVersion: 1}, {State: runtime.RunFailed, StateVersion: 2}},
+	}, updateSubscriberStub{updates: updates})
 	request := httptest.NewRequest(http.MethodGet, "/v1/projects/project-1/runs/run-1/events", nil)
 	request.Header.Set("Authorization", "Bearer 0123456789abcdef")
 	response := httptest.NewRecorder()
@@ -214,6 +301,23 @@ func TestRunEventsAreWakeupsAndNeverCarryRuntimeState(t *testing.T) {
 	body := response.Body.String()
 	if response.Code != http.StatusOK || !strings.Contains(response.Header().Get("Content-Type"), "text/event-stream") || !strings.Contains(body, "event: ready") || !strings.Contains(body, "event: update") || strings.Contains(body, "failed") {
 		t.Fatalf("status=%d header=%q body=%q", response.Code, response.Header().Get("Content-Type"), body)
+	}
+}
+
+func TestRunEventsPollRunVersionAcrossInstances(t *testing.T) {
+	updates := make(chan string)
+	application := &applicationStub{
+		run:      projection.RunView{RunID: "run-1", ProjectID: "project-1", State: runtime.RunRunning},
+		versions: []projection.RunVersion{{State: runtime.RunRunning, StateVersion: 3}, {State: runtime.RunSucceeded, StateVersion: 4}},
+	}
+	handler := New(authenticatorStub{}, application, updateSubscriberStub{updates: updates}).WithRunUpdatePollInterval(time.Millisecond)
+	request := httptest.NewRequest(http.MethodGet, "/v1/projects/project-1/runs/run-1/events", nil)
+	request.Header.Set("Authorization", "Bearer 0123456789abcdef")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "event: update") || application.versionCalls < 2 {
+		t.Fatalf("status=%d version_calls=%d body=%q", response.Code, application.versionCalls, body)
 	}
 }
 

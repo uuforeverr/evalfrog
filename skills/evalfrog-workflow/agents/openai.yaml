@@ -1,0 +1,4 @@
+interface:
+  display_name: "EvalFrog Workflow CLI"
+  short_description: "Create and run EvalFrog workflows through its CLI"
+  default_prompt: "Use $evalfrog-workflow to create and validate an EvalFrog workflow from my requirements."

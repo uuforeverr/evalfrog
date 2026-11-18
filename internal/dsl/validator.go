@@ -111,6 +111,103 @@ func BuiltinV1Contract() Contract {
 	return contract
 }
 
+// BuiltinV2Contract accepts both immutable v1 snapshots and named-port v2
+// control operations. The DSL envelope remains v1; operation versions carry
+// the semantic change.
+func BuiltinV2Contract() Contract {
+	contract := BuiltinV1Contract()
+	contract.specs[Coordinate{Type: "control.start", Version: 2}] = OperationSpec{
+		Coordinate: Coordinate{Type: "control.start", Version: 2}, Kind: KindControl,
+		ConfigFields: map[string]bool{}, Inputs: map[PortName]PortRule{},
+		Outputs: map[PortName]PortRule{}, AllowExtraOutputs: true,
+	}
+	contract.specs[Coordinate{Type: "control.end", Version: 2}] = OperationSpec{
+		Coordinate: Coordinate{Type: "control.end", Version: 2}, Kind: KindControl,
+		ConfigFields: map[string]bool{}, Inputs: map[PortName]PortRule{}, AllowExtraInputs: true,
+		Outputs: map[PortName]PortRule{}, AllowExtraOutputs: true,
+		ValidateConfig: validateEndV2Ports,
+	}
+	contract.specs[Coordinate{Type: "control.branch", Version: 2}] = OperationSpec{
+		Coordinate: Coordinate{Type: "control.branch", Version: 2}, Kind: KindControl,
+		ConfigFields: map[string]bool{"cases": true, "default_route": true}, Inputs: map[PortName]PortRule{}, AllowExtraInputs: true,
+		Outputs: map[PortName]PortRule{}, ValidateConfig: validateBranchV2Config,
+	}
+	return contract
+}
+
+func validateEndV2Ports(node Node) []Issue {
+	if len(node.Inputs) != len(node.Outputs) {
+		return []Issue{{Code: "DSL_END_OUTPUT_BINDING_MISMATCH", Message: "each end output needs a same-named input", NodeID: node.ID, Field: "outputs"}}
+	}
+	for name, dataType := range node.Outputs {
+		if binding, exists := node.Inputs[name]; !exists || binding.DataType != dataType {
+			return []Issue{{Code: "DSL_END_OUTPUT_BINDING_MISMATCH", Message: "end output type must match its input", NodeID: node.ID, Field: "outputs." + string(name)}}
+		}
+	}
+	return nil
+}
+
+func validateBranchV2Config(node Node) []Issue {
+	var fallback string
+	if !decodeConfig(node, "default_route", &fallback) || !routePattern.MatchString(fallback) {
+		return []Issue{{Code: "DSL_BRANCH_DEFAULT_INVALID", Message: "ELSE route is invalid", NodeID: node.ID, Field: "operation.config.default_route"}}
+	}
+	var cases []struct {
+		Route      string `json:"route"`
+		Logic      string `json:"logic"`
+		Conditions []struct {
+			Input    string          `json:"input"`
+			Path     string          `json:"path,omitempty"`
+			Operator string          `json:"operator"`
+			Value    json.RawMessage `json:"value"`
+		} `json:"conditions"`
+	}
+	if !decodeConfig(node, "cases", &cases) || len(cases) == 0 {
+		return []Issue{{Code: "DSL_BRANCH_CASES_INVALID", Message: "IF cases are required", NodeID: node.ID, Field: "operation.config.cases"}}
+	}
+	var rawCases []map[string]json.RawMessage
+	if !decodeConfig(node, "cases", &rawCases) || len(rawCases) != len(cases) {
+		return []Issue{{Code: "DSL_BRANCH_CASES_INVALID", Message: "IF cases must be objects", NodeID: node.ID, Field: "operation.config.cases"}}
+	}
+	var issues []Issue
+	for index, branchCase := range cases {
+		field := fmt.Sprintf("operation.config.cases.%d", index)
+		for key := range rawCases[index] {
+			if key != "route" && key != "logic" && key != "conditions" {
+				issues = append(issues, Issue{Code: "DSL_BRANCH_CASE_INVALID", Message: "unsupported IF case field", NodeID: node.ID, Field: field + "." + key})
+			}
+		}
+		var rawConditions []map[string]json.RawMessage
+		if json.Unmarshal(rawCases[index]["conditions"], &rawConditions) != nil || len(rawConditions) != len(branchCase.Conditions) {
+			issues = append(issues, Issue{Code: "DSL_BRANCH_CASE_INVALID", Message: "conditions must be objects", NodeID: node.ID, Field: field + ".conditions"})
+			continue
+		}
+		if !routePattern.MatchString(branchCase.Route) || branchCase.Logic != "and" && branchCase.Logic != "or" || len(branchCase.Conditions) == 0 {
+			issues = append(issues, Issue{Code: "DSL_BRANCH_CASE_INVALID", Message: "case requires route, logic, and conditions", NodeID: node.ID, Field: field})
+		}
+		for conditionIndex, condition := range branchCase.Conditions {
+			for key := range rawConditions[conditionIndex] {
+				if key != "input" && key != "path" && key != "operator" && key != "value" {
+					issues = append(issues, Issue{Code: "DSL_BRANCH_CASE_INVALID", Message: "unsupported IF condition field", NodeID: node.ID, Field: fmt.Sprintf("%s.conditions.%d.%s", field, conditionIndex, key)})
+				}
+			}
+			binding, exists := node.Inputs[PortName(condition.Input)]
+			if !exists || condition.Input == "" || condition.Operator == "" || len(condition.Value) == 0 {
+				issues = append(issues, Issue{Code: "DSL_BRANCH_CASE_INVALID", Message: "condition requires a bound input, operator, and value", NodeID: node.ID, Field: field})
+				continue
+			}
+			if condition.Path != "" {
+				if binding.DataType != TypeObject || !validBranchPath(condition.Path) || !validDSLPathComparison(condition.Operator, condition.Value) {
+					issues = append(issues, Issue{Code: "DSL_BRANCH_OPERATOR_TYPE_MISMATCH", Message: "path condition is incompatible", NodeID: node.ID, Field: field})
+				}
+			} else if !validDSLBranchComparison(binding.DataType, condition.Operator, condition.Value) {
+				issues = append(issues, Issue{Code: "DSL_BRANCH_OPERATOR_TYPE_MISMATCH", Message: "condition is incompatible", NodeID: node.ID, Field: field})
+			}
+		}
+	}
+	return issues
+}
+
 func (contract Contract) Validate(document Document) []Issue {
 	issues := make([]Issue, 0)
 	if document.DSLVersion != contract.version {
@@ -129,10 +226,10 @@ func (contract Contract) Validate(document Document) []Issue {
 		}
 		nodes[node.ID] = node
 		outputs[node.ID] = node.Outputs
-		if node.Operation.Coordinate() == (Coordinate{Type: "control.start", Version: 1}) {
+		if node.Operation.Type == "control.start" && (node.Operation.Version == 1 || node.Operation.Version == 2) {
 			startCount++
 		}
-		if node.Operation.Coordinate() == (Coordinate{Type: "control.end", Version: 1}) {
+		if node.Operation.Type == "control.end" && (node.Operation.Version == 1 || node.Operation.Version == 2) {
 			endCount++
 		}
 		issues = append(issues, contract.validateNode(node)...)
@@ -149,10 +246,10 @@ func (contract Contract) Validate(document Document) []Issue {
 	if _, exists := nodes[document.ExitNodeID]; !exists {
 		issues = append(issues, Issue{Code: "DSL_EXIT_NODE_NOT_FOUND", Message: "exit_node_id does not exist", NodeID: document.ExitNodeID, Field: "exit_node_id"})
 	}
-	if entry, exists := nodes[document.EntryNodeID]; exists && entry.Operation.Coordinate() != (Coordinate{Type: "control.start", Version: 1}) {
+	if entry, exists := nodes[document.EntryNodeID]; exists && (entry.Operation.Type != "control.start" || entry.Operation.Version != 1 && entry.Operation.Version != 2) {
 		issues = append(issues, Issue{Code: "DSL_ENTRY_NODE_INVALID", Message: "entry node must be control.start@1", NodeID: entry.ID, Field: "operation"})
 	}
-	if exit, exists := nodes[document.ExitNodeID]; exists && exit.Operation.Coordinate() != (Coordinate{Type: "control.end", Version: 1}) {
+	if exit, exists := nodes[document.ExitNodeID]; exists && (exit.Operation.Type != "control.end" || exit.Operation.Version != 1 && exit.Operation.Version != 2) {
 		issues = append(issues, Issue{Code: "DSL_EXIT_NODE_INVALID", Message: "exit node must be control.end@1", NodeID: exit.ID, Field: "operation"})
 	}
 	issues = append(issues, validateEdgesAndGraph(document, nodes)...)

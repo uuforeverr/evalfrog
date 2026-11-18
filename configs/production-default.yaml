@@ -5,8 +5,10 @@ http:
   control_plane_address: ":8080"
   builtin_worker_address: ":8081"
   sandbox_worker_address: ":8082"
+  sandbox_runtime_address: ":8083"
   read_header_timeout: 5s
   idle_timeout: 60s
+  run_update_poll_interval: 2s
 
 endpoints:
   control_plane_url: "http://evalfrog-control-plane:8080"
@@ -14,34 +16,16 @@ endpoints:
 shutdown:
   timeout: 30s
 
-postgres:
-  dsn: "postgres://evalfrog@postgres:5432/evalfrog?sslmode=require"
-  schema: "evalfrog_production_default"
+mysql:
+  dsn: "evalfrog@tcp(mysql:3306)/evalfrog_production_default?tls=true"
+  database: "evalfrog_production_default"
   pool_min: 5
   pool_max: 20
   server_max_connections: 400
   expected_control_plane_instances: 8
-  statement_timeout: 5s
-  lock_timeout: 500ms
-  idle_in_transaction_timeout: 10s
-
-redis:
-  scheduling:
-    address: "scheduling-redis:6379"
-    password: ""
-    db: 0
-    key_prefix: "evalfrog:production-default:sched:"
-    operation_timeout: 500ms
-    max_retries: 1
-    eviction_policy: "noeviction"
-  cache:
-    address: "cache-redis:6379"
-    password: ""
-    db: 0
-    key_prefix: "evalfrog:production-default:cache:"
-    operation_timeout: 500ms
-    max_retries: 0
-    eviction_policy: "allkeys-lfu"
+  lock_timeout: 1s
+  conn_max_idle_time: 5m
+  conn_max_lifetime: 30m
 
 kafka:
   brokers: ["kafka:9092"]
@@ -61,24 +45,13 @@ kafka:
   linger: 5ms
   batch_bytes: 65536
   topics:
-    builtin_task: {name: "workflow-task-builtin-v1", partitions: 12, retention: 24h}
-    sandbox_task: {name: "workflow-task-sandbox-v1", partitions: 12, retention: 24h}
+    builtin_task: {name: "workflow-task-builtin-v1", partitions: 48, retention: 24h}
+    sandbox_task: {name: "workflow-task-sandbox-v1", partitions: 24, retention: 24h}
     runtime_event: {name: "workflow-runtime-event-v1", partitions: 24, retention: 72h}
     dlq: {name: "workflow-dead-letter-v1", partitions: 12, retention: 336h}
 
-scheduler:
-  lane_count: 128
-  epoch: 1s
-  active_project_ttl: 5s
-  credit_grant_batch: 8
-  redis_candidate_batch: 32
-  admission_concurrency: 8
-  inflight_reservation_ttl: 300s
-  ready_reconcile_interval: 30s
-  dispatch_buffer_factor: 1.2
-  epoch_capacity_change_limit: 0.10
-  idle_poll: 100ms
-  idle_poll_max: 1s
+engine:
+  max_inflight: 12
 
 worker:
   builtin_slots: 32
@@ -102,6 +75,15 @@ sandbox:
   image: "registry.example.invalid/evalfrog/python-sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   runtime: "runsc"
   command: "docker"
+  # The Sandbox Worker reaches a dedicated runtime controller through this
+  # private HTTPS endpoint and a Secret-Manager-injected service token. The
+  # deployment platform must add mTLS at this boundary when its network model
+  # requires client-certificate authentication. The Worker never receives a
+  # Docker socket; the controller owns the hardened OCI runtime on sandbox
+  # nodes.
+  runtime_url: "https://sandbox-runtime.internal/v1"
+  # Inject EVALFROG_SANDBOX_RUNTIME_TOKEN from Secret Manager at deployment.
+  runtime_token: ""
 
 outbox:
   batch: 100
@@ -117,13 +99,9 @@ outbox:
   reconciler_interval: 30s
   scan_batch: 100
 
-cache:
-  execution_snapshot_ttl: 24h
-  active_run_context_ttl: 6h
-  terminal_run_context_ttl: 1h
-  active_run_read_model_ttl: 15m
-  terminal_run_read_model_ttl: 1h
-  definition_negative_ttl: 30s
+snapshot_l1:
+  max_entries: 2048
+  max_bytes: 268435456
 
 migrations:
   directory: "migrations"

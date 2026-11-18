@@ -1,10 +1,14 @@
 {
   "name": "evalfrog-web",
   "private": true,
+  "type": "module",
   "version": "0.1.0",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "playwright test tests/browser/merge.spec.mjs"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@playwright/test": "^1.65.1"
+  }
 }

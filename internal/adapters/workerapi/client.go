@@ -13,26 +13,11 @@ import (
 	"github.com/uu999/evalfrog/internal/resources"
 	"github.com/uu999/evalfrog/internal/runtime/attempt"
 	runtimecontext "github.com/uu999/evalfrog/internal/runtime/context"
-	"github.com/uu999/evalfrog/internal/scheduling"
 )
 
 type Client struct {
 	baseURL string
 	http    *http.Client
-}
-
-func (client *Client) RegisterWorker(ctx context.Context, registration scheduling.WorkerRegistration) error {
-	capabilities := make([]capability, len(registration.Capabilities))
-	for index, value := range registration.Capabilities {
-		capabilities[index] = capability{Type: value.Type, Version: value.Version}
-	}
-	body := workerHeartbeatRequest{ExecutorBuild: registration.ExecutorBuild,
-		ResourceClass: registration.ResourceClass, Slots: registration.Slots,
-		Capabilities: capabilities, TTLMS: registration.TTL.Milliseconds()}
-	var response struct {
-		Registered bool `json:"registered"`
-	}
-	return client.post(ctx, "/internal/v1/workers/"+registration.WorkerID+"/heartbeat", body, &response)
 }
 
 func New(baseURL string, timeout time.Duration) *Client {
@@ -60,7 +45,7 @@ func (client *Client) Claim(ctx context.Context, command attempt.ClaimCommand) (
 	for index, value := range command.Capabilities {
 		capabilities[index] = capability{Type: value.Type, Version: value.Version}
 	}
-	body := claimRequest{ProjectID: command.ProjectID, RunID: command.RunID,
+	body := claimRequest{ProjectID: command.ProjectID, RunID: command.RunID, NodeRunID: command.NodeRunID,
 		AttemptSequence: command.AttemptSequence, WorkerID: command.WorkerID,
 		ExecutorBuild: command.ExecutorBuild, ResourceClass: command.ResourceClass,
 		Capabilities: capabilities, LeaseDurationMS: command.LeaseDuration.Milliseconds()}
@@ -69,6 +54,42 @@ func (client *Client) Claim(ctx context.Context, command attempt.ClaimCommand) (
 		return attempt.Lease{}, err
 	}
 	return attempt.Lease{Token: response.LeaseToken, Owner: response.Owner, FencingToken: response.FencingToken, ExpiresAt: response.ExpiresAt, CancelRequested: response.CancelRequested}, nil
+}
+
+func (client *Client) ClaimBatch(ctx context.Context, commands []attempt.ClaimCommand) ([]attempt.ClaimResult, error) {
+	items := make([]claimRequest, len(commands))
+	for index, command := range commands {
+		capabilities := make([]capability, len(command.Capabilities))
+		for capabilityIndex, value := range command.Capabilities {
+			capabilities[capabilityIndex] = capability{Type: value.Type, Version: value.Version}
+		}
+		items[index] = claimRequest{AttemptID: command.AttemptID, ProjectID: command.ProjectID, RunID: command.RunID,
+			NodeRunID: command.NodeRunID, AttemptSequence: command.AttemptSequence, WorkerID: command.WorkerID,
+			ExecutorBuild: command.ExecutorBuild, ResourceClass: command.ResourceClass, Capabilities: capabilities,
+			LeaseDurationMS: command.LeaseDuration.Milliseconds()}
+	}
+	var response struct {
+		Items []claimBatchItemResponse `json:"items"`
+	}
+	if err := client.post(ctx, "/internal/v1/attempts/claim-batch", claimBatchRequest{Items: items}, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Items) != len(commands) {
+		return nil, fmt.Errorf("worker API claim batch result count mismatch")
+	}
+	results := make([]attempt.ClaimResult, len(commands))
+	for index, item := range response.Items {
+		if item.Code != "" {
+			results[index].Err = mappedDomainError(item.Code)
+			continue
+		}
+		if item.Lease == nil {
+			return nil, fmt.Errorf("worker API claim batch item %d omitted lease", index)
+		}
+		results[index].Lease = attempt.Lease{Token: item.Lease.LeaseToken, Owner: item.Lease.Owner,
+			FencingToken: item.Lease.FencingToken, ExpiresAt: item.Lease.ExpiresAt, CancelRequested: item.Lease.CancelRequested}
+	}
+	return results, nil
 }
 
 func (client *Client) Heartbeat(ctx context.Context, command attempt.HeartbeatCommand) (attempt.Lease, error) {
@@ -105,6 +126,42 @@ func (client *Client) Load(ctx context.Context, command runtimecontext.LoadComma
 	}
 	response.LeaseToken, response.FencingToken = command.LeaseToken, command.FencingToken
 	return response, nil
+}
+
+func (client *Client) LoadBatch(ctx context.Context, commands []runtimecontext.LoadCommand) ([]runtimecontext.LoadResult, error) {
+	request := contextBatchRequest{Items: make([]struct {
+		AttemptID string `json:"attempt_id"`
+		contextRequest
+	}, len(commands))}
+	for index, command := range commands {
+		request.Items[index].AttemptID = command.AttemptID
+		request.Items[index].contextRequest = contextRequest{ProjectID: command.ProjectID, RunID: command.RunID,
+			AttemptSequence: command.AttemptSequence, LeaseToken: command.LeaseToken, FencingToken: command.FencingToken}
+	}
+	var response struct {
+		Items []contextBatchItemResponse `json:"items"`
+	}
+	if err := client.post(ctx, "/internal/v1/attempts/context-batch", request, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Items) != len(commands) {
+		return nil, fmt.Errorf("worker API context batch result count mismatch")
+	}
+	results := make([]runtimecontext.LoadResult, len(commands))
+	for index, item := range response.Items {
+		if item.Code != "" {
+			results[index].Err = mappedDomainError(item.Code)
+			continue
+		}
+		if item.Context == nil {
+			results[index].Err = errors.New("worker API context batch item omitted context")
+			continue
+		}
+		results[index].Context = *item.Context
+		results[index].Context.LeaseToken = commands[index].LeaseToken
+		results[index].Context.FencingToken = commands[index].FencingToken
+	}
+	return results, nil
 }
 
 func (client *Client) ResolveConnection(ctx context.Context, command resources.RuntimeResolveCommand) (resources.ConnectionRuntime, error) {
@@ -150,7 +207,16 @@ func (client *Client) post(ctx context.Context, path string, body, result any) e
 		Error struct{ Code, Message string } `json:"error"`
 	}
 	_ = json.NewDecoder(response.Body).Decode(&failure)
-	switch failure.Error.Code {
+	err = mappedDomainError(failure.Error.Code)
+	if failure.Error.Code != "ATTEMPT_NOT_FOUND" && failure.Error.Code != "ATTEMPT_NOT_CURRENT" && failure.Error.Code != "LEASE_MISMATCH" && failure.Error.Code != "ATTEMPT_STATE_CONFLICT" && failure.Error.Code != "CAPABILITY_MISMATCH" {
+		err = errors.New(failure.Error.Message)
+	}
+	return fmt.Errorf("worker API %s: %w", failure.Error.Code, err)
+}
+
+func mappedDomainError(code string) error {
+	var err error
+	switch code {
 	case "ATTEMPT_NOT_FOUND":
 		err = attempt.ErrNotFound
 	case "ATTEMPT_NOT_CURRENT":
@@ -162,16 +228,18 @@ func (client *Client) post(ctx context.Context, path string, body, result any) e
 	case "CAPABILITY_MISMATCH":
 		err = attempt.ErrCapabilityMismatch
 	default:
-		err = errors.New(failure.Error.Message)
+		err = errors.New(code)
 	}
-	return fmt.Errorf("worker API %s: %w", failure.Error.Code, err)
+	return err
 }
 
 var _ interface {
 	Claim(context.Context, attempt.ClaimCommand) (attempt.Lease, error)
+	ClaimBatch(context.Context, []attempt.ClaimCommand) ([]attempt.ClaimResult, error)
 	Heartbeat(context.Context, attempt.HeartbeatCommand) (attempt.Lease, error)
 	Complete(context.Context, attempt.CompleteCommand) (bool, error)
 	Load(context.Context, runtimecontext.LoadCommand) (runtimecontext.ExecutionContext, error)
+	LoadBatch(context.Context, []runtimecontext.LoadCommand) ([]runtimecontext.LoadResult, error)
 	ResolveConnection(context.Context, resources.RuntimeResolveCommand) (resources.ConnectionRuntime, error)
 	ResolveServiceOperation(context.Context, resources.RuntimeResolveCommand) (resources.ServiceOperationRuntime, error)
 } = (*Client)(nil)

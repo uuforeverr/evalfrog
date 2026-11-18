@@ -37,6 +37,63 @@ func BuiltinRegistry() Registry {
 	return registry
 }
 
+func BuiltinRegistryV2() Registry {
+	registry, err := NewRegistry(
+		builtinHandler{nodeType: "start", kind: dsl.KindControl, coordinate: dsl.Coordinate{Type: "control.start", Version: 2}, compile: compileStart},
+		builtinHandler{nodeType: "end", kind: dsl.KindControl, coordinate: dsl.Coordinate{Type: "control.end", Version: 2}, compile: compileEndV2},
+		builtinHandler{nodeType: "branch", kind: dsl.KindControl, coordinate: dsl.Coordinate{Type: "control.branch", Version: 2}, compile: compileBranchV2},
+		builtinHandler{nodeType: "code", kind: dsl.KindTask, coordinate: dsl.Coordinate{Type: "task.python", Version: 1}, compile: compileCode},
+		builtinHandler{nodeType: "http", kind: dsl.KindTask, coordinate: dsl.Coordinate{Type: "task.http", Version: 1}, compile: compileHTTP},
+		builtinHandler{nodeType: "rpc", kind: dsl.KindTask, coordinate: dsl.Coordinate{Type: "task.rpc", Version: 1}, compile: compileRPC},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return registry
+}
+
+func compileBranchV2(context Context, node ir.Node) (NodeProduct, []ir.Diagnostic) {
+	product := emptyProduct(node)
+	var diagnostics []ir.Diagnostic
+	for _, input := range node.Inputs {
+		if input.Name == "cases" || input.Name == "default_route" {
+			canonical, err := ir.CanonicalizeJSON(input.Value, ir.DefaultParseLimits)
+			if err != nil {
+				diagnostics = append(diagnostics, inputDiagnostic(context, node, input.Name, "BRANCH_CONFIG_INVALID", err.Error()))
+				continue
+			}
+			product.Config[string(input.Name)] = canonical
+			product.FieldMappings["operation.config."+string(input.Name)] = "inputs." + string(input.Name)
+			if input.Name == "cases" {
+				var cases []map[string]json.RawMessage
+				if json.Unmarshal(canonical, &cases) == nil {
+					for index, branchCase := range cases {
+						for field := range branchCase {
+							product.FieldMappings[fmt.Sprintf("operation.config.cases.%d.%s", index, field)] = fmt.Sprintf("inputs.cases.%d.%s", index, field)
+						}
+						var conditions []map[string]json.RawMessage
+						if json.Unmarshal(branchCase["conditions"], &conditions) == nil {
+							for conditionIndex, condition := range conditions {
+								for field := range condition {
+									product.FieldMappings[fmt.Sprintf("operation.config.cases.%d.conditions.%d.%s", index, conditionIndex, field)] = fmt.Sprintf("inputs.cases.%d.conditions.%d.%s", index, conditionIndex, field)
+								}
+							}
+						}
+					}
+				}
+			}
+			continue
+		}
+		binding, issues := compileInput(context, node, input)
+		diagnostics = append(diagnostics, issues...)
+		if !ir.HasErrors(issues) {
+			product.Inputs[dsl.PortName(input.Name)] = binding
+			product.FieldMappings["inputs."+string(input.Name)] = "inputs." + string(input.Name)
+		}
+	}
+	return product, diagnostics
+}
+
 func compileStart(_ Context, node ir.Node) (NodeProduct, []ir.Diagnostic) {
 	return NodeProduct{
 		Config: map[string]json.RawMessage{}, Inputs: map[dsl.PortName]dsl.InputBinding{},
@@ -50,6 +107,20 @@ func compileEnd(context Context, node ir.Node) (NodeProduct, []ir.Diagnostic) {
 	if !ir.HasErrors(diagnostics) {
 		product.Inputs["workflow_output"] = input
 		product.FieldMappings["inputs.workflow_output"] = "inputs.workflow_output"
+	}
+	return product, diagnostics
+}
+
+func compileEndV2(context Context, node ir.Node) (NodeProduct, []ir.Diagnostic) {
+	product := emptyProduct(node)
+	var diagnostics []ir.Diagnostic
+	for _, input := range node.Inputs {
+		binding, issues := compileInput(context, node, input)
+		diagnostics = append(diagnostics, issues...)
+		if !ir.HasErrors(issues) {
+			product.Inputs[dsl.PortName(input.Name)] = binding
+			product.FieldMappings["inputs."+string(input.Name)] = "inputs." + string(input.Name)
+		}
 	}
 	return product, diagnostics
 }

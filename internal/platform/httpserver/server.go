@@ -128,6 +128,8 @@ func metricRoute(path string) string {
 			parts[index+1] = "{run_id}"
 		case "versions":
 			parts[index+1] = "{version_number}"
+		case "attempts":
+			parts[index+1] = "{attempt_id}"
 		}
 	}
 	if len(parts) == 0 || parts[0] == "" {

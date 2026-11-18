@@ -79,6 +79,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DraftRevision' }
+        '409':
+          description: On DRAFT_REVISION_CONFLICT, error.details includes base_revision, current_revision, base_ir, current_ir and submitted_ir for an explicit three-way merge. No revision is created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         default: { $ref: '#/components/responses/Error' }
   /v1/projects/{project_id}/workflows/{workflow_id}/draft/validate:
     post:
@@ -193,7 +198,7 @@ paths:
         - $ref: '#/components/parameters/RunID'
       responses:
         '200':
-          description: Current PostgreSQL-derived Run Read Model.
+          description: Current MySQL-derived Run Read Model.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunView' }
@@ -207,7 +212,7 @@ paths:
         - $ref: '#/components/parameters/RunID'
       responses:
         '200':
-          description: Current Run, Attempt and safe Audit diagnostics derived from PostgreSQL.
+          description: Current Run, Attempt and safe Audit diagnostics derived from MySQL.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunDiagnostics' }
@@ -255,9 +260,15 @@ paths:
   /v1/node-types:
     get:
       operationId: listNodeTypes
+      parameters:
+        - in: query
+          name: catalog_revision
+          required: false
+          schema: { type: string }
+          description: Immutable catalog revision recorded by a Draft; omitted selects the current catalog.
       responses:
         '200':
-          description: Public, versionless authoring descriptions from the current catalog.
+          description: Public authoring descriptions from the selected immutable catalog.
           content:
             application/json:
               schema:

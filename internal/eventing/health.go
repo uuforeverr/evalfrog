@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// OutboxAgeReader reads a PostgreSQL-derived health fact. It is deliberately
+// OutboxAgeReader reads a MySQL-derived health fact. It is deliberately
 // not inferred from Kafka offsets: an unpublished Runtime or Task Outbox
 // record is the only authority for relay backlog before Kafka receives it.
 type OutboxAgeReader interface {

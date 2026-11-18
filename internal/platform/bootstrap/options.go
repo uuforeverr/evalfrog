@@ -26,7 +26,7 @@ func Parse(service string, arguments []string, output io.Writer) (Options, error
 	flags.StringVar(&options.Profile, "profile", "", "configuration profile: local, test, or production-default")
 	flags.StringVar(&options.ConfigDir, "config-dir", "", "directory containing EvalFrog profile YAML files")
 	flags.BoolVar(&options.CheckConfig, "check-config", false, "validate configuration and exit")
-	flags.BoolVar(&options.Migrate, "migrate", false, "apply PostgreSQL migrations and exit")
+	flags.BoolVar(&options.Migrate, "migrate", false, "apply MySQL migrations and exit")
 	flags.StringVar(&options.HealthcheckURL, "healthcheck-url", "", "probe an HTTP readiness URL and exit")
 	if err := flags.Parse(arguments); err != nil {
 		return Options{}, err

@@ -1,6 +1,6 @@
 // Package runtime owns Workflow Run, Node Run, and Node Attempt domain state.
 //
-// State fields are private by design: Engine, Scheduler and Attempt Coordinator
+// State fields are private by design: Engine and Attempt Coordinator
 // must use explicit domain operations rather than updating status strings.
 package runtime
 
@@ -641,7 +641,7 @@ func (attempt *NodeAttempt) transition(target AttemptState) error {
 }
 
 // CompleteWorkflowSuccess models the single atomic write boundary that M5 will
-// implement as one PostgreSQL transaction.
+// implement as one MySQL transaction.
 func CompleteWorkflowSuccess(run *WorkflowRun, end *NodeRun, nodes []*NodeRun, output json.RawMessage) error {
 	if run == nil || end == nil || run.state != RunRunning || run.termination != nil || end.kind != NodeControl || !end.activated || end.state != NodePending {
 		return fmt.Errorf("workflow success preconditions are not met")

@@ -74,15 +74,29 @@ func NewService(repository Repository, accessControl AccessControl, resourceReso
 }
 
 func NewBuiltinService(repository Repository, accessControl AccessControl, resourceResolver ResourceResolver) Service {
-	registry, err := NewStaticCatalogRegistry(catalog.BuiltinV1())
+	registry, err := NewStaticCatalogRegistry(catalog.BuiltinV2(), catalog.BuiltinV1())
 	if err != nil {
 		panic(err)
 	}
-	service, err := NewService(repository, accessControl, resourceResolver, compilerpkg.BuiltinV1(), registry, compilerpkg.DefaultPolicyV1(), identity.UUIDv7Generator{})
+	service, err := NewService(repository, accessControl, resourceResolver, compilerpkg.BuiltinV2(), registry, compilerpkg.DefaultPolicyV1(), identity.UUIDv7Generator{})
 	if err != nil {
 		panic(err)
 	}
 	return service
+}
+
+func (service Service) catalogRevision(irVersion string) string {
+	if irVersion == ir.VersionV1 {
+		if value, exists := service.catalogs.Get(string(catalog.BuiltinRevisionV1)); exists {
+			return string(value.Revision())
+		}
+	}
+	if irVersion == ir.VersionV2 {
+		if value, exists := service.catalogs.Get(string(catalog.BuiltinRevisionV2)); exists {
+			return string(value.Revision())
+		}
+	}
+	return string(service.catalogs.Current().Revision())
 }
 
 type CreateWorkflowCommand struct {
@@ -98,7 +112,6 @@ func (service Service) CreateWorkflow(ctx context.Context, command CreateWorkflo
 		return Workflow{}, DraftRevision{}, nil, mapAccessError(err)
 	}
 	document, canonical, diagnostics := service.parseDraft(command.IRJSON)
-	_ = document
 	if ir.HasErrors(diagnostics) {
 		return Workflow{}, DraftRevision{}, diagnostics, nil
 	}
@@ -118,7 +131,7 @@ func (service Service) CreateWorkflow(ctx context.Context, command CreateWorkflo
 	}
 	workflow, revision, err := service.repository.CreateWorkflow(ctx, CreateWorkflowRecord{
 		WorkflowID: workflowID, DraftRevisionID: draftRevisionID, ProjectID: command.ProjectID, Name: command.Name,
-		IRJSON: canonical, CatalogRevision: string(service.catalogs.Current().Revision()), PrincipalID: command.PrincipalID,
+		IRJSON: canonical, CatalogRevision: service.catalogRevision(document.IRVersion), PrincipalID: command.PrincipalID,
 		IdempotencyKey: command.IdempotencyKey, RequestHash: hash,
 	})
 	if err != nil {
@@ -162,7 +175,7 @@ func (service Service) SaveDraft(ctx context.Context, command SaveDraftCommand) 
 	if err := service.access.Require(ctx, command.ProjectID, command.PrincipalID, access.PermissionWorkflowWrite); err != nil {
 		return DraftRevision{}, nil, mapAccessError(err)
 	}
-	_, canonical, diagnostics := service.parseDraft(command.IRJSON)
+	document, canonical, diagnostics := service.parseDraft(command.IRJSON)
 	if ir.HasErrors(diagnostics) {
 		return DraftRevision{}, diagnostics, nil
 	}
@@ -187,10 +200,19 @@ func (service Service) SaveDraft(ctx context.Context, command SaveDraftCommand) 
 	}
 	revision, err := service.repository.SaveDraft(ctx, SaveDraftRecord{
 		DraftRevisionID: revisionID, ProjectID: command.ProjectID, WorkflowID: command.WorkflowID,
-		ExpectedRevision: command.ExpectedRevision, IRJSON: canonical, CatalogRevision: baseRevision.CatalogRevision,
+		ExpectedRevision: command.ExpectedRevision, IRJSON: canonical, CatalogRevision: service.catalogRevision(document.IRVersion),
 		PrincipalID: command.PrincipalID, IdempotencyKey: command.IdempotencyKey, RequestHash: hash,
 	})
 	if err != nil {
+		if errors.Is(err, ErrDraftRevisionConflict) {
+			latest, readErr := service.repository.GetCurrentDraft(ctx, command.ProjectID, command.WorkflowID)
+			if readErr == nil {
+				return DraftRevision{}, nil, wrapError(CodeDraftRevisionConflict, "draft revision has changed", err, map[string]any{
+					"base_revision": baseRevision.RevisionNumber, "current_revision": latest.CurrentRevision,
+					"base_ir": baseRevision.IRJSON, "current_ir": latest.Current.IRJSON, "submitted_ir": json.RawMessage(canonical),
+				})
+			}
+		}
 		return DraftRevision{}, nil, repositoryError("save draft", err)
 	}
 	return revision, nil, nil

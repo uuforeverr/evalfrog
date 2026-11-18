@@ -33,12 +33,12 @@ func TestLoadRejectsProfileMixing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	content = []byte(strings.Replace(string(content), "evalfrog:local:sched:", "evalfrog:test:sched:", 1))
+	content = []byte(strings.Replace(string(content), "database: \"evalfrog_local\"", "database: \"evalfrog_test\"", 1))
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err = Load(LoadOptions{Directory: directory, Profile: "local", LookupEnv: emptyEnvironment})
-	if err == nil || !strings.Contains(err.Error(), "key_prefix") {
+	if err == nil || !strings.Contains(err.Error(), "isolated") {
 		t.Fatalf("expected profile isolation error, got %v", err)
 	}
 }
@@ -75,16 +75,19 @@ func TestValidateCapacityConstraints(t *testing.T) {
 		mutate  func(*Config)
 		message string
 	}{
-		{"missing required DSN", func(value *Config) { value.Postgres.DSN = "" }, "postgres.dsn is required"},
+		{"missing required DSN", func(value *Config) { value.MySQL.DSN = "" }, "mysql.dsn is required"},
 		{"invalid HTTP port", func(value *Config) { value.HTTP.ControlPlaneAddress = ":0" }, "control_plane_address"},
 		{"heartbeat", func(value *Config) { value.Worker.HeartbeatInterval = Duration(4 * time.Second) }, "heartbeat_interval"},
 		{"lost threshold", func(value *Config) { value.Worker.LostAfter = Duration(10 * time.Second) }, "lost_after"},
-		{"reservation", func(value *Config) { value.Scheduler.InflightReservationTTL = Duration(1 * time.Second) }, "reservation TTL"},
 		{"consumer partitions", func(value *Config) { value.Worker.ExpectedBuiltinConsumers = 2 }, "partitions"},
-		{"database budget", func(value *Config) { value.Postgres.ExpectedControlPlaneInstances = 100 }, "70% safety budget"},
+		{"engine database budget", func(value *Config) { value.Engine.MaxInflight = int(value.MySQL.PoolMax) }, "engine.max_inflight"},
+		{"snapshot L1 bounds", func(value *Config) { value.SnapshotL1.MaxBytes = 0 }, "snapshot_l1"},
+		{"database budget", func(value *Config) { value.MySQL.ExpectedControlPlaneInstances = 100 }, "70% safety budget"},
 		{"inbox retention", func(value *Config) { value.Outbox.InboxRetention = Duration(time.Hour) }, "inbox_retention"},
 		{"recovery scanner interval", func(value *Config) { value.Outbox.ReconcilerInterval = 0 }, "recovery timer, deadline scanner and reconciler intervals"},
 		{"sandbox runtime", func(value *Config) { value.Sandbox.Runtime = "unsafe" }, "sandbox runtime"},
+		{"sandbox runtime token", func(value *Config) { value.Sandbox.RuntimeToken = "" }, "runtime_token"},
+		{"sandbox runtime URL", func(value *Config) { value.Sandbox.RuntimeURL = "" }, "runtime_url"},
 	}
 	for _, test := range tests {
 		test := test
@@ -100,10 +103,22 @@ func TestValidateCapacityConstraints(t *testing.T) {
 	}
 }
 
+func TestProductionRuntimeURLRequiresHTTPS(t *testing.T) {
+	t.Parallel()
+	value, err := Load(LoadOptions{Directory: configDirectory(t), Profile: ProductionDefault, LookupEnv: emptyEnvironment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.Sandbox.RuntimeURL = "http://sandbox-runtime.internal/v1"
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "runtime_url") {
+		t.Fatalf("expected HTTPS runtime URL validation error, got %v", err)
+	}
+}
+
 func TestEnvironmentOverrides(t *testing.T) {
 	t.Parallel()
 	environment := map[string]string{
-		"EVALFROG_POSTGRES_DSN":  "postgres://override/db",
+		"EVALFROG_MYSQL_DSN":     "override:secret@tcp(mysql:3306)/evalfrog_local",
 		"EVALFROG_KAFKA_BROKERS": "kafka-a:9092, kafka-b:9092",
 	}
 	value, err := Load(LoadOptions{
@@ -114,8 +129,8 @@ func TestEnvironmentOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if value.Postgres.DSN != environment["EVALFROG_POSTGRES_DSN"] {
-		t.Fatalf("postgres override not applied")
+	if value.MySQL.DSN != environment["EVALFROG_MYSQL_DSN"] {
+		t.Fatalf("MySQL override not applied")
 	}
 	if len(value.Kafka.Brokers) != 2 || value.Kafka.Brokers[1] != "kafka-b:9092" {
 		t.Fatalf("Kafka override not applied: %v", value.Kafka.Brokers)

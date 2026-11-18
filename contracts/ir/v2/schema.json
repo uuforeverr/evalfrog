@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evalfrog.dev/contracts/ir/v2/schema.json",
+  "title": "EvalFrog Canonical IR v2",
+  "type": "object",
+  "required": ["ir_version", "nodes", "edges", "layout"],
+  "additionalProperties": false,
+  "properties": {
+    "ir_version": { "const": "2" },
+    "nodes": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/edge" }
+    },
+    "layout": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/logicalId" },
+      "additionalProperties": { "$ref": "#/$defs/position" }
+    }
+  },
+  "$defs": {
+    "logicalId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "portName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+    },
+    "nodeType": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "dataType": {
+      "enum": ["string", "integer", "number", "boolean", "object", "array"]
+    },
+    "node": {
+      "type": "object",
+      "required": ["id", "type", "title", "inputs", "outputs"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "type": { "$ref": "#/$defs/nodeType" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "inputs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/input" }
+        },
+        "outputs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/output" }
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["name", "data_type", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/portName" },
+        "data_type": { "$ref": "#/$defs/dataType" },
+        "source": { "enum": ["literal", "ref"] },
+        "value": {},
+        "ref_node": { "$ref": "#/$defs/logicalId" },
+        "ref_output": { "$ref": "#/$defs/portName" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "source": { "const": "literal" } }, "required": ["source"] },
+          "then": {
+            "required": ["value"],
+            "not": { "anyOf": [{ "required": ["ref_node"] }, { "required": ["ref_output"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "source": { "const": "ref" } }, "required": ["source"] },
+          "then": {
+            "required": ["ref_node", "ref_output"],
+            "not": { "required": ["value"] }
+          }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "string" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "string" } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "integer" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "number" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "number" } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "boolean" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "boolean" } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "object" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "object" } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "literal" }, "data_type": { "const": "array" } }, "required": ["source", "data_type"] },
+          "then": { "properties": { "value": { "type": "array" } } }
+        }
+      ]
+    },
+    "output": {
+      "type": "object",
+      "required": ["name", "data_type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/portName" },
+        "data_type": { "$ref": "#/$defs/dataType" }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": ["id", "source", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/logicalId" },
+        "source": { "$ref": "#/$defs/logicalId" },
+        "target": { "$ref": "#/$defs/logicalId" },
+        "route": { "$ref": "#/$defs/portName" }
+      }
+    },
+    "position": {
+      "type": "object",
+      "required": ["x", "y"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      }
+    }
+  }
+}

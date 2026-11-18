@@ -24,6 +24,11 @@ type AttemptClient interface {
 	Load(context.Context, runtimecontext.LoadCommand) (runtimecontext.ExecutionContext, error)
 }
 
+type BatchAttemptClient interface {
+	ClaimBatch(context.Context, []attempt.ClaimCommand) ([]attempt.ClaimResult, error)
+	LoadBatch(context.Context, []runtimecontext.LoadCommand) ([]runtimecontext.LoadResult, error)
+}
+
 type Executor interface {
 	Coordinate() dsl.Coordinate
 	Execute(context.Context, runtimecontext.ExecutionContext) platformruntime.AttemptResult
@@ -55,13 +60,14 @@ func NewCatalog(resourceClass scheduling.ResourceClass, executors ...Executor) (
 		result.values[coordinate] = executor
 		result.coordinates = append(result.coordinates, coordinate)
 	}
-	registration := scheduling.WorkerRegistration{
-		WorkerID: "catalog-validation", ExecutorBuild: "catalog-validation",
-		ResourceClass: resourceClass, Slots: 1, Capabilities: result.coordinates,
-		TTL: time.Second,
+	required := scheduling.RequiredCapabilities(resourceClass)
+	if len(result.coordinates) != len(required) {
+		return Catalog{}, fmt.Errorf("executor catalog must provide the complete %s capability set", resourceClass)
 	}
-	if err := registration.Validate(); err != nil {
-		return Catalog{}, fmt.Errorf("executor catalog is not pool-homogeneous: %w", err)
+	for _, coordinate := range required {
+		if _, exists := result.values[coordinate]; !exists {
+			return Catalog{}, fmt.Errorf("executor catalog is missing %s@%d", coordinate.Type, coordinate.Version)
+		}
 	}
 	return result, nil
 }
@@ -74,6 +80,7 @@ type Settings struct {
 	WorkerID, ExecutorBuild string
 	ResourceClass           scheduling.ResourceClass
 	Slots                   int
+	BatchSize               int
 	LeaseDuration           time.Duration
 	HeartbeatInterval       time.Duration
 	ClaimTimeout            time.Duration
@@ -81,7 +88,10 @@ type Settings struct {
 }
 
 func (settings Settings) validate() error {
-	if settings.WorkerID == "" || settings.ExecutorBuild == "" || !settings.ResourceClass.Valid() || settings.Slots < 1 || settings.LeaseDuration <= 0 || settings.HeartbeatInterval <= 0 || settings.HeartbeatInterval >= settings.LeaseDuration/3 || settings.ClaimTimeout <= 0 || settings.CompleteTimeout <= 0 {
+	if settings.BatchSize == 0 {
+		settings.BatchSize = 1
+	}
+	if settings.WorkerID == "" || settings.ExecutorBuild == "" || !settings.ResourceClass.Valid() || settings.Slots < 1 || settings.BatchSize < 1 || settings.BatchSize > 8 || settings.LeaseDuration <= 0 || settings.HeartbeatInterval <= 0 || settings.HeartbeatInterval >= settings.LeaseDuration/3 || settings.ClaimTimeout <= 0 || settings.CompleteTimeout <= 0 {
 		return fmt.Errorf("worker runtime identity, resource class and timing settings are invalid")
 	}
 	return nil
@@ -94,6 +104,7 @@ type Runtime struct {
 	settings   Settings
 	logger     *slog.Logger
 	deliveryMu sync.Mutex
+	active     sync.Map
 	stop       context.CancelFunc
 }
 
@@ -104,6 +115,9 @@ func New(consumer eventing.Consumer, attempts AttemptClient, catalog Catalog, se
 	if err := settings.validate(); err != nil {
 		return nil, err
 	}
+	if settings.BatchSize == 0 {
+		settings.BatchSize = 1
+	}
 	return &Runtime{consumer: consumer, attempts: attempts, catalog: catalog, settings: settings, logger: logger}, nil
 }
 
@@ -113,6 +127,11 @@ func (worker *Runtime) Name() string { return "worker-runtime" }
 // one execution; the Kafka adapter may batch only to the configured slot
 // bound, so local outstanding work can never grow without limit.
 func (worker *Runtime) Run(ctx context.Context) error {
+	if consumer, ok := worker.consumer.(eventing.PartitionBatchConsumer); ok {
+		if attempts, batchOK := worker.attempts.(BatchAttemptClient); batchOK && worker.settings.BatchSize > 1 {
+			return worker.runBatches(ctx, consumer, attempts)
+		}
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	worker.stop = cancel
 	errorsFound := make(chan error, worker.settings.Slots)
@@ -148,6 +167,221 @@ func (worker *Runtime) Shutdown(context.Context) error {
 		worker.stop()
 	}
 	return nil
+}
+
+type acquiredTask struct {
+	messageIndex int
+	task         eventing.TaskMessage
+	lease        attempt.Lease
+	context      *runtimecontext.ExecutionContext
+	poison       error
+}
+
+func (worker *Runtime) runBatches(ctx context.Context, consumer eventing.PartitionBatchConsumer, attempts BatchAttemptClient) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	worker.stop = cancel
+	defer cancel()
+	slots := make(chan struct{}, worker.settings.Slots)
+	completed := make(chan struct{}, worker.settings.Slots)
+	errorsFound := make(chan error, 1)
+	var wait sync.WaitGroup
+	for runCtx.Err() == nil {
+		free := worker.settings.Slots - len(slots)
+		if free == 0 {
+			select {
+			case <-completed:
+			case err := <-errorsFound:
+				cancel()
+				wait.Wait()
+				return err
+			case <-runCtx.Done():
+			}
+			continue
+		}
+		batch, err := consumer.ReceivePartitionBatch(runCtx, min(worker.settings.BatchSize, free))
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				select {
+				case executionErr := <-errorsFound:
+					wait.Wait()
+					return executionErr
+				default:
+				}
+				break
+			}
+			cancel()
+			wait.Wait()
+			return err
+		}
+		jobs, err := worker.acquireBatch(runCtx, batch, attempts)
+		if err != nil {
+			cancel()
+			wait.Wait()
+			return err
+		}
+		for _, job := range jobs {
+			slots <- struct{}{}
+			wait.Add(1)
+			go func(value acquiredTask) {
+				defer wait.Done()
+				defer func() { <-slots }()
+				defer worker.active.Delete(value.task.AttemptID)
+				err := worker.runAcquired(runCtx, value)
+				if err != nil {
+					select {
+					case errorsFound <- err:
+					default:
+					}
+					cancel()
+				}
+				select {
+				case completed <- struct{}{}:
+				default:
+				}
+			}(job)
+		}
+		select {
+		case err := <-errorsFound:
+			cancel()
+			wait.Wait()
+			return err
+		default:
+		}
+	}
+	wait.Wait()
+	return runCtx.Err()
+}
+
+func (worker *Runtime) acquireBatch(ctx context.Context, delivery eventing.DeliveryBatch, client BatchAttemptClient) ([]acquiredTask, error) {
+	messages := delivery.Messages()
+	if len(messages) == 0 || len(messages) > worker.settings.BatchSize {
+		delivery.Nack()
+		return nil, fmt.Errorf("Kafka partition batch size is invalid")
+	}
+	commands := make([]attempt.ClaimCommand, 0, len(messages))
+	prepared := make([]acquiredTask, 0, len(messages))
+	claimIndexes := make([]int, 0, len(messages))
+	for index, message := range messages {
+		task, parseErr := eventing.ParseTaskMessage(message.Payload)
+		if parseErr != nil {
+			identity, identityErr := eventing.ParseTaskIdentity(message.Payload)
+			if identityErr != nil {
+				if err := delivery.DeadLetter(ctx, index, "INVALID_TASK_MESSAGE"); err != nil {
+					delivery.Nack()
+					return nil, err
+				}
+				continue
+			}
+			task = identity
+			prepared = append(prepared, acquiredTask{messageIndex: index, task: task, poison: parseErr})
+		} else {
+			prepared = append(prepared, acquiredTask{messageIndex: index, task: task})
+		}
+		preparedIndex := len(prepared) - 1
+		if task.ResourceClass != worker.settings.ResourceClass {
+			prepared = prepared[:preparedIndex]
+			if err := delivery.DeadLetter(ctx, index, "RESOURCE_CLASS_MISMATCH"); err != nil {
+				delivery.Nack()
+				return nil, err
+			}
+			continue
+		}
+		commands = append(commands, attempt.ClaimCommand{ProjectID: task.ProjectID, RunID: task.RunID, NodeRunID: task.NodeRunID,
+			AttemptID: task.AttemptID, AttemptSequence: task.AttemptSequence, WorkerID: worker.settings.WorkerID,
+			ExecutorBuild: worker.settings.ExecutorBuild, ResourceClass: task.ResourceClass,
+			Capabilities: worker.catalog.Capabilities(), LeaseDuration: worker.settings.LeaseDuration})
+		claimIndexes = append(claimIndexes, preparedIndex)
+	}
+	if len(commands) > 0 {
+		claimCtx, cancelClaim := context.WithTimeout(ctx, worker.settings.ClaimTimeout)
+		results, err := client.ClaimBatch(claimCtx, commands)
+		cancelClaim()
+		if err != nil {
+			delivery.Nack()
+			return nil, err
+		}
+		if len(results) != len(commands) {
+			delivery.Nack()
+			return nil, fmt.Errorf("claim batch result count mismatch")
+		}
+		for resultIndex, result := range results {
+			preparedIndex := claimIndexes[resultIndex]
+			if result.Err == nil {
+				prepared[preparedIndex].lease = result.Lease
+				continue
+			}
+			if errors.Is(result.Err, attempt.ErrCapabilityMismatch) {
+				messageIndex := prepared[preparedIndex].messageIndex
+				if messageIndex < 0 || delivery.DeadLetter(ctx, messageIndex, "CAPABILITY_MISMATCH") != nil {
+					delivery.Nack()
+					return nil, fmt.Errorf("dead-letter capability mismatch")
+				}
+				prepared[preparedIndex].lease = attempt.Lease{}
+				continue
+			}
+			if errors.Is(result.Err, attempt.ErrNotFound) || errors.Is(result.Err, attempt.ErrNotCurrent) || errors.Is(result.Err, attempt.ErrStateConflict) || errors.Is(result.Err, attempt.ErrLeaseMismatch) {
+				prepared[preparedIndex].lease = attempt.Lease{}
+				continue
+			}
+			delivery.Nack()
+			return nil, result.Err
+		}
+	}
+	loadCommands := make([]runtimecontext.LoadCommand, 0, len(prepared))
+	loadIndexes := make([]int, 0, len(prepared))
+	for index := range prepared {
+		value := &prepared[index]
+		if value.lease.Token == "" || value.lease.CancelRequested || value.poison != nil {
+			continue
+		}
+		loadCommands = append(loadCommands, runtimecontext.LoadCommand{ProjectID: value.task.ProjectID, RunID: value.task.RunID,
+			AttemptID: value.task.AttemptID, AttemptSequence: value.task.AttemptSequence,
+			LeaseToken: value.lease.Token, FencingToken: value.lease.FencingToken})
+		loadIndexes = append(loadIndexes, index)
+	}
+	if len(loadCommands) > 0 {
+		results, err := client.LoadBatch(ctx, loadCommands)
+		if err != nil {
+			worker.logger.Warn("execution context batch unavailable; deferred to lease recovery", "component", worker.Name(), "attempts", len(loadCommands), "error", err)
+		} else if len(results) != len(loadCommands) {
+			worker.logger.Warn("execution context batch result count mismatch; deferred to lease recovery", "component", worker.Name())
+		} else {
+			for resultIndex, result := range results {
+				if result.Err != nil {
+					worker.logger.Warn("execution context unavailable; deferred to lease recovery", "component", worker.Name(), "attempt_id", loadCommands[resultIndex].AttemptID, "error", result.Err)
+					continue
+				}
+				value := result.Context
+				prepared[loadIndexes[resultIndex]].context = &value
+			}
+		}
+	}
+	if err := delivery.Ack(ctx); err != nil {
+		return nil, err
+	}
+	jobs := make([]acquiredTask, 0, len(prepared))
+	for _, value := range prepared {
+		if value.lease.Token != "" && (value.context != nil || value.poison != nil || value.lease.CancelRequested) {
+			if _, executing := worker.active.LoadOrStore(value.task.AttemptID, struct{}{}); executing {
+				continue
+			}
+			jobs = append(jobs, value)
+		}
+	}
+	return jobs, nil
+}
+
+func (worker *Runtime) runAcquired(ctx context.Context, value acquiredTask) error {
+	if value.lease.CancelRequested {
+		return worker.complete(ctx, value.task, value.lease, platformruntime.AttemptResult{State: platformruntime.AttemptCanceled, ErrorCode: "RUN_TERMINATING", Message: "run cancellation or deadline was requested before execution"})
+	}
+	if value.poison != nil {
+		return worker.completeFailure(ctx, value.task, value.lease, "TASK_MESSAGE_INVALID", value.poison.Error())
+	}
+	if value.context == nil {
+		return nil
+	}
+	return worker.executeClaimed(ctx, value.task, value.lease, *value.context)
 }
 
 func (worker *Runtime) receiveAndExecute(ctx context.Context) error {
@@ -217,6 +451,10 @@ func (worker *Runtime) receiveAndExecute(ctx context.Context) error {
 			"project_id", task.ProjectID, "run_id", task.RunID, "attempt_id", task.AttemptID, "trace_id", task.TraceID, "error", err)
 		return nil
 	}
+	return worker.executeClaimed(ctx, task, lease, executionContext)
+}
+
+func (worker *Runtime) executeClaimed(ctx context.Context, task eventing.TaskMessage, lease attempt.Lease, executionContext runtimecontext.ExecutionContext) error {
 	executor, exists := worker.catalog.values[executionContext.Operation.Coordinate()]
 	if !exists {
 		return worker.completeFailure(ctx, task, lease, "EXECUTOR_NOT_AVAILABLE", "claimed operation has no local executor")
@@ -251,7 +489,7 @@ func (worker *Runtime) receiveAndExecute(ctx context.Context) error {
 	if !result.State.Terminal() || result.State == platformruntime.AttemptLost {
 		result = platformruntime.AttemptResult{State: platformruntime.AttemptFailed, ErrorCode: "EXECUTOR_PROTOCOL_ERROR", Message: "executor returned a non-terminal result"}
 	}
-	if err = worker.complete(ctx, task, lease, result); err != nil {
+	if err := worker.complete(ctx, task, lease, result); err != nil {
 		worker.logger.Warn("attempt completion deferred to lease recovery", "component", worker.Name(),
 			"project_id", task.ProjectID, "run_id", task.RunID, "attempt_id", task.AttemptID, "trace_id", task.TraceID, "error", err)
 	}

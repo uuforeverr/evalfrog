@@ -1,0 +1,29 @@
+#merge-dialog { width: min(1200px, 96vw); max-height: 92vh; overflow: auto; color: #ecf2ff; background: #171d29; border: 1px solid #55739b; border-radius: 8px; }
+#merge-dialog::backdrop { background: #000b; }
+#merge-workspace { display: grid; grid-template-columns: minmax(900px, 1fr) 260px; min-height: 480px; overflow: auto; max-height: 65vh; border: 1px solid #344157; }
+#merge-canvas { position: relative; background: radial-gradient(#293548 1px, transparent 1px); background-size: 24px 24px; }
+.merge-lines { position: absolute; inset: 0; pointer-events: none; }
+.merge-line { stroke: #64748b; stroke-width: 3; }
+.merge-line[data-changed="latest"] { stroke: #60a5fa; }
+.merge-line[data-changed="local"] { stroke: #f59e0b; }
+.merge-line[data-changed="both"] { stroke: #c084fc; }
+.merge-line[data-removed="true"] { opacity: .4; stroke-dasharray: 7 5; }
+.merge-node { position: absolute; display: grid; gap: 4px; width: 170px; min-height: 82px; text-align: left; background: #223047; border: 2px solid #64748b; cursor: grab; touch-action: none; }
+.merge-node:active { cursor: grabbing; }
+.merge-node small { color: #cbd5e1; }
+.merge-node[data-changed="latest"] { border-color: #60a5fa; }
+.merge-node[data-changed="local"] { border-color: #f59e0b; }
+.merge-node[data-changed="both"] { border-color: #c084fc; }
+.merge-node[data-resolved="true"] { box-shadow: 0 0 0 3px #34d39966; }
+.merge-node[data-removed="true"] { opacity: .5; text-decoration: line-through; }
+.merge-edge { position: absolute; transform: translate(-50%, -50%); padding: 3px 7px; border: 2px solid #64748b; background: #171d29; }
+.merge-edge[data-changed="latest"] { border-color: #60a5fa; }
+.merge-edge[data-changed="local"] { border-color: #f59e0b; }
+.merge-edge[data-changed="both"] { border-color: #c084fc; }
+.merge-edge[data-resolved="true"] { box-shadow: 0 0 0 3px #34d39966; }
+#merge-inspector { position: sticky; right: 0; top: 0; align-self: start; min-height: 100%; background: #171d29; border-left: 1px solid #344157; }
+.merge-option { display: block; width: 100%; text-align: left; margin: 7px 0; background: #263246; }
+.merge-option[data-origin="latest"] { border-left: 4px solid #60a5fa; }
+.merge-option[data-origin="local"] { border-left: 4px solid #f59e0b; }
+.merge-option[data-selected="true"] { outline: 2px solid #34d399; }
+#merge-error { color: #fca5a5; }

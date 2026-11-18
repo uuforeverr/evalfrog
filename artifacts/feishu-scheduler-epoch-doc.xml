@@ -1,0 +1,7 @@
+<title>EvalFrog Scheduler 一个 Epoch：Ready 如何进入 Kafka</title>
+<p>G 是全局 Dispatch Window，约等于 ceil(全部 Worker Slot × 1.2)。它是整平台这一拍最多还能新准入多少，不是每个 Project 各有一个 Window。</p>
+<h1>三个容易混的量</h1>
+<p><b>本轮已授予 granted[P]。</b>这是 BuildPlan 里的内存计数器，每个 Epoch 从 0 开始。每决定给 Project P 一个新名额，granted[P] 加 1。选择公式是 level = inflight[P] + granted[P]，总是把下一个名额给当前 level 最小的 Project。inflight[P] 来自库里的 queued + running，再加上 Redis 里尚未落库的 Reservation；granted[P] 只统计这一拍新计划出去的 Credit，不是 Redis 里的历史库存。</p>
+<p><b>对应 Pool 还有窗口。</b>Builtin 和 Sandbox 各有 Pool Window，约等于 ceil(该池 Slot × 1.2)。队头 Task 属于哪个池，该池剩余窗口必须大于 0，否则这个 Project 本轮先跳过。这是资源可行性，不是第二套公平份额。公平仍然只按 project_id 算。</p>
+<p><b>Window 用完。</b>指全局 remainingG = G − 当前全局 inflight 变成 0。循环发完这些新名额就停，剩余 Ready 仍留在 PostgreSQL。不是把每个 Project 的队列消化完，也不是每 Project 一个 G。读库时每个 Project 最多拉 G 条 Ready，那只是快照上限，不等于本轮能准入 G 条。</p>
+<h1>流程图</h1>

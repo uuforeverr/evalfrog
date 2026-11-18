@@ -120,8 +120,8 @@ func TestM10RunReadModelMapsPersistedRuntimeFailureToIRLocation(t *testing.T) {
 		ExecutionNodeID: nodeID, DSLField: "outputs.result", Message: "output contract failed", Details: map[string]any{"actual": "string"},
 	}
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		UPDATE node_runs SET state='failed', state_version=state_version+1, failure_json=$1::jsonb
-		WHERE project_id=$2 AND run_id=$3 AND execution_node_id=$4`, mustJSONBytes(t, failure), harness.projectID, run.ID, nodeID)
+		UPDATE node_runs SET state='failed', state_version=state_version+1, failure_json=$1
+		WHERE project_id=UUID_TO_BIN($2) AND run_id=UUID_TO_BIN($3) AND execution_node_id=$4`, mustJSONBytes(t, failure), harness.projectID, run.ID, nodeID)
 	reader := projection.NewBuiltinService(harness.store, harness.access)
 	view, err := reader.GetRun(harness.ctx, harness.projectID, harness.principalID, run.ID)
 	if err != nil {

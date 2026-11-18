@@ -8,9 +8,7 @@ x-common-environment: &common-environment
 
 x-control-plane-environment: &control-plane-environment
   <<: *common-environment
-  EVALFROG_POSTGRES_DSN: postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable
-  EVALFROG_SCHEDULING_REDIS_ADDRESS: redis-scheduling:6379
-  EVALFROG_CACHE_REDIS_ADDRESS: redis-cache:6379
+  EVALFROG_MYSQL_DSN: evalfrog:evalfrog@tcp(mysql:3306)/evalfrog_local
   EVALFROG_MIGRATIONS_DIR: /app/migrations
 
 x-app-build: &app-build
@@ -18,48 +16,25 @@ x-app-build: &app-build
   dockerfile: Dockerfile
 
 services:
-  postgres:
-    image: postgres:16.4-alpine
+  mysql:
+    image: mysql:8.4
+    command: ["--log-bin-trust-function-creators=1"]
     environment:
-      POSTGRES_USER: evalfrog
-      POSTGRES_PASSWORD: evalfrog
-      POSTGRES_DB: evalfrog
+      MYSQL_ROOT_PASSWORD: evalfrog-root
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_USER: evalfrog
+      MYSQL_PASSWORD: evalfrog
+      MYSQL_DATABASE: evalfrog_local
     ports:
-      - "15432:5432"
+      - "13306:3306"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U evalfrog -d evalfrog"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
       interval: 2s
       timeout: 2s
       retries: 30
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-
-  redis-scheduling:
-    image: redis:7.4.2-alpine
-    # Lane/Credit/Reservation are derived coordination state. Persisting them
-    # creates disk-fsync stalls without improving recovery: Control Plane
-    # deliberately fails closed and rebuilds them from PostgreSQL instead.
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
-    ports:
-      - "16379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
-    volumes:
-      - scheduling-redis-data:/data
-
-  redis-cache:
-    image: redis:7.4.2-alpine
-    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lfu"]
-    ports:
-      - "16380:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      - mysql-data:/var/lib/mysql
+    networks: [authority]
 
   kafka:
     image: apache/kafka:3.9.1
@@ -87,6 +62,7 @@ services:
       retries: 40
     volumes:
       - kafka-data:/var/lib/kafka/data
+    networks: [authority, worker]
 
   kafka-init:
     image: apache/kafka:3.9.1
@@ -105,6 +81,7 @@ services:
         create_topic evalfrog.local.workflow-task-sandbox-v1 1 7200000
         create_topic evalfrog.local.workflow-runtime-event-v1 1 14400000
         create_topic evalfrog.local.workflow-dead-letter-v1 1 86400000
+    networks: [authority]
 
   migrate:
     build:
@@ -113,9 +90,10 @@ services:
     command: ["--profile", "local", "--config-dir", "/app/configs", "--migrate"]
     environment: *control-plane-environment
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
     restart: "no"
+    networks: [authority]
 
   control-plane:
     build:
@@ -127,10 +105,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis-scheduling:
-        condition: service_healthy
-      redis-cache:
-        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
@@ -139,6 +113,13 @@ services:
       timeout: 2s
       retries: 30
     init: true
+    networks:
+      authority: {}
+      worker: {}
+      # The static Web image deliberately uses the deployment-level Control
+      # Plane name rather than Compose's implementation service name.
+      edge:
+        aliases: [evalfrog-control-plane]
 
   web:
     build:
@@ -149,6 +130,7 @@ services:
     depends_on:
       control-plane:
         condition: service_healthy
+    networks: [edge]
 
   worker-builtin:
     build:
@@ -166,6 +148,13 @@ services:
       timeout: 2s
       retries: 30
     init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # HTTP/RPC calls can leave only through this explicitly named local
+    # egress network. Production replaces it with an allow-list proxy that
+    # enforces the managed Connection destination policy.
+    networks: [worker, managed-egress]
 
   worker-sandbox:
     build:
@@ -183,6 +172,37 @@ services:
       timeout: 2s
       retries: 30
     init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [worker]
+
+  # Local-only implementation of the dedicated Sandbox Runtime Controller.
+  # It is the sole service with Docker socket access; no Worker has the socket.
+  # Production replaces it with a separately hardened runsc-capable controller.
+  sandbox-runtime:
+    build:
+      <<: *app-build
+      target: sandbox-runtime
+    environment:
+      <<: *common-environment
+      EVALFROG_SANDBOX_RUNTIME_TOKEN: local-sandbox-runtime-token-not-for-production
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/evalfrog", "--sandbox-runtime", "--healthcheck-url", "http://127.0.0.1:8083/health/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [worker]
+    init: true
 
   evalfrog-cli:
     profiles: ["tools"]
@@ -193,8 +213,19 @@ services:
     depends_on:
       control-plane:
         condition: service_healthy
+    networks: [worker]
 
 volumes:
-  postgres-data:
-  scheduling-redis-data:
+  mysql-data:
   kafka-data:
+
+networks:
+  # Workers can reach only Kafka and the Worker API. MySQL has no Worker
+  # network attachment, so credential loss alone
+  # cannot become an authority-store network path.
+  authority:
+    internal: true
+  worker:
+    internal: true
+  edge: {}
+  managed-egress: {}

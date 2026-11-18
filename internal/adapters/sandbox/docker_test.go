@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -75,6 +76,28 @@ func TestSweepRemovesOnlyManagedContainers(t *testing.T) {
 	if len(runner.commands) != 3 || !reflect.DeepEqual(runner.commands[0].arguments, []string{"ps", "-aq", "--filter", "label=" + managedLabel, "--filter", "status=exited"}) || !reflect.DeepEqual(runner.commands[1].arguments[:2], []string{"rm", "-f"}) {
 		t.Fatalf("commands = %#v", runner.commands)
 	}
+}
+
+func TestDockerCleanupTreatsAnAlreadyRemovedContainerAsSuccess(t *testing.T) {
+	runner := &cleanupRunner{}
+	orchestrator, _ := NewDockerOrchestrator("docker", domainsandbox.DefaultProfile("image", "runc"))
+	orchestrator.Runner = runner
+	if err := orchestrator.Cleanup(context.Background(), "attempt"); err != nil {
+		t.Fatalf("idempotent cleanup error=%v", err)
+	}
+	if len(runner.commands) != 2 || runner.commands[1].arguments[0] != "ps" {
+		t.Fatalf("commands=%+v", runner.commands)
+	}
+}
+
+type cleanupRunner struct{ commands []recordedCommand }
+
+func (runner *cleanupRunner) Run(_ context.Context, _ string, arguments []string, _ []byte, _ int64) ([]byte, []byte, error) {
+	runner.commands = append(runner.commands, recordedCommand{append([]string(nil), arguments...)})
+	if arguments[0] == "rm" {
+		return nil, nil, errors.New("container already removed")
+	}
+	return nil, nil, nil
 }
 
 func contains(values []string, target string) bool {

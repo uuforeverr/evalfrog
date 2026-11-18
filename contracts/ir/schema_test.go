@@ -163,6 +163,34 @@ func TestEmbeddedSchemaReturnsDefensiveCopy(t *testing.T) {
 	}
 }
 
+func TestIRV2SchemaAndCatalog(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	compiler.Draft = jsonschema.Draft2020
+	const uri = "https://evalfrog.dev/contracts/ir/v2/schema.json"
+	if err := compiler.AddResource(uri, bytes.NewReader(ircontract.SchemaV2())); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := compiler.Compile(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"ir_version":"2","nodes":[{"id":"start","type":"start","title":"Start","inputs":[],"outputs":[{"name":"amount","data_type":"integer"}]},{"id":"end","type":"end","title":"End","inputs":[{"name":"total","data_type":"integer","source":"ref","ref_node":"start","ref_output":"amount"}],"outputs":[{"name":"total","data_type":"integer"}]}],"edges":[{"id":"flow","source":"start","target":"end"}],"layout":{"start":{"x":0,"y":0},"end":{"x":200,"y":0}}}`)
+	if err := schema.Validate(decodeJSON(t, raw)); err != nil {
+		t.Fatal(err)
+	}
+	document, diagnostics := ir.DefaultParser().ParseDraft(raw)
+	if ir.HasErrors(diagnostics) {
+		t.Fatalf("parse: %+v", diagnostics)
+	}
+	if diagnostics := ir.NewStrictValidator(catalog.BuiltinV2()).Validate(document); ir.HasErrors(diagnostics) {
+		t.Fatalf("validate: %+v", diagnostics)
+	}
+	legacy := bytes.Replace(raw, []byte(`"ir_version":"2"`), []byte(`"ir_version":"1"`), 1)
+	if err := schema.Validate(decodeJSON(t, legacy)); err == nil {
+		t.Fatal("v2 schema accepted v1 IR")
+	}
+}
+
 func compileSchema(t *testing.T) *jsonschema.Schema {
 	t.Helper()
 	compiler := jsonschema.NewCompiler()

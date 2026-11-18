@@ -29,8 +29,12 @@ type m5Harness struct {
 }
 
 func newM5Harness(t *testing.T) *m5Harness {
+	return newM5HarnessWithTimeout(t, 60*time.Second)
+}
+
+func newM5HarnessWithTimeout(t *testing.T, timeout time.Duration) *m5Harness {
 	t.Helper()
-	base := newM3Harness(t)
+	base := newM3HarnessWithTimeout(t, timeout)
 	consumer, err := enginepkg.NewConsumer(base.store)
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +71,18 @@ func (harness *m5Harness) createCodeWorkflow(t *testing.T, publish bool) (defini
 	return workflow, snapshot
 }
 
+func (harness *m5Harness) createEntryRefCodeWorkflow(t *testing.T) (definition.Workflow, definition.ExecutionSnapshot) {
+	t.Helper()
+	workflow, _, diagnostics, err := harness.definitions.CreateWorkflow(harness.ctx, definition.CreateWorkflowCommand{
+		ProjectID: harness.projectID, PrincipalID: harness.principalID, Name: "M5 Entry Ref",
+		IRJSON: entryRefCodeIR(), IdempotencyKey: "m5-create-entry-ref-" + newID(t),
+	})
+	assertNoDefinitionFailure(t, diagnostics, err)
+	snapshot, diagnostics, err := harness.definitions.CompileDraftTestSnapshot(harness.ctx, harness.projectID, harness.principalID, workflow.ID, 1)
+	assertNoDefinitionFailure(t, diagnostics, err)
+	return workflow, snapshot
+}
+
 func (harness *m5Harness) createTestRun(t *testing.T, workflowID, snapshotID, key string) runtimepkg.WorkflowRunRecord {
 	t.Helper()
 	run, err := harness.creator.TestDraft(harness.ctx, runtimepkg.TestDraftRunCommand{
@@ -93,9 +109,9 @@ func (harness *m5Harness) event(t *testing.T, eventType eventing.RuntimeEventTyp
 	t.Helper()
 	var value eventing.RuntimeEvent
 	err := harness.client.Pool().QueryRow(harness.ctx, `
-		SELECT message_version, event_id::text, project_id::text, run_id::text,
-		       aggregate_type, aggregate_id::text, event_type, occurred_at, trace_id
-		FROM outbox_events WHERE project_id=$1 AND event_type=$2 AND aggregate_id=$3
+		SELECT message_version, BIN_TO_UUID(event_id), BIN_TO_UUID(project_id), BIN_TO_UUID(run_id),
+		       aggregate_type, BIN_TO_UUID(aggregate_id), event_type, occurred_at, trace_id
+		FROM outbox_events WHERE project_id=UUID_TO_BIN($1) AND event_type=$2 AND aggregate_id=UUID_TO_BIN($3)
 		ORDER BY created_at DESC, event_id DESC LIMIT 1`, harness.projectID, eventType, aggregateID).
 		Scan(&value.MessageVersion, &value.EventID, &value.ProjectID, &value.RunID,
 			&value.AggregateType, &value.AggregateID, &value.EventType, &value.OccurredAt, &value.TraceID)
@@ -169,24 +185,19 @@ func TestM5RunInitializationCrashRollsBackWholeGraphAndReplayCreatesOneGraph(t *
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m5-init-crash-01")
 	event := harness.event(t, eventing.RunCreated, run.ID)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		CREATE FUNCTION fail_second_node_insert() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN
-		  IF (SELECT count(*) FROM node_runs WHERE run_id=NEW.run_id) >= 1 THEN
-		    RAISE EXCEPTION 'injected second node insert failure';
-		  END IF;
-		  RETURN NEW;
-		END; $$`)
-	mustExec(t, harness.ctx, harness.client.Pool(), `
 		CREATE TRIGGER inject_node_insert_failure BEFORE INSERT ON node_runs
-		FOR EACH ROW EXECUTE FUNCTION fail_second_node_insert()`)
+		FOR EACH ROW BEGIN
+		  IF (SELECT count(*) FROM node_runs WHERE run_id=NEW.run_id) >= 1 THEN
+		    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected second node insert failure';
+		  END IF;
+		END`)
 	if err := harness.consumer.Consume(harness.ctx, event); err == nil {
 		t.Fatal("injected initialization failure unexpectedly committed")
 	}
 	assertCount(t, harness.m3Harness, "node_runs", 0)
 	assertCount(t, harness.m3Harness, "inbox_events", 0)
 	assertState(t, harness, run.ID, runtimepkg.RunPending)
-	mustExec(t, harness.ctx, harness.client.Pool(), `DROP TRIGGER inject_node_insert_failure ON node_runs`)
-	mustExec(t, harness.ctx, harness.client.Pool(), `DROP FUNCTION fail_second_node_insert()`)
+	mustExec(t, harness.ctx, harness.client.Pool(), `DROP TRIGGER inject_node_insert_failure`)
 	if err := harness.consumer.Consume(harness.ctx, event); err != nil {
 		t.Fatal(err)
 	}
@@ -247,14 +258,12 @@ func TestM5AttemptCompletionIsTwoAtomicTransactionsAndOnlyCurrentBecomesEffectiv
 		t.Fatal(err)
 	}
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		CREATE FUNCTION fail_completion_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN
-		  IF NEW.event_type='attempt.completed' THEN RAISE EXCEPTION 'injected outbox failure'; END IF;
-		  RETURN NEW;
-		END; $$`)
-	mustExec(t, harness.ctx, harness.client.Pool(), `
 		CREATE TRIGGER inject_completion_outbox_failure BEFORE INSERT ON outbox_events
-		FOR EACH ROW EXECUTE FUNCTION fail_completion_outbox()`)
+		FOR EACH ROW BEGIN
+		  IF NEW.event_type='attempt.completed' THEN
+		    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected outbox failure';
+		  END IF;
+		END`)
 	complete := attempt.CompleteCommand{
 		ProjectID: harness.projectID, RunID: run.ID, AttemptID: queued.ID, AttemptSequence: queued.Sequence,
 		LeaseToken: lease.Token, FencingToken: lease.FencingToken,
@@ -266,8 +275,7 @@ func TestM5AttemptCompletionIsTwoAtomicTransactionsAndOnlyCurrentBecomesEffectiv
 	}
 	assertAttemptState(t, harness, queued.ID, runtimepkg.AttemptRunning)
 	assertCount(t, harness.m3Harness, "node_output_values", 0)
-	mustExec(t, harness.ctx, harness.client.Pool(), `DROP TRIGGER inject_completion_outbox_failure ON outbox_events`)
-	mustExec(t, harness.ctx, harness.client.Pool(), `DROP FUNCTION fail_completion_outbox()`)
+	mustExec(t, harness.ctx, harness.client.Pool(), `DROP TRIGGER inject_completion_outbox_failure`)
 	applied, err := harness.coordinator.Complete(harness.ctx, complete)
 	if err != nil || !applied {
 		t.Fatalf("complete applied=%v err=%v", applied, err)
@@ -308,7 +316,7 @@ func TestM5DuplicateOutOfOrderAndLateEventsCannotReplaceCurrentAttempt(t *testin
 	if err != nil || lease.Token == "" {
 		t.Fatalf("claim=%+v err=%v", lease, err)
 	}
-	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE node_attempts SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE attempt_id=$1`, first.ID)
+	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE node_attempts SET lease_expires_at=CURRENT_TIMESTAMP(6)-INTERVAL 1 SECOND WHERE attempt_id=UUID_TO_BIN($1)`, first.ID)
 	if applied, markErr := harness.coordinator.MarkExpiredLost(harness.ctx, attempt.MarkLostCommand{
 		ProjectID: harness.projectID, RunID: run.ID, AttemptID: first.ID,
 		AttemptSequence: first.Sequence, TraceID: "trace-lost",
@@ -346,7 +354,7 @@ func TestM5DuplicateOutOfOrderAndLateEventsCannotReplaceCurrentAttempt(t *testin
 		t.Fatal("completion signal before authoritative Attempt Result unexpectedly advanced")
 	}
 	var earlyInbox int
-	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM inbox_events WHERE event_id=$1`, early.EventID).Scan(&earlyInbox); err != nil || earlyInbox != 0 {
+	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM inbox_events WHERE event_id=UUID_TO_BIN($1)`, early.EventID).Scan(&earlyInbox); err != nil || earlyInbox != 0 {
 		t.Fatalf("failed early event left inbox fact count=%d err=%v", earlyInbox, err)
 	}
 }
@@ -405,6 +413,37 @@ func TestM5ConcurrentWorkersClaimExactlyOneLeaseAndStaleFencingIsRejected(t *tes
 	assertAttemptState(t, harness, queued.ID, runtimepkg.AttemptRunning)
 }
 
+func TestM5CurrentAttemptForeignKeyRejectsCrossNodePointer(t *testing.T) {
+	harness := newM5Harness(t)
+	workflow, snapshot := harness.createCodeWorkflow(t, false)
+	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m5-cross-node-attempt-fk")
+	if err := harness.consumer.Consume(harness.ctx, harness.event(t, eventing.RunCreated, run.ID)); err != nil {
+		t.Fatal(err)
+	}
+	var queuedAttemptID string
+	if err := harness.client.Pool().QueryRow(harness.ctx, `
+		SELECT BIN_TO_UUID(attempt_id) FROM node_attempts
+		WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND state='queued'`,
+		harness.projectID, run.ID).Scan(&queuedAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	probeNodeRunID := newID(t)
+	mustExec(t, harness.ctx, harness.client.Pool(), `
+		INSERT INTO node_runs (
+			node_run_id, project_id, run_id, execution_node_id, kind, state, state_version,
+			operation_type, operation_version, resource_class, activated, ready_at
+		) VALUES (UUID_TO_BIN($1),UUID_TO_BIN($2),UUID_TO_BIN($3),'cross-node-probe','task','ready',1,
+		          'task.python',1,'sandbox',TRUE,CURRENT_TIMESTAMP(6))`,
+		probeNodeRunID, harness.projectID, run.ID)
+	_, err := harness.client.Pool().Exec(harness.ctx, `
+		UPDATE node_runs SET current_attempt_id=UUID_TO_BIN($1)
+		WHERE project_id=UUID_TO_BIN($2) AND run_id=UUID_TO_BIN($3) AND node_run_id=UUID_TO_BIN($4)`,
+		queuedAttemptID, harness.projectID, run.ID, probeNodeRunID)
+	if err == nil || !strings.Contains(err.Error(), "node_runs_current_attempt_fk") {
+		t.Fatalf("cross-node current Attempt pointer was not rejected by the strengthened FK: %v", err)
+	}
+}
+
 func TestM5UnsupportedOperationFailsPendingRunBeforeNodeInitialization(t *testing.T) {
 	harness := newM5Harness(t)
 	workflow, snapshot := harness.createCodeWorkflow(t, false)
@@ -424,12 +463,13 @@ func TestM5UnsupportedOperationFailsPendingRunBeforeNodeInitialization(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustExec(t, harness.ctx, harness.client.Pool(), `DROP TRIGGER workflow_execution_snapshots_immutable`)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		ALTER TABLE workflow_execution_snapshots DISABLE TRIGGER workflow_execution_snapshots_immutable`)
+		UPDATE workflow_execution_snapshots SET dsl_json=$1 WHERE snapshot_id=UUID_TO_BIN($2)`, mutatedDSL, snapshot.ID)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		UPDATE workflow_execution_snapshots SET dsl_json=$1 WHERE snapshot_id=$2`, mutatedDSL, snapshot.ID)
-	mustExec(t, harness.ctx, harness.client.Pool(), `
-		ALTER TABLE workflow_execution_snapshots ENABLE TRIGGER workflow_execution_snapshots_immutable`)
+		CREATE TRIGGER workflow_execution_snapshots_immutable
+		BEFORE UPDATE ON workflow_execution_snapshots FOR EACH ROW
+		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'workflow_execution_snapshots is immutable'`)
 	run := harness.createTestRun(t, workflow.ID, snapshot.ID, "m5-unsupported-operation")
 	event := harness.event(t, eventing.RunCreated, run.ID)
 	if err = harness.consumer.Consume(harness.ctx, event); err != nil {
@@ -438,7 +478,7 @@ func TestM5UnsupportedOperationFailsPendingRunBeforeNodeInitialization(t *testin
 	assertState(t, harness, run.ID, runtimepkg.RunFailed)
 	assertCount(t, harness.m3Harness, "node_runs", 0)
 	var code string
-	err = harness.client.Pool().QueryRow(harness.ctx, `SELECT termination_intent_json->'cause'->>'code' FROM workflow_runs WHERE run_id=$1`, run.ID).Scan(&code)
+	err = harness.client.Pool().QueryRow(harness.ctx, `SELECT JSON_UNQUOTE(JSON_EXTRACT(termination_intent_json,'$.cause.code')) FROM workflow_runs WHERE run_id=UUID_TO_BIN($1)`, run.ID).Scan(&code)
 	if err != nil || code != "RUNTIME_OPERATION_UNSUPPORTED" {
 		t.Fatalf("initialization failure code=%q err=%v", code, err)
 	}
@@ -497,7 +537,7 @@ func TestM5OutboxRelayRecoversBeforeAndAfterPublishCrash(t *testing.T) {
 	if len(publisher.events) != 1 {
 		t.Fatalf("published events=%d want=1", len(publisher.events))
 	}
-	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE outbox_events SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE event_id=$1`, publisher.events[0].EventID)
+	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE outbox_events SET claim_expires_at=CURRENT_TIMESTAMP(6)-INTERVAL 1 SECOND WHERE event_id=UUID_TO_BIN($1)`, publisher.events[0].EventID)
 	relay, _ = eventing.NewRelay(harness.store, publisher, "relay-recovery", 1, time.Minute, 0)
 	if count, relayErr := relay.RelayOnce(harness.ctx); relayErr != nil || count != 1 {
 		t.Fatalf("recovery count=%d err=%v", count, relayErr)
@@ -518,10 +558,10 @@ func TestM5OutboxRelayRecoversBeforeAndAfterPublishCrash(t *testing.T) {
 func TestM5RuntimeIndexesServeFrozenAccessPaths(t *testing.T) {
 	harness := newM5Harness(t)
 	queries := map[string]string{
-		"node_runs_ready_idx":     `SELECT node_run_id FROM node_runs WHERE project_id='00000000-0000-0000-0000-000000000001' AND state='ready' ORDER BY priority DESC, ready_at, node_run_id LIMIT 100`,
-		"node_runs_retry_idx":     `SELECT node_run_id FROM node_runs WHERE state='retry_wait' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, node_run_id LIMIT 100`,
-		"node_attempts_lease_idx": `SELECT attempt_id FROM node_attempts WHERE state='running' AND lease_expires_at <= clock_timestamp() ORDER BY lease_expires_at, attempt_id LIMIT 100`,
-		"outbox_events_relay_idx": `SELECT event_id FROM outbox_events WHERE published_at IS NULL AND available_at <= clock_timestamp() ORDER BY available_at, event_id LIMIT 100`,
+		"node_runs_retry_idx":        `SELECT node_run_id FROM node_runs FORCE INDEX (node_runs_retry_idx) WHERE state='retry_wait' AND next_retry_at <= CURRENT_TIMESTAMP(6) ORDER BY next_retry_at, node_run_id LIMIT 100`,
+		"node_attempts_lease_idx":    `SELECT attempt_id FROM node_attempts FORCE INDEX (node_attempts_lease_idx) WHERE state='running' AND lease_expires_at <= CURRENT_TIMESTAMP(6) ORDER BY lease_expires_at, attempt_id LIMIT 100`,
+		"outbox_events_relay_idx":    `SELECT event_id FROM outbox_events FORCE INDEX (outbox_events_relay_idx) WHERE published_at IS NULL AND available_at <= CURRENT_TIMESTAMP(6) ORDER BY occurred_at ASC, event_id ASC LIMIT 100`,
+		"node_task_outbox_relay_idx": `SELECT task_id FROM node_task_outbox FORCE INDEX (node_task_outbox_relay_idx) WHERE published_at IS NULL AND available_at <= CURRENT_TIMESTAMP(6) ORDER BY occurred_at ASC, task_id ASC LIMIT 100`,
 	}
 	for index, query := range queries {
 		t.Run(index, func(t *testing.T) {
@@ -530,8 +570,7 @@ func TestM5RuntimeIndexesServeFrozenAccessPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback(harness.ctx)
-			mustExec(t, harness.ctx, tx, `SET LOCAL enable_seqscan=off`)
-			rows, err := tx.Query(harness.ctx, "EXPLAIN (COSTS OFF) "+query)
+			rows, err := tx.Query(harness.ctx, "EXPLAIN FORMAT=JSON "+query)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -545,7 +584,7 @@ func TestM5RuntimeIndexesServeFrozenAccessPaths(t *testing.T) {
 			}
 			rows.Close()
 			joined := strings.Join(plan, "\n")
-			if !strings.Contains(joined, index) || strings.Contains(joined, "Seq Scan") {
+			if !strings.Contains(joined, index) {
 				t.Fatalf("query did not use %s:\n%s", index, joined)
 			}
 		})
@@ -555,7 +594,7 @@ func TestM5RuntimeIndexesServeFrozenAccessPaths(t *testing.T) {
 func assertState(t *testing.T, harness *m5Harness, runID string, want runtimepkg.RunState) {
 	t.Helper()
 	var got runtimepkg.RunState
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM workflow_runs WHERE project_id=$1 AND run_id=$2`, harness.projectID, runID).Scan(&got); err != nil || got != want {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM workflow_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2)`, harness.projectID, runID).Scan(&got); err != nil || got != want {
 		t.Fatalf("run state=%s want=%s err=%v", got, want, err)
 	}
 }
@@ -563,7 +602,7 @@ func assertState(t *testing.T, harness *m5Harness, runID string, want runtimepkg
 func assertAttemptState(t *testing.T, harness *m5Harness, attemptID string, want runtimepkg.AttemptState) {
 	t.Helper()
 	var got runtimepkg.AttemptState
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_attempts WHERE project_id=$1 AND attempt_id=$2`, harness.projectID, attemptID).Scan(&got); err != nil || got != want {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_attempts WHERE project_id=UUID_TO_BIN($1) AND attempt_id=UUID_TO_BIN($2)`, harness.projectID, attemptID).Scan(&got); err != nil || got != want {
 		t.Fatalf("attempt state=%s want=%s err=%v", got, want, err)
 	}
 }
@@ -571,7 +610,7 @@ func assertAttemptState(t *testing.T, harness *m5Harness, attemptID string, want
 func assertNodeState(t *testing.T, harness *m5Harness, runID, nodeID string, want runtimepkg.NodeState) {
 	t.Helper()
 	var got runtimepkg.NodeState
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&got); err != nil || got != want {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&got); err != nil || got != want {
 		t.Fatalf("node state=%s want=%s err=%v", got, want, err)
 	}
 }
@@ -580,7 +619,7 @@ func assertNodeEffective(t *testing.T, harness *m5Harness, runID, nodeID string,
 	t.Helper()
 	var state runtimepkg.NodeState
 	var effective *string
-	err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state, effective_attempt_id::text FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state, &effective)
+	err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state, BIN_TO_UUID(effective_attempt_id) FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state, &effective)
 	got := ""
 	if effective != nil {
 		got = *effective
@@ -594,7 +633,7 @@ func assertNodeCurrent(t *testing.T, harness *m5Harness, runID, nodeID string, w
 	t.Helper()
 	var state runtimepkg.NodeState
 	var current string
-	err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state, current_attempt_id::text FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state, &current)
+	err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state, BIN_TO_UUID(current_attempt_id) FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state, &current)
 	if err != nil || state != wantState || current != wantAttempt {
 		t.Fatalf("node state=%s/%s current=%s/%s err=%v", state, wantState, current, wantAttempt, err)
 	}
@@ -603,15 +642,18 @@ func assertNodeCurrent(t *testing.T, harness *m5Harness, runID, nodeID string, w
 func readyNodeID(t *testing.T, harness *m5Harness, runID string) string {
 	t.Helper()
 	var id string
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT execution_node_id FROM node_runs WHERE project_id=$1 AND run_id=$2 AND state='ready'`, harness.projectID, runID).Scan(&id); err != nil {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `
+		SELECT execution_node_id FROM node_runs
+		WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND kind='task' AND state IN ('ready','queued')
+		ORDER BY execution_node_id LIMIT 1`, harness.projectID, runID).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	return id
 }
 
-// dispatchFixture constructs the queued Attempt that M6 Scheduler will own.
-// M5 intentionally has no production ready->queued method because M6 must add
-// NodeTask Outbox to that exact transaction.
+// dispatchFixture returns the Attempt queued atomically by Engine. The fallback
+// keeps older state-transition fixtures usable when they deliberately construct
+// a Ready Node without passing through the production initialization path.
 func dispatchFixture(t *testing.T, harness *m5Harness, runID, nodeID string) runtimepkg.NodeAttemptRecord {
 	t.Helper()
 	tx, err := harness.client.Pool().Begin(harness.ctx)
@@ -624,12 +666,28 @@ func dispatchFixture(t *testing.T, harness *m5Harness, runID, nodeID string) run
 	var stateVersion uint64
 	var sequence, business, recovery uint32
 	var kind runtimepkg.RetryKind
+	var currentAttemptID *string
 	err = tx.QueryRow(harness.ctx, `
-		SELECT node_run_id::text, state, state_version, next_attempt_seq,
-		       next_attempt_kind, business_attempt_count, recovery_count
-		FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3
+		SELECT BIN_TO_UUID(node_run_id), state, state_version, next_attempt_seq,
+		       next_attempt_kind, business_attempt_count, recovery_count,
+		       BIN_TO_UUID(current_attempt_id)
+		FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3
 		FOR UPDATE`, harness.projectID, runID, nodeID).
-		Scan(&nodeRunID, &state, &stateVersion, &sequence, &kind, &business, &recovery)
+		Scan(&nodeRunID, &state, &stateVersion, &sequence, &kind, &business, &recovery, &currentAttemptID)
+	if err == nil && state == runtimepkg.NodeQueued && currentAttemptID != nil {
+		var queued runtimepkg.NodeAttemptRecord
+		err = tx.QueryRow(harness.ctx, `
+			SELECT BIN_TO_UUID(attempt_id), attempt_seq, attempt_kind, state, state_version
+			FROM node_attempts
+			WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND attempt_id=UUID_TO_BIN($3)`,
+			harness.projectID, runID, *currentAttemptID).
+			Scan(&queued.ID, &queued.Sequence, &queued.Kind, &queued.State, &queued.StateVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued.NodeRunID = runID + ":" + nodeID
+		return queued
+	}
 	if err != nil || state != runtimepkg.NodeReady {
 		t.Fatalf("dispatch fixture state=%s err=%v", state, err)
 	}
@@ -648,10 +706,10 @@ func dispatchFixture(t *testing.T, harness *m5Harness, runID, nodeID string) run
 		attemptID, harness.projectID, runID, nodeRunID, sequence, kind, business-1, recovery)
 	tag, err := tx.Exec(harness.ctx, `
 		UPDATE node_runs SET state='queued', state_version=state_version+1,
-		       current_attempt_id=$1, next_attempt_seq=$2,
+		       current_attempt_id=UUID_TO_BIN($1), next_attempt_seq=$2,
 		       business_attempt_count=$3, recovery_count=$4,
-		       ready_at=NULL, next_retry_at=NULL, updated_at=clock_timestamp()
-		WHERE project_id=$5 AND run_id=$6 AND execution_node_id=$7
+		       ready_at=NULL, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP(6)
+		WHERE project_id=UUID_TO_BIN($5) AND run_id=UUID_TO_BIN($6) AND execution_node_id=$7
 		  AND state='ready' AND state_version=$8`, attemptID, sequence, business, recovery,
 		harness.projectID, runID, nodeID, stateVersion)
 	if err != nil || tag.RowsAffected() != 1 {
@@ -672,6 +730,22 @@ func singleCodeIR() []byte {
 		"nodes":[
 			{"id":"start","type":"start","title":"Start","inputs":[],"outputs":[{"name":"workflow_input","data_type":"object"}]},
 			{"id":"transform","type":"code","title":"Transform","inputs":[{"name":"source_code","data_type":"string","source":"literal","value":"def main(inputs):\n    return {'result': {'ok': True}}"}],"outputs":[{"name":"result","data_type":"object"}]},
+			{"id":"end","type":"end","title":"End","inputs":[{"name":"workflow_output","data_type":"object","source":"ref","ref_node":"transform","ref_output":"result"}],"outputs":[]}
+		],
+		"edges":[{"id":"start_to_transform","source":"start","target":"transform"},{"id":"transform_to_end","source":"transform","target":"end"}],
+		"layout":{"start":{"x":0,"y":0},"transform":{"x":100,"y":0},"end":{"x":200,"y":0}}
+	}`)
+}
+
+func entryRefCodeIR() []byte {
+	return []byte(`{
+		"ir_version":"1",
+		"nodes":[
+			{"id":"start","type":"start","title":"Start","inputs":[],"outputs":[{"name":"workflow_input","data_type":"object"}]},
+			{"id":"transform","type":"code","title":"Transform","inputs":[
+				{"name":"source_code","data_type":"string","source":"literal","value":"def main(inputs):\n    return {'result': {'ok': True}}"},
+				{"name":"request","data_type":"object","source":"ref","ref_node":"start","ref_output":"workflow_input"}
+			],"outputs":[{"name":"result","data_type":"object"}]},
 			{"id":"end","type":"end","title":"End","inputs":[{"name":"workflow_output","data_type":"object","source":"ref","ref_node":"transform","ref_output":"result"}],"outputs":[]}
 		],
 		"edges":[{"id":"start_to_transform","source":"start","target":"transform"},{"id":"transform_to_end","source":"transform","target":"end"}],

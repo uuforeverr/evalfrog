@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,33 @@ func TestVersion(t *testing.T) {
 	code := (App{Output: &output, Error: &output}).Run(context.Background(), []string{"version"})
 	if code != 0 || !strings.Contains(output.String(), "version") {
 		t.Fatalf("code=%d output=%q", code, output.String())
+	}
+}
+
+func TestCommonFlagsDefaultToEvalFrogEnvironmentAndAllowExplicitOverride(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"EF_SERVER":  "http://from-environment",
+		"EF_PROJECT": "environment-project",
+		"EF_TOKEN":   "environment-token",
+	}
+	app := App{Env: func(name string) string { return values[name] }}
+	flags := flag.NewFlagSet("environment", flag.ContinueOnError)
+	common := app.common(flags, true)
+	if err := flags.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if common.server != values["EF_SERVER"] || common.project != values["EF_PROJECT"] || common.token != values["EF_TOKEN"] {
+		t.Fatalf("environment defaults=%+v", common)
+	}
+
+	flags = flag.NewFlagSet("override", flag.ContinueOnError)
+	common = app.common(flags, true)
+	if err := flags.Parse([]string{"--server", "http://explicit", "--project", "explicit-project", "--token", "explicit-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if common.server != "http://explicit" || common.project != "explicit-project" || common.token != "explicit-token" {
+		t.Fatalf("explicit flags did not override environment: %+v", common)
 	}
 }
 

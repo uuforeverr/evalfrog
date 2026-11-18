@@ -13,7 +13,7 @@ import (
 )
 
 // Wakeup describes a re-checkable Runtime condition. It deliberately carries
-// no result or state transition: the Engine reloads PostgreSQL authority after
+// no result or state transition: the Engine reloads MySQL authority after
 // consuming the event.
 type Wakeup struct {
 	ProjectID, RunID, AggregateID string
@@ -89,7 +89,7 @@ func (replayer ManualReplayer) Replay(ctx context.Context, wakeup Wakeup, traceI
 }
 
 // WakeupEmission is persisted atomically with Runtime Outbox and Audit.
-// Cooldown is enforced by the repository with PostgreSQL time, not timer
+// Cooldown is enforced by the repository with MySQL time, not timer
 // process memory, so replicas may safely race.
 type WakeupEmission struct {
 	Wakeup

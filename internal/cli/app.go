@@ -22,6 +22,7 @@ type App struct {
 	Error  io.Writer
 	HTTP   *http.Client
 	Home   string
+	Env    func(string) string
 }
 
 func (app App) Run(ctx context.Context, arguments []string) int {
@@ -65,12 +66,19 @@ type commonFlags struct {
 
 func (app App) common(flags *flag.FlagSet, requiredProject bool) *commonFlags {
 	value := &commonFlags{}
-	flags.StringVar(&value.server, "server", "", "EvalFrog Control Plane base URL")
-	flags.StringVar(&value.token, "token", "", "bearer API token")
+	flags.StringVar(&value.server, "server", app.environment("EF_SERVER"), "EvalFrog Control Plane base URL")
+	flags.StringVar(&value.token, "token", app.environment("EF_TOKEN"), "bearer API token")
 	if requiredProject {
-		flags.StringVar(&value.project, "project", "", "project UUID")
+		flags.StringVar(&value.project, "project", app.environment("EF_PROJECT"), "project UUID")
 	}
 	return value
+}
+
+func (app App) environment(name string) string {
+	if app.Env != nil {
+		return app.Env(name)
+	}
+	return os.Getenv(name)
 }
 
 func (app App) api(value *commonFlags) (*apiClient, bool) {
@@ -98,10 +106,12 @@ func (app App) workspaceRoot() string {
 
 func (app App) workflow(ctx context.Context, arguments []string) int {
 	if len(arguments) == 0 {
-		fmt.Fprintln(app.Error, "usage: evalfrog workflow <create|pull|copy> ...")
+		fmt.Fprintln(app.Error, "usage: evalfrog workflow <create|pull|copy|builder> ...")
 		return 2
 	}
 	switch arguments[0] {
+	case "builder":
+		return app.builder(ctx, arguments[1:])
 	case "create":
 		flags := flag.NewFlagSet("workflow create", flag.ContinueOnError)
 		flags.SetOutput(app.Error)
@@ -128,13 +138,8 @@ func (app App) workflow(ctx context.Context, arguments []string) int {
 			return code
 		}
 		var response struct {
-			Workflow struct {
-				ID string `json:"workflow_id"`
-			} `json:"workflow"`
-			Draft struct {
-				Revision int64           `json:"revision_number"`
-				IR       json.RawMessage `json:"ir"`
-			} `json:"draft_revision"`
+			Workflow apiWorkflowResponse      `json:"workflow"`
+			Draft    apiDraftRevisionResponse `json:"draft_revision"`
 		}
 		err = client.request(ctx, http.MethodPost, "/v1/projects/"+common.project+"/workflows", *key, map[string]any{"name": *name, "ir": json.RawMessage(raw)}, &response)
 		if app.reportAPIError(err) {
@@ -161,12 +166,7 @@ func (app App) workflow(ctx context.Context, arguments []string) int {
 			}
 			return 2
 		}
-		var response struct {
-			Current struct {
-				Revision int64           `json:"revision_number"`
-				IR       json.RawMessage `json:"ir"`
-			} `json:"current"`
-		}
+		var response apiDraftResponse
 		err := client.request(ctx, http.MethodGet, "/v1/projects/"+common.project+"/workflows/"+*workflowID+"/draft", "", nil, &response)
 		if app.reportAPIError(err) {
 			return 1
@@ -196,13 +196,8 @@ func (app App) workflow(ctx context.Context, arguments []string) int {
 			return 2
 		}
 		var response struct {
-			Workflow struct {
-				ID string `json:"workflow_id"`
-			} `json:"workflow"`
-			Draft struct {
-				Revision int64           `json:"revision_number"`
-				IR       json.RawMessage `json:"ir"`
-			} `json:"draft_revision"`
+			Workflow apiWorkflowResponse      `json:"workflow"`
+			Draft    apiDraftRevisionResponse `json:"draft_revision"`
 		}
 		err := client.request(ctx, http.MethodPost, "/v1/projects/"+common.project+"/workflows:copy", *key, map[string]any{"source_workflow_id": *source, "source_version_number": *version, "name": *name}, &response)
 		if app.reportAPIError(err) {
@@ -215,7 +210,7 @@ func (app App) workflow(ctx context.Context, arguments []string) int {
 		fmt.Fprintf(app.Output, "workflow copied: %s revision=%d\n", response.Workflow.ID, response.Draft.Revision)
 		return 0
 	default:
-		fmt.Fprintln(app.Error, "usage: evalfrog workflow <create|pull|copy> ...")
+		fmt.Fprintln(app.Error, "usage: evalfrog workflow <create|pull|copy|builder> ...")
 		return 2
 	}
 }
@@ -256,10 +251,7 @@ func (app App) draft(ctx context.Context, arguments []string) int {
 		if code := app.localValidate(raw); code != 0 {
 			return code
 		}
-		var response struct {
-			Revision int64           `json:"revision_number"`
-			IR       json.RawMessage `json:"ir"`
-		}
+		var response apiDraftRevisionResponse
 		err = client.request(ctx, http.MethodPut, "/v1/projects/"+common.project+"/workflows/"+*workflowID+"/draft", *key, map[string]any{"expected_revision": workspace.Revision, "ir": json.RawMessage(raw)}, &response)
 		if app.reportAPIError(err) {
 			return 1
@@ -333,9 +325,7 @@ func (app App) publish(ctx context.Context, arguments []string) int {
 		return 1
 	}
 	var response struct {
-		Version struct {
-			Number int64 `json:"version_number"`
-		} `json:"version"`
+		Version apiPublishedVersionResponse `json:"version"`
 	}
 	err = client.request(ctx, http.MethodPost, "/v1/projects/"+common.project+"/workflows/"+*workflowID+"/publish", *key, map[string]any{"expected_revision": workspace.Revision, "change_log": *changeLog}, &response)
 	if app.reportAPIError(err) {
@@ -622,4 +612,5 @@ func (app App) doctor(ctx context.Context, arguments []string) int {
 
 func (app App) usage() {
 	fmt.Fprintln(app.Error, "usage: evalfrog <workflow|draft|publish|run|node-type|connection|version|config validate|doctor>")
+	fmt.Fprintln(app.Error, "workflow supports create|pull|copy|builder")
 }

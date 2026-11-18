@@ -10,17 +10,14 @@ import (
 	"syscall"
 
 	"github.com/uu999/evalfrog/internal/access"
-	"github.com/uu999/evalfrog/internal/adapters/cacheredis"
 	"github.com/uu999/evalfrog/internal/adapters/httpapi"
 	"github.com/uu999/evalfrog/internal/adapters/kafka"
-	"github.com/uu999/evalfrog/internal/adapters/postgres"
-	"github.com/uu999/evalfrog/internal/adapters/schedulingredis"
+	"github.com/uu999/evalfrog/internal/adapters/mysql"
 	"github.com/uu999/evalfrog/internal/adapters/workerapi"
 	"github.com/uu999/evalfrog/internal/catalog"
 	"github.com/uu999/evalfrog/internal/definition"
 	"github.com/uu999/evalfrog/internal/eventing"
 	"github.com/uu999/evalfrog/internal/platform/bootstrap"
-	"github.com/uu999/evalfrog/internal/platform/clock"
 	"github.com/uu999/evalfrog/internal/platform/config"
 	"github.com/uu999/evalfrog/internal/platform/health"
 	"github.com/uu999/evalfrog/internal/platform/httpserver"
@@ -36,7 +33,6 @@ import (
 	"github.com/uu999/evalfrog/internal/runtime/attempt"
 	runtimecontext "github.com/uu999/evalfrog/internal/runtime/context"
 	"github.com/uu999/evalfrog/internal/runtime/engine"
-	"github.com/uu999/evalfrog/internal/scheduling"
 	"github.com/uu999/evalfrog/internal/workflowapp"
 )
 
@@ -74,29 +70,27 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		fmt.Fprintln(errorOutput, err)
 		return 1
 	}
-	postgresClient, err := postgres.Open(ctx, configuration.Postgres)
+	metricRegistry := metrics.New(serviceName)
+	mysqlClient, err := mysql.OpenWithAcquireObserver(ctx, configuration.MySQL, metricRegistry)
 	if err != nil {
-		logger.Error("PostgreSQL client creation failed", "error", err)
+		logger.Error("MySQL client creation failed", "error", err)
 		return 1
 	}
-	defer postgresClient.Close()
+	defer mysqlClient.Close()
+	metricRegistry.RegisterMySQLPoolStats(mysqlClient.Pool().Stats)
 	if options.Migrate {
 		runner := migrations.Runner{
-			Pool: postgresClient.Pool(), Schema: configuration.Postgres.Schema,
+			Database: mysqlClient.Pool().Raw(), DatabaseName: configuration.MySQL.Database,
 			Directory: configuration.Migrations.Directory, LockTimeout: configuration.Migrations.LockTimeout.Duration(),
 		}
 		if err := runner.Up(ctx); err != nil {
 			logger.Error("migration failed", "error", err)
 			return 1
 		}
-		logger.Info("migrations applied", "schema", configuration.Postgres.Schema)
+		logger.Info("migrations applied", "database", configuration.MySQL.Database)
 		return 0
 	}
 
-	schedulingClient := schedulingredis.Open(configuration.Redis.Scheduling)
-	defer closeWithLog(logger, "scheduling Redis", schedulingClient.Close)
-	cacheClient := cacheredis.Open(configuration.Redis.Cache)
-	defer closeWithLog(logger, "cache Redis", cacheClient.Close)
 	kafkaClient, err := kafka.Open(configuration.Kafka, serviceName)
 	if err != nil {
 		logger.Error("Kafka client creation failed", "error", err)
@@ -104,26 +98,30 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 	}
 	defer kafkaClient.Close()
 
-	readiness := health.New(configuration.Redis.Cache.OperationTimeout.Duration())
-	mustRegister(logger, readiness, "postgres", postgresClient.Check)
-	mustRegister(logger, readiness, "redis-cache", cacheClient.Check)
-	mustRegister(logger, readiness, "redis-scheduling", schedulingClient.Check)
+	readiness := health.New(configuration.MySQL.LockTimeout.Duration())
+	mustRegister(logger, readiness, "mysql", mysqlClient.Check)
 	mustRegister(logger, readiness, "kafka", kafkaClient.Check)
-	metricRegistry := metrics.New(serviceName)
 	server := httpserver.New(
 		serviceName, configuration.HTTP.ControlPlaneAddress,
 		configuration.HTTP.ReadHeaderTimeout.Duration(), configuration.HTTP.IdleTimeout.Duration(),
 		logger, readiness, metricRegistry,
 	)
-	store := postgres.NewStore(postgresClient.Pool())
-	store.SetRunViewInvalidator(cacheClient)
+	store := mysql.NewStore(mysqlClient.Pool())
+	notifier := projection.NewLocalNotifier()
+	store.SetRunUpdateNotifier(notifier)
+	snapshotCache, err := runtimecontext.NewSnapshotCache(
+		configuration.SnapshotL1.MaxEntries, configuration.SnapshotL1.MaxBytes, metricRegistry,
+	)
+	if err != nil {
+		logger.Error("snapshot L1 construction failed", "error", err)
+		return 1
+	}
 	accessService := access.NewService(store)
 	resourceResolver := resources.NewResolver(store, accessService)
 	definitionService := definition.NewBuiltinService(store, accessService, resourceResolver)
 	runCreator := runtime.NewBuiltinRunCreator(store, accessService)
 	runControl := runtime.NewBuiltinRunControl(store, accessService)
-	runReader := projection.NewCachedService(projection.NewBuiltinService(store, accessService), cacheClient,
-		configuration.Cache.ActiveRunReadModelTTL.Duration(), configuration.Cache.TerminalRunReadModelTTL.Duration())
+	runReader := projection.NewBuiltinService(store, accessService)
 	connectionDirectory := resources.NewBuiltinConnectionDirectory(store, accessService)
 	recoveryEmitter := recovery.NewBuiltinEmitter(store)
 	manualReplayer, err := recovery.NewManualReplayer(store, recoveryEmitter, accessService)
@@ -131,44 +129,27 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("manual recovery replay construction failed", "error", err)
 		return 1
 	}
-	application, err := workflowapp.New(definitionService, runCreator, runControl, runReader, catalog.BuiltinV1(), connectionDirectory, manualReplayer)
+	application, err := workflowapp.New(definitionService, runCreator, runControl, runReader, catalog.BuiltinDirectory(), connectionDirectory, manualReplayer)
 	if err != nil {
 		logger.Error("workflow application construction failed", "error", err)
 		return 1
 	}
-	server.Handle("/v1/", httpapi.New(accessService, application, cacheClient))
+	server.Handle("/v1/", httpapi.New(accessService, application, notifier).
+		WithRunUpdatePollInterval(configuration.HTTP.RunUpdatePollInterval.Duration()))
 	attemptCoordinator := attempt.NewBuiltinCoordinator(store)
-	contextGateway, err := runtimecontext.NewGateway(store, cacheClient,
-		configuration.Cache.ExecutionSnapshotTTL.Duration(), configuration.Cache.ActiveRunContextTTL.Duration())
+	contextGateway, err := runtimecontext.NewGateway(store, snapshotCache)
 	if err != nil {
 		logger.Error("execution context gateway construction failed", "error", err)
 		return 1
 	}
-	runtimeResources := postgres.NewRuntimeResourceResolver(store, resources.NoopSecretResolver{})
-	server.Handle("/internal/v1/", workerapi.NewHandler(attemptCoordinator, contextGateway, schedulingClient, runtimeResources))
-	schedulerID, err := (identity.UUIDv7Generator{}).New()
+	runtimeResources := mysql.NewRuntimeResourceResolver(store, resources.NoopSecretResolver{})
+	server.Handle("/internal/v1/", workerapi.NewHandler(attemptCoordinator, contextGateway, runtimeResources))
+	instanceID, err := (identity.UUIDv7Generator{}).New()
 	if err != nil {
-		logger.Error("scheduler identity generation failed", "error", err)
+		logger.Error("control-plane identity generation failed", "error", err)
 		return 1
 	}
-	projectScheduler, err := scheduling.New(store, schedulingClient,
-		schedulingClient, identity.UUIDv7Generator{}, clock.System{}, schedulerID, scheduling.Settings{
-			LaneCount: configuration.Scheduler.LaneCount, CreditGrantBatch: configuration.Scheduler.CreditGrantBatch,
-			CandidateBatch: configuration.Scheduler.RedisCandidateBatch, AdmissionConcurrency: configuration.Scheduler.AdmissionConcurrency,
-			Epoch: configuration.Scheduler.Epoch.Duration(), ActiveProjectTTL: configuration.Scheduler.ActiveProjectTTL.Duration(),
-			BalancerLease: configuration.Scheduler.ActiveProjectTTL.Duration(), ReservationTTL: configuration.Scheduler.InflightReservationTTL.Duration(),
-			DispatchBufferFactor: configuration.Scheduler.DispatchBufferFactor, CapacityChangeLimit: configuration.Scheduler.EpochCapacityChangeLimit,
-		}, metricRegistry)
-	if err != nil {
-		logger.Error("scheduler construction failed", "error", err)
-		return 1
-	}
-	schedulerService, err := scheduling.NewService(projectScheduler, "scheduler-"+schedulerID, logger)
-	if err != nil {
-		logger.Error("scheduler service construction failed", "error", err)
-		return 1
-	}
-	runtimeRelay, err := eventing.NewRelay(store, kafkaClient, "runtime-relay-"+schedulerID,
+	runtimeRelay, err := eventing.NewRelay(store, kafkaClient, "runtime-relay-"+instanceID,
 		configuration.Outbox.Batch, configuration.Outbox.ClaimLease.Duration(), configuration.Outbox.ActivePoll.Duration())
 	if err != nil {
 		logger.Error("runtime relay construction failed", "error", err)
@@ -180,7 +161,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("runtime relay service construction failed", "error", err)
 		return 1
 	}
-	taskRelay, err := eventing.NewTaskRelay(store, kafkaClient, "task-relay-"+schedulerID,
+	taskRelay, err := eventing.NewTaskRelay(store, kafkaClient, "task-relay-"+instanceID,
 		configuration.Outbox.Batch, configuration.Outbox.ClaimLease.Duration(), configuration.Outbox.ActivePoll.Duration())
 	if err != nil {
 		logger.Error("task relay construction failed", "error", err)
@@ -204,7 +185,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("Kafka lag observer construction failed", "error", err)
 		return 1
 	}
-	engineConsumer, err := engine.NewConsumer(store)
+	engineConsumer, err := engine.NewConsumerWithConcurrency(store, configuration.Engine.MaxInflight)
 	if err != nil {
 		logger.Error("engine consumer construction failed", "error", err)
 		return 1
@@ -216,25 +197,25 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 	}
 	recoveryGrace := configuration.Worker.LostAfter.Duration() - configuration.Worker.LeaseDuration.Duration()
 	reaper, err := recovery.NewReaper(store, attemptCoordinator, recoveryGrace,
-		configuration.Worker.RecoveryScannerInterval.Duration(), configuration.Outbox.ScanBatch, "reaper-"+schedulerID, logger, metricRegistry)
+		configuration.Worker.RecoveryScannerInterval.Duration(), configuration.Outbox.ScanBatch, "reaper-"+instanceID, logger, metricRegistry)
 	if err != nil {
 		logger.Error("attempt reaper construction failed", "error", err)
 		return 1
 	}
 	retryTimer, err := recovery.NewRetryTimer(store, recoveryEmitter, configuration.Outbox.RetryTimerInterval.Duration(),
-		configuration.Outbox.ScanBatch, "retry-timer-"+schedulerID, logger, metricRegistry)
+		configuration.Outbox.ScanBatch, "retry-timer-"+instanceID, logger, metricRegistry)
 	if err != nil {
 		logger.Error("retry timer construction failed", "error", err)
 		return 1
 	}
 	deadlineScanner, err := recovery.NewDeadlineScanner(store, recoveryEmitter, configuration.Outbox.DeadlineScannerInterval.Duration(),
-		configuration.Outbox.ScanBatch, "deadline-scanner-"+schedulerID, logger, metricRegistry)
+		configuration.Outbox.ScanBatch, "deadline-scanner-"+instanceID, logger, metricRegistry)
 	if err != nil {
 		logger.Error("deadline scanner construction failed", "error", err)
 		return 1
 	}
 	reconciler, err := recovery.NewReconciler(store, recoveryEmitter, configuration.Outbox.ReconcilerInterval.Duration(),
-		configuration.Outbox.ScanBatch, "runtime-reconciler-"+schedulerID, logger, metricRegistry)
+		configuration.Outbox.ScanBatch, "runtime-reconciler-"+instanceID, logger, metricRegistry)
 	if err != nil {
 		logger.Error("runtime reconciler construction failed", "error", err)
 		return 1
@@ -244,7 +225,7 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("outbox age observer construction failed", "error", err)
 		return 1
 	}
-	if err := lifecycle.Run(ctx, configuration.Shutdown.Timeout.Duration(), logger, server, schedulerService,
+	if err := lifecycle.Run(ctx, configuration.Shutdown.Timeout.Duration(), logger, server,
 		runtimeRelayService, taskRelayService, runtimeConsumerService, reaper, retryTimer, deadlineScanner, reconciler, outboxAgeService, kafkaLagService); err != nil {
 		logger.Error("control plane stopped with error", "error", err)
 		return 1
@@ -256,11 +237,5 @@ func mustRegister(logger *slog.Logger, registry *health.Registry, name string, c
 	if err := registry.Register(name, check); err != nil {
 		logger.Error("health check registration failed", "check", name, "error", err)
 		panic(err)
-	}
-}
-
-func closeWithLog(logger *slog.Logger, name string, close func() error) {
-	if err := close(); err != nil {
-		logger.Warn("dependency close failed", "dependency", name, "error", err)
 	}
 }

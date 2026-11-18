@@ -24,6 +24,51 @@ type apiError struct {
 	Details map[string]any
 }
 
+// These are transport DTOs for the versioned External API. Keep the complete
+// published response shape here because request() deliberately rejects unknown
+// response fields; the CLI only consumes the fields required by its command.
+type apiWorkflowResponse struct {
+	ID              string          `json:"workflow_id"`
+	ProjectID       string          `json:"project_id"`
+	Name            string          `json:"name"`
+	ActiveVersionID json.RawMessage `json:"active_version_id"`
+	CreatedBy       string          `json:"created_by"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+}
+
+type apiDraftRevisionResponse struct {
+	ID                  string          `json:"draft_revision_id"`
+	ProjectID           string          `json:"project_id"`
+	WorkflowID          string          `json:"workflow_id"`
+	Revision            int64           `json:"revision_number"`
+	IR                  json.RawMessage `json:"ir"`
+	CatalogRevision     string          `json:"catalog_revision"`
+	CreatedBy           string          `json:"created_by"`
+	CreatedAt           time.Time       `json:"created_at"`
+	ClonedFromVersionID json.RawMessage `json:"cloned_from_version_id"`
+}
+
+type apiDraftResponse struct {
+	ProjectID       string                   `json:"project_id"`
+	WorkflowID      string                   `json:"workflow_id"`
+	CurrentRevision int64                    `json:"current_revision"`
+	StateVersion    int64                    `json:"state_version"`
+	Current         apiDraftRevisionResponse `json:"current"`
+}
+
+type apiPublishedVersionResponse struct {
+	ID                    string    `json:"version_id"`
+	ProjectID             string    `json:"project_id"`
+	WorkflowID            string    `json:"workflow_id"`
+	Number                int64     `json:"version_number"`
+	SourceDraftRevisionID string    `json:"source_draft_revision_id"`
+	ExecutionSnapshotID   string    `json:"execution_snapshot_id"`
+	ChangeLog             string    `json:"change_log"`
+	CreatedBy             string    `json:"created_by"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
 func (err *apiError) Error() string {
 	if err.Code == "" {
 		return err.Message

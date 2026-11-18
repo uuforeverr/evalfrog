@@ -10,16 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/uu999/evalfrog/internal/access"
-	"github.com/uu999/evalfrog/internal/adapters/postgres"
+	"github.com/uu999/evalfrog/internal/adapters/mysql"
 	"github.com/uu999/evalfrog/internal/definition"
 	"github.com/uu999/evalfrog/internal/ir"
 	"github.com/uu999/evalfrog/internal/platform/config"
@@ -30,37 +29,45 @@ import (
 type m3Harness struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
-	client      *postgres.Client
-	store       *postgres.Store
+	client      *mysql.Client
+	store       *mysql.Store
 	access      access.Service
 	definitions definition.Service
 	projectID   string
 	principalID string
 	executionID string
 	token       string
-	schema      string
+	database    string
 }
 
 func newM3Harness(t *testing.T) *m3Harness {
+	return newM3HarnessWithTimeout(t, 60*time.Second)
+}
+
+func newM3HarnessWithTimeout(t *testing.T, timeout time.Duration) *m3Harness {
 	t.Helper()
+	if timeout <= 0 {
+		t.Fatal("integration harness timeout must be positive")
+	}
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("EVALFROG_POSTGRES_DSN", "postgres://evalfrog:evalfrog@localhost:15432/evalfrog?sslmode=disable")
+	databaseName, dsn := isolatedMySQLDatabase(t)
+	t.Setenv("EVALFROG_MYSQL_DSN", dsn)
 	configuration, err := config.Load(config.LoadOptions{Directory: filepath.Join(root, "configs"), Profile: "local"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	configuration.Postgres.Schema = "m3_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	client, err := postgres.Open(ctx, configuration.Postgres)
+	configuration.MySQL.Database = databaseName
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	client, err := mysql.Open(ctx, configuration.MySQL)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
 	}
 	runner := migrations.Runner{
-		Pool: client.Pool(), Schema: configuration.Postgres.Schema,
+		Database: client.Pool().Raw(), DatabaseName: configuration.MySQL.Database,
 		Directory: filepath.Join(root, "migrations"), LockTimeout: 5 * time.Second,
 	}
 	if err := runner.Up(ctx); err != nil {
@@ -69,17 +76,15 @@ func newM3Harness(t *testing.T) *m3Harness {
 		t.Fatal(err)
 	}
 	harness := &m3Harness{
-		ctx: ctx, cancel: cancel, client: client, store: postgres.NewStore(client.Pool()),
+		ctx: ctx, cancel: cancel, client: client, store: mysql.NewStore(client.Pool()),
 		projectID: newID(t), principalID: newID(t), executionID: newID(t),
-		token: "m3-integration-token-" + uuid.NewString(), schema: configuration.Postgres.Schema,
+		token: "m3-integration-token-" + uuid.NewString(), database: configuration.MySQL.Database,
 	}
 	harness.access = access.NewService(harness.store)
 	resolver := resources.NewResolver(harness.store, harness.access)
 	harness.definitions = definition.NewBuiltinService(harness.store, harness.access, resolver)
 	harness.seedProject(t, harness.projectID, harness.principalID, harness.executionID, harness.token, allPermissions())
 	t.Cleanup(func() {
-		identifier := pgx.Identifier{harness.schema}.Sanitize()
-		_, _ = harness.client.Pool().Exec(context.Background(), "DROP SCHEMA IF EXISTS "+identifier+" CASCADE")
 		harness.client.Close()
 		harness.cancel()
 	})
@@ -114,6 +119,10 @@ func TestM3DraftPublishRollbackCopyLifecycle(t *testing.T) {
 		IRJSON: minimalIR("initial", 0), IdempotencyKey: "create-lifecycle",
 	})
 	assertNoDefinitionFailure(t, diagnostics, err)
+	base, err := harness.store.GetDraftRevision(harness.ctx, harness.projectID, workflow.ID, 1)
+	if err != nil || !json.Valid(base.IRJSON) {
+		t.Fatalf("base revision IR unavailable: err=%v ir=%q", err, base.IRJSON)
+	}
 
 	if _, err := harness.definitions.ResolveProductionDefinition(harness.ctx, harness.projectID, harness.principalID, workflow.ID); definitionCode(err) != definition.CodeWorkflowNotPublished {
 		t.Fatalf("unpublished resolution error = %v", err)
@@ -147,6 +156,22 @@ func TestM3DraftPublishRollbackCopyLifecycle(t *testing.T) {
 			winner = result.revision
 		} else if definitionCode(result.err) == definition.CodeDraftRevisionConflict {
 			conflicts++
+			var conflict *definition.Error
+			if !errors.As(result.err, &conflict) || conflict.Details["base_revision"] != int64(1) || conflict.Details["current_revision"] != int64(2) {
+				t.Fatalf("conflict merge context missing: %v", result.err)
+			}
+			for _, field := range []string{"base_ir", "current_ir", "submitted_ir"} {
+				var payload []byte
+				switch value := conflict.Details[field].(type) {
+				case json.RawMessage:
+					payload = value
+				case []byte:
+					payload = value
+				}
+				if !json.Valid(payload) {
+					t.Fatalf("invalid %s: type=%T value=%q", field, conflict.Details[field], payload)
+				}
+			}
 		} else {
 			t.Fatalf("unexpected concurrent save error: %v", result.err)
 		}
@@ -201,10 +226,10 @@ func TestM3DraftPublishRollbackCopyLifecycle(t *testing.T) {
 	}
 
 	for name, statement := range map[string]string{
-		"version update":  `UPDATE workflow_versions SET change_log = 'changed' WHERE version_id = $1`,
-		"version delete":  `DELETE FROM workflow_versions WHERE version_id = $1`,
-		"snapshot update": `UPDATE workflow_execution_snapshots SET definition_hash = repeat('a',64) WHERE snapshot_id = $1`,
-		"snapshot delete": `DELETE FROM workflow_execution_snapshots WHERE snapshot_id = $1`,
+		"version update":  `UPDATE workflow_versions SET change_log = 'changed' WHERE version_id = UUID_TO_BIN($1)`,
+		"version delete":  `DELETE FROM workflow_versions WHERE version_id = UUID_TO_BIN($1)`,
+		"snapshot update": `UPDATE workflow_execution_snapshots SET definition_hash = repeat('a',64) WHERE snapshot_id = UUID_TO_BIN($1)`,
+		"snapshot delete": `DELETE FROM workflow_execution_snapshots WHERE snapshot_id = UUID_TO_BIN($1)`,
 	} {
 		id := version1.ID
 		if strings.Contains(name, "snapshot") {
@@ -228,11 +253,55 @@ func TestM3DraftPublishRollbackCopyLifecycle(t *testing.T) {
 		t.Fatalf("copy did not use saved IR snapshot: workflow=%+v draft=%+v", copyWorkflow, copyDraft)
 	}
 	var copyVersions int
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM workflow_versions WHERE project_id=$1 AND workflow_id=$2`, harness.projectID, copyWorkflow.ID).Scan(&copyVersions); err != nil || copyVersions != 0 {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM workflow_versions WHERE project_id=UUID_TO_BIN($1) AND workflow_id=UUID_TO_BIN($2)`, harness.projectID, copyWorkflow.ID).Scan(&copyVersions); err != nil || copyVersions != 0 {
 		t.Fatalf("copy version count=%d err=%v", copyVersions, err)
 	}
 	if _, err := harness.definitions.ResolveProductionDefinition(harness.ctx, harness.projectID, harness.principalID, copyWorkflow.ID); definitionCode(err) != definition.CodeWorkflowNotPublished {
 		t.Fatalf("copied workflow production resolution error = %v", err)
+	}
+}
+
+func TestM3ConflictMergeSaveAndIdempotency(t *testing.T) {
+	harness := newM3Harness(t)
+	workflow, _, diagnostics, err := harness.definitions.CreateWorkflow(harness.ctx, definition.CreateWorkflowCommand{
+		ProjectID: harness.projectID, PrincipalID: harness.principalID, Name: "Merge",
+		IRJSON: minimalIR("base", 0), IdempotencyKey: "merge-create",
+	})
+	assertNoDefinitionFailure(t, diagnostics, err)
+	command := func(expected int64, title, key string) definition.SaveDraftCommand {
+		return definition.SaveDraftCommand{ProjectID: harness.projectID, PrincipalID: harness.principalID,
+			WorkflowID: workflow.ID, ExpectedRevision: expected, IRJSON: minimalIR(title, 0), IdempotencyKey: key}
+	}
+	first, diagnostics, err := harness.definitions.SaveDraft(harness.ctx, command(1, "A", "merge-save-a"))
+	assertNoDefinitionFailure(t, diagnostics, err)
+	if first.RevisionNumber != 2 {
+		t.Fatalf("first revision=%d", first.RevisionNumber)
+	}
+	_, _, err = harness.definitions.SaveDraft(harness.ctx, command(1, "B", "merge-save-b"))
+	var conflict *definition.Error
+	if !errors.As(err, &conflict) || conflict.Code != definition.CodeDraftRevisionConflict {
+		t.Fatalf("expected merge conflict, got %v", err)
+	}
+	if conflict.Details["base_revision"] != int64(1) || conflict.Details["current_revision"] != int64(2) {
+		t.Fatalf("incorrect merge revisions: %+v", conflict.Details)
+	}
+	current, err := harness.store.GetCurrentDraft(harness.ctx, harness.projectID, workflow.ID)
+	if err != nil || current.CurrentRevision != 2 {
+		t.Fatalf("conflict changed draft: %+v %v", current, err)
+	}
+	merged, diagnostics, err := harness.definitions.SaveDraft(harness.ctx, command(2, "chosen", "merge-confirm"))
+	assertNoDefinitionFailure(t, diagnostics, err)
+	if merged.RevisionNumber != 3 {
+		t.Fatalf("merged revision=%d", merged.RevisionNumber)
+	}
+	replay, diagnostics, err := harness.definitions.SaveDraft(harness.ctx, command(2, "chosen", "merge-confirm"))
+	assertNoDefinitionFailure(t, diagnostics, err)
+	if replay.ID != merged.ID {
+		t.Fatalf("replay created another revision: %s != %s", replay.ID, merged.ID)
+	}
+	_, _, err = harness.definitions.SaveDraft(harness.ctx, command(2, "different", "merge-confirm"))
+	if definitionCode(err) != definition.CodeIdempotencyKeyReused {
+		t.Fatalf("key reuse error=%v", err)
 	}
 }
 
@@ -244,11 +313,8 @@ func TestM3PublishTransactionRollsBackEveryFact(t *testing.T) {
 	})
 	assertNoDefinitionFailure(t, diagnostics, err)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		CREATE FUNCTION fail_publish_audit() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN RAISE EXCEPTION 'injected publish failure'; END; $$`)
-	mustExec(t, harness.ctx, harness.client.Pool(), `
 		CREATE TRIGGER inject_publish_failure BEFORE INSERT ON workflow_definition_audits
-		FOR EACH ROW EXECUTE FUNCTION fail_publish_audit()`)
+		FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected publish failure'`)
 	_, _, diagnostics, err = harness.definitions.Publish(harness.ctx, definition.PublishCommand{
 		ProjectID: harness.projectID, PrincipalID: harness.principalID, WorkflowID: workflow.ID,
 		ExpectedRevision: 1, ChangeLog: "must rollback", IdempotencyKey: "publish-atomic-01",
@@ -264,7 +330,7 @@ func TestM3PublishTransactionRollsBackEveryFact(t *testing.T) {
 		t.Fatalf("publish idempotency survived failed transaction: count=%d err=%v", publishKeys, err)
 	}
 	var active *string
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT active_version_id::text FROM workflows WHERE project_id=$1 AND workflow_id=$2`, harness.projectID, workflow.ID).Scan(&active); err != nil || active != nil {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT BIN_TO_UUID(active_version_id) FROM workflows WHERE project_id=UUID_TO_BIN($1) AND workflow_id=UUID_TO_BIN($2)`, harness.projectID, workflow.ID).Scan(&active); err != nil || active != nil {
 		t.Fatalf("active pointer survived failed transaction: %v %v", active, err)
 	}
 }
@@ -303,7 +369,7 @@ func TestM3PermissionsManagedResourcesAndProjectIsolation(t *testing.T) {
 	assertNoDefinitionFailure(t, diagnostics, err)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
 		DELETE FROM connection_execution_grants
-		WHERE project_id=$1 AND connection_id=$2 AND execution_identity_id=$3 AND purpose='production'`,
+		WHERE project_id=UUID_TO_BIN($1) AND connection_id=UUID_TO_BIN($2) AND execution_identity_id=UUID_TO_BIN($3) AND purpose='production'`,
 		harness.projectID, connectionID, harness.executionID)
 	replayed, _, diagnostics, err := harness.definitions.Publish(harness.ctx, publish)
 	assertNoDefinitionFailure(t, diagnostics, err)
@@ -455,11 +521,24 @@ func allPermissions() []access.Permission {
 }
 
 type execer interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Exec(context.Context, string, ...any) (mysql.CommandTag, error)
 }
 
 func mustExec(t *testing.T, ctx context.Context, target execer, sql string, arguments ...any) {
 	t.Helper()
+	for index, argument := range arguments {
+		value, ok := argument.(string)
+		if !ok {
+			continue
+		}
+		parsed, err := uuid.Parse(value)
+		wrapped := regexp.MustCompile(fmt.Sprintf(`(?i)UUID_TO_BIN\(\s*\$%d\s*\)`, index+1)).MatchString(sql)
+		if err == nil && !wrapped {
+			binary := make([]byte, 16)
+			copy(binary, parsed[:])
+			arguments[index] = binary
+		}
+	}
 	if _, err := target.Exec(ctx, sql, arguments...); err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +580,7 @@ func hasDiagnostic(diagnostics []ir.Diagnostic, code string) bool {
 func assertCount(t *testing.T, harness *m3Harness, table string, expected int) {
 	t.Helper()
 	var count int
-	query := fmt.Sprintf("SELECT count(*) FROM %s", pgx.Identifier{table}.Sanitize())
+	query := fmt.Sprintf("SELECT count(*) FROM %s", mysqlIdentifier(table))
 	if err := harness.client.Pool().QueryRow(harness.ctx, query).Scan(&count); err != nil || count != expected {
 		t.Fatalf("%s count=%d want=%d err=%v", table, count, expected, err)
 	}

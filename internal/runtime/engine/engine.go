@@ -53,7 +53,7 @@ type Engine struct {
 }
 
 func NewBuiltinV1(snapshot Snapshot, command runtime.CreateRunCommand) (*Engine, error) {
-	return New(snapshot, command, dsl.BuiltinV1Contract(), dsl.BuiltinV1Compatibility())
+	return New(snapshot, command, dsl.BuiltinV2Contract(), dsl.BuiltinV2Compatibility())
 }
 
 func New(snapshot Snapshot, command runtime.CreateRunCommand, contract dsl.Contract, compatibility dsl.CompatibilityChecker) (*Engine, error) {
@@ -381,7 +381,11 @@ func (engine *Engine) initialize() error {
 	if err := start.Activate(); err != nil {
 		return err
 	}
-	if err := start.SucceedControl("", map[string]json.RawMessage{"workflow_input": engine.run.WorkflowInput()}); err != nil {
+	outputs, err := engine.startOutputs()
+	if err != nil {
+		return &Error{Code: FailureInputContract, NodeID: string(engine.doc.EntryNodeID), Field: "workflow_input", Cause: err}
+	}
+	if err := start.SucceedControl("", outputs); err != nil {
 		return err
 	}
 	engine.settleOutgoing(engine.doc.EntryNodeID, "")
@@ -459,7 +463,13 @@ func (engine *Engine) drive(at time.Time) error {
 			}
 			switch definition.Operation.Type {
 			case "control.branch":
-				route, branchErr := evaluateBranch(definition, inputs["value"])
+				var route string
+				var branchErr *Error
+				if definition.Operation.Version == 2 {
+					route, branchErr = evaluateBranchV2(definition, inputs)
+				} else {
+					route, branchErr = evaluateBranch(definition, inputs["value"])
+				}
 				if branchErr != nil {
 					failure := engine.failure(branchErr.Code, "control_evaluation", branchErr.Error(), id, "", branchErr.Field, false)
 					if err := node.FailControl(failure); err != nil {
@@ -476,7 +486,22 @@ func (engine *Engine) drive(at time.Time) error {
 				if !engine.allOtherNodesTerminal(id) {
 					continue
 				}
-				if err := runtime.CompleteWorkflowSuccess(engine.run, node, engine.allNodeRuns(), inputs["workflow_output"]); err != nil {
+				output := inputs["workflow_output"]
+				if definition.Operation.Version == 2 {
+					values := make(map[string]json.RawMessage, len(inputs))
+					for name, value := range inputs {
+						values[string(name)] = value
+					}
+					if err := validateOutputs(definition, values); err != nil {
+						return err
+					}
+					var err error
+					output, err = json.Marshal(values)
+					if err != nil {
+						return err
+					}
+				}
+				if err := runtime.CompleteWorkflowSuccess(engine.run, node, engine.allNodeRuns(), output); err != nil {
 					return err
 				}
 			case "control.start":
@@ -490,6 +515,29 @@ func (engine *Engine) drive(at time.Time) error {
 			return nil
 		}
 	}
+}
+
+func (engine *Engine) startOutputs() (map[string]json.RawMessage, error) {
+	definition := engine.nodeDefs[engine.doc.EntryNodeID]
+	if definition.Operation.Version == 1 {
+		return map[string]json.RawMessage{"workflow_input": engine.run.WorkflowInput()}, nil
+	}
+	var invocation map[string]json.RawMessage
+	if err := json.Unmarshal(engine.run.WorkflowInput(), &invocation); err != nil {
+		return nil, fmt.Errorf("invalid workflow input: %w", err)
+	}
+	if len(invocation) != len(definition.Outputs) {
+		return nil, fmt.Errorf("workflow input parameter count does not match Start contract")
+	}
+	for name := range invocation {
+		if _, exists := definition.Outputs[dsl.PortName(name)]; !exists {
+			return nil, fmt.Errorf("workflow input parameter %s is undeclared", name)
+		}
+	}
+	if err := validateOutputs(definition, invocation); err != nil {
+		return nil, err
+	}
+	return invocation, nil
 }
 
 func (engine *Engine) acceptSuccess(node *runtime.NodeRun, definition dsl.Node, attemptID string, outputs map[string]json.RawMessage) error {

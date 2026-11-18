@@ -5,14 +5,23 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EvalFrog Workflow Canvas</title>
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./merge.css" />
   </head>
   <body>
-    <header><strong>EvalFrog</strong><span>Human Web Canvas</span><button id="load">加载 Draft</button><button id="save">保存 Draft</button><button id="validate">校验</button><button id="test">测试</button><button id="publish">发布</button><button id="run">正式运行</button><button id="cancel">取消运行</button></header>
+    <header><strong>EvalFrog</strong><span id="save-status" role="status" aria-live="polite">请加载 Draft</span><button id="create">新建工作流</button><button id="load">加载 Draft</button><button id="upgrade-ir" hidden>升级 v1 Draft</button><button id="save">保存 Draft</button><button id="validate">校验</button><button id="test">测试</button><button id="publish">发布</button><button id="run">正式运行</button><button id="cancel">取消运行</button></header>
     <main>
-      <aside><h2>节点目录</h2><div id="catalog"></div><h2>运行</h2><div id="run-state">未选择</div><pre id="run-error"></pre></aside>
+      <aside><h2>画布编辑</h2><p class="hint">拖动节点调整位置；从右侧圆点拖线到另一节点左侧圆点；点击节点旁的＋添加节点。选中后可按 Backspace/Delete 或右键删除。</p><div id="selection">未选择</div>
+        <details id="advanced-tools"><summary>高级画布操作</summary><h2>在选中节点后插入</h2><label>节点类型<select id="insert-type"></select></label><label>插入到哪条出边<select id="insert-edge"></select></label><button id="insert-node">插入节点</button><button id="delete-node" class="danger">删除节点</button>
+        <h2>连接</h2><label>起点<select id="edge-source"></select></label><label>终点<select id="edge-target"></select></label><label>Branch route<input id="edge-route" placeholder="仅 Branch 起点填写" /></label><button id="add-edge">新增连接</button><button id="delete-edge" class="danger">删除选中连接</button></details><div id="edge-list"></div>
+        <h2>节点目录</h2><div id="catalog"></div><h2>调用输入</h2><div id="run-inputs"></div><h2>运行</h2><div id="run-state">未选择</div><pre id="run-error"></pre></aside>
       <section id="canvas" aria-label="Workflow canvas"><svg id="edges" aria-hidden="true"></svg><div id="nodes"></div></section>
-      <aside><h2>编辑</h2><label>Workflow ID<input id="workflow-id" /></label><label>Project ID<input id="project-id" /></label><label>Token<input id="token" type="password" /></label><label>API Base URL<input id="api-base" value="/api" /></label><label>IR JSON<textarea id="ir"></textarea></label><pre id="diagnostics"></pre></aside>
+      <aside><section id="inspector"><h2>节点与连接设置</h2><p class="hint">点击画布节点编辑输入和输出；点击 Branch 连线标签设置条件。</p><div id="inspector-content"></div><p id="inspector-error" role="alert"></p></section><hr /><h2>工作流</h2><label>Workflow ID<input id="workflow-id" /></label><label>Project ID<input id="project-id" /></label><label>Token<input id="token" type="password" /></label><label>API Base URL<input id="api-base" value="/api" /></label><details id="advanced-ir"><summary>高级：直接编辑 IR JSON</summary><label>IR JSON<textarea id="ir"></textarea></label></details><pre id="diagnostics"></pre></aside>
     </main>
+    <dialog id="merge-dialog"><h2>Draft 并发修改：在画布上选择</h2><p id="merge-revisions"></p><p id="merge-progress"></p><div id="merge-workspace"><div id="merge-canvas" aria-label="三方合并流程图"></div><aside id="merge-inspector"><h3>选择节点或连线</h3><div id="merge-choices">点击画布中的元素，选择保留哪一版。</div></aside></div><p id="merge-error" role="alert"></p><button id="merge-submit">保存选择</button><button id="merge-cancel">返回编辑</button></dialog>
+    <dialog id="create-dialog"><h2>新建工作流</h2><label>名称<input id="create-name" maxlength="200" /></label><p id="create-error" role="alert"></p><button id="create-confirm">创建</button><button id="create-cancel">取消</button></dialog>
+    <dialog id="node-picker"><h2>在节点后添加</h2><p id="picker-source"></p><label>节点类型<select id="picker-type"></select></label><label>插入到连接<select id="picker-edge"></select></label><p id="picker-error" role="alert"></p><button id="picker-confirm">添加节点</button><button id="picker-cancel">取消</button></dialog>
+    <div id="context-menu" role="menu" hidden><button id="context-delete" role="menuitem">删除所选元素</button></div>
+    <link rel="stylesheet" href="./editor.css" />
     <script type="module" src="./app.js"></script>
   </body>
 </html>

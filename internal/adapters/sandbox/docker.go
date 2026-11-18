@@ -85,6 +85,19 @@ func (orchestrator DockerOrchestrator) Cleanup(ctx context.Context, attemptID st
 	return orchestrator.cleanupName(ctx, containerName(attemptID))
 }
 
+// Check proves that the dedicated Sandbox Runtime Controller can reach its
+// container runtime. It is never called by a Worker process.
+func (orchestrator DockerOrchestrator) Check(ctx context.Context) error {
+	if orchestrator.Runner == nil {
+		return fmt.Errorf("sandbox command runner is required")
+	}
+	_, _, err := orchestrator.Runner.Run(ctx, orchestrator.Command, []string{"version", "--format", "{{.Server.Version}}"}, nil, 4<<10)
+	if err != nil {
+		return fmt.Errorf("sandbox container runtime: %w", err)
+	}
+	return nil
+}
+
 func (orchestrator DockerOrchestrator) Sweep(ctx context.Context) error {
 	if orchestrator.Runner == nil {
 		return fmt.Errorf("sandbox command runner is required")
@@ -106,6 +119,16 @@ func (orchestrator DockerOrchestrator) Sweep(ctx context.Context) error {
 
 func (orchestrator DockerOrchestrator) cleanupName(ctx context.Context, name string) error {
 	_, _, err := orchestrator.Runner.Run(ctx, orchestrator.Command, []string{"rm", "-f", "--volumes", name}, nil, 64<<10)
+	if err == nil {
+		return nil
+	}
+	// Docker returns a non-zero status when a retry races with a successful
+	// cleanup. Confirm the name is absent so the controller's DELETE endpoint
+	// remains idempotent without masking a live daemon or permission failure.
+	remaining, _, inspectErr := orchestrator.Runner.Run(ctx, orchestrator.Command, []string{"ps", "-aq", "--filter", "name=^/" + name + "$"}, nil, 64<<10)
+	if inspectErr == nil && len(bytes.TrimSpace(remaining)) == 0 {
+		return nil
+	}
 	return err
 }
 

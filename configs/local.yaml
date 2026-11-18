@@ -4,27 +4,17 @@ namespace: local
 endpoints:
   control_plane_url: "http://localhost:8080"
 
-postgres:
-  dsn: "postgres://evalfrog@localhost:15432/evalfrog?sslmode=disable"
-  schema: "evalfrog_local"
+http:
+  sandbox_runtime_address: ":8083"
+  run_update_poll_interval: 1s
+
+mysql:
+  dsn: "evalfrog:evalfrog@tcp(localhost:13306)/evalfrog_local"
+  database: "evalfrog_local"
   pool_min: 1
   pool_max: 5
   server_max_connections: 100
   expected_control_plane_instances: 1
-
-redis:
-  scheduling:
-    address: "localhost:16379"
-    key_prefix: "evalfrog:local:sched:"
-    operation_timeout: 500ms
-    max_retries: 1
-    eviction_policy: "noeviction"
-  cache:
-    address: "localhost:16380"
-    key_prefix: "evalfrog:local:cache:"
-    operation_timeout: 500ms
-    max_retries: 0
-    eviction_policy: "allkeys-lfu"
 
 kafka:
   brokers: ["localhost:29092"]
@@ -38,15 +28,8 @@ kafka:
     runtime_event: {partitions: 1, retention: 4h}
     dlq: {partitions: 1, retention: 24h}
 
-scheduler:
-  lane_count: 8
-  epoch: 500ms
-  active_project_ttl: 3s
-  credit_grant_batch: 4
-  redis_candidate_batch: 8
-  admission_concurrency: 2
-  inflight_reservation_ttl: 30s
-  ready_reconcile_interval: 5s
+engine:
+  max_inflight: 3
 
 worker:
   builtin_slots: 4
@@ -65,6 +48,8 @@ sandbox:
   image: "evalfrog-sandbox-python:dev"
   runtime: "runc"
   command: "docker"
+  runtime_url: "http://sandbox-runtime:8083/v1"
+  runtime_token: "local-sandbox-runtime-token-not-for-production"
 
 outbox:
   batch: 20
@@ -72,13 +57,9 @@ outbox:
   published_retention: 24h
   inbox_retention: 24h
 
-cache:
-  execution_snapshot_ttl: 1h
-  active_run_context_ttl: 30m
-  terminal_run_context_ttl: 10m
-  active_run_read_model_ttl: 5m
-  terminal_run_read_model_ttl: 10m
-  definition_negative_ttl: 10s
+snapshot_l1:
+  max_entries: 128
+  max_bytes: 16777216
 
 observability:
   log_level: "debug"

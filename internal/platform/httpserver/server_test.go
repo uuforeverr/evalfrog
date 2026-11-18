@@ -56,7 +56,8 @@ func TestMetricRouteNeverUsesTenantOrRunIdentifiers(t *testing.T) {
 	for path, want := range map[string]string{
 		"/v1/projects/project-1/workflows/workflow-1/runs": "/v1/projects/{project_id}/workflows/{workflow_id}/runs",
 		"/v1/projects/project-1/runs/run-1/diagnostics":    "/v1/projects/{project_id}/runs/{run_id}/diagnostics",
-		"/health/ready": "/health/ready",
+		"/v1/attempts/attempt-1/execute":                   "/v1/attempts/{attempt_id}/execute",
+		"/health/ready":                                    "/health/ready",
 	} {
 		if got := metricRoute(path); got != want {
 			t.Fatalf("path=%q got=%q want=%q", path, got, want)

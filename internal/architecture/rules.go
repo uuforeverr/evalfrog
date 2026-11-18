@@ -41,10 +41,13 @@ func Validate(graph Graph) []Violation {
 		fromRelative := localPath(from)
 		for _, imported := range imports {
 			toRelative := localPath(imported)
+			if strings.HasPrefix(imported, "github.com/redis/") {
+				violations = append(violations, Violation{from, imported, "the current architecture must not reintroduce Redis clients"})
+			}
 			if fromRelative == "internal/compiler" && hasAnyPrefix(imported, []string{
-				"net/http", "github.com/jackc/pgx", "github.com/redis/go-redis", "github.com/twmb/franz-go",
+				"net/http", "github.com/go-sql-driver/mysql", "github.com/redis/go-redis", "github.com/twmb/franz-go",
 			}) {
-				violations = append(violations, Violation{from, imported, "compiler must remain deterministic and cannot import HTTP, PostgreSQL, Redis, or Kafka clients"})
+				violations = append(violations, Violation{from, imported, "compiler must remain deterministic and cannot import HTTP, MySQL, Redis, or Kafka clients"})
 			}
 			if toRelative == "" {
 				continue
@@ -52,25 +55,17 @@ func Validate(graph Graph) []Violation {
 			if hasAnyPrefix(fromRelative, domainPrefixes) && strings.HasPrefix(toRelative, "internal/adapters/") {
 				violations = append(violations, Violation{from, imported, "domain modules must depend on ports, not adapters"})
 			}
-			if strings.HasPrefix(fromRelative, "internal/worker/") && strings.HasPrefix(toRelative, "internal/adapters/postgres") {
-				violations = append(violations, Violation{from, imported, "workers must not have PostgreSQL access"})
+			if strings.HasPrefix(fromRelative, "internal/worker/") && strings.HasPrefix(toRelative, "internal/adapters/mysql") {
+				violations = append(violations, Violation{from, imported, "workers must not have MySQL access"})
 			}
-			if strings.HasPrefix(fromRelative, "internal/worker/") && hasAnyPrefix(imported, []string{"github.com/jackc/pgx", "github.com/redis/go-redis"}) {
-				violations = append(violations, Violation{from, imported, "worker processes must not carry PostgreSQL or Redis clients"})
+			if strings.HasPrefix(fromRelative, "internal/worker/") && hasAnyPrefix(imported, []string{"github.com/go-sql-driver/mysql", "github.com/redis/go-redis"}) {
+				violations = append(violations, Violation{from, imported, "worker processes must not carry MySQL or Redis clients"})
 			}
-			if strings.HasPrefix(fromRelative, "internal/adapters/httpapi") && strings.HasPrefix(toRelative, "internal/adapters/postgres") {
-				violations = append(violations, Violation{from, imported, "HTTP API handlers must call application ports instead of PostgreSQL repositories"})
+			if strings.HasPrefix(fromRelative, "internal/adapters/httpapi") && strings.HasPrefix(toRelative, "internal/adapters/mysql") {
+				violations = append(violations, Violation{from, imported, "HTTP API handlers must call application ports instead of MySQL repositories"})
 			}
 			if hasAnyPrefix(fromRelative, []string{"internal/runtime"}) && hasAnyPrefix(toRelative, []string{"internal/ir", "internal/definition", "internal/catalog"}) {
 				violations = append(violations, Violation{from, imported, "runtime executes immutable DSL and must not read authoring models"})
-			}
-			if strings.HasPrefix(fromRelative, "internal/scheduling") && strings.HasPrefix(toRelative, "internal/runtime/engine") {
-				violations = append(violations, Violation{from, imported, "scheduler must not interpret engine control semantics"})
-			}
-			if strings.HasPrefix(fromRelative, "internal/scheduling") && hasAnyPrefix(toRelative, []string{
-				"github.com/redis/go-redis", "github.com/jackc/pgx", "github.com/twmb/franz-go",
-			}) {
-				violations = append(violations, Violation{from, imported, "scheduler domain must depend on authority and coordination ports, not infrastructure clients"})
 			}
 		}
 	}
@@ -122,7 +117,7 @@ func ValidateLayout(root string) []Violation {
 			if err != nil || !entry.IsDir() || path == root {
 				return nil
 			}
-			if entry.Name() == ".git" {
+			if entry.Name() == ".git" || entry.Name() == "node_modules" {
 				return filepath.SkipDir
 			}
 			if entry.Name() == forbidden {

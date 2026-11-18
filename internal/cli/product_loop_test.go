@@ -42,17 +42,26 @@ func TestM10CLIProductLoopUsesOnlyIRAndStableExternalPaths(t *testing.T) {
 		}
 		switch request.Method + " " + request.URL.Path {
 		case "POST /v1/projects/" + project + "/workflows":
-			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"workflow": map[string]any{"workflow_id": workflow}, "draft_revision": map[string]any{"revision_number": 1, "ir": json.RawMessage(validCLIIR("Initial"))}})
+			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{
+				"workflow":       completeWorkflowResponse(project, workflow, "Loop"),
+				"draft_revision": completeDraftRevisionResponse(project, workflow, 1, validCLIIR("Initial")),
+			})
 		case "GET /v1/projects/" + project + "/workflows/" + workflow + "/draft":
-			writeCLIJSON(t, writer, http.StatusOK, map[string]any{"current": map[string]any{"revision_number": 1, "ir": json.RawMessage(validCLIIR("Initial"))}})
+			writeCLIJSON(t, writer, http.StatusOK, map[string]any{
+				"project_id":       project,
+				"workflow_id":      workflow,
+				"current_revision": 1,
+				"state_version":    1,
+				"current":          completeDraftRevisionResponse(project, workflow, 1, validCLIIR("Initial")),
+			})
 		case "PUT /v1/projects/" + project + "/workflows/" + workflow + "/draft":
-			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"revision_number": 2, "ir": json.RawMessage(validCLIIR("Updated"))})
+			writeCLIJSON(t, writer, http.StatusCreated, completeDraftRevisionResponse(project, workflow, 2, validCLIIR("Updated")))
 		case "POST /v1/projects/" + project + "/workflows/" + workflow + "/draft/validate":
 			writeCLIJSON(t, writer, http.StatusOK, map[string]any{"valid": true, "diagnostics": []any{}})
 		case "POST /v1/projects/" + project + "/workflows/" + workflow + "/draft/test":
 			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"run_id": "test-run", "purpose": "test", "state": "pending", "created_at": time.Now().UTC()})
 		case "POST /v1/projects/" + project + "/workflows/" + workflow + "/publish":
-			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"version": map[string]any{"version_number": 1}})
+			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"version": completePublishedVersionResponse(project, workflow, 1)})
 		case "POST /v1/projects/" + project + "/workflows/" + workflow + "/runs":
 			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"run_id": "production-run", "purpose": "production", "state": "pending", "created_at": time.Now().UTC()})
 		case "GET /v1/projects/" + project + "/runs/production-run":
@@ -64,7 +73,10 @@ func TestM10CLIProductLoopUsesOnlyIRAndStableExternalPaths(t *testing.T) {
 		case "POST /v1/projects/" + project + "/runs/production-run/replay":
 			writeCLIJSON(t, writer, http.StatusAccepted, map[string]any{"accepted": true})
 		case "POST /v1/projects/" + project + "/workflows:copy":
-			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{"workflow": map[string]any{"workflow_id": copyWorkflow}, "draft_revision": map[string]any{"revision_number": 1, "ir": json.RawMessage(validCLIIR("Copied"))}})
+			writeCLIJSON(t, writer, http.StatusCreated, map[string]any{
+				"workflow":       completeWorkflowResponse(project, copyWorkflow, "Copied"),
+				"draft_revision": completeDraftRevisionResponse(project, copyWorkflow, 1, validCLIIR("Copied")),
+			})
 		default:
 			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
 		}

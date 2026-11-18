@@ -19,19 +19,11 @@ import (
 func TestWorkerAPIClientAndHandlerRoundTrip(t *testing.T) {
 	coordinator := &fakeCoordinator{}
 	gateway := &fakeGateway{}
-	registry := &fakeRegistry{}
-	server := httptest.NewServer(NewHandler(coordinator, gateway, registry))
+	server := httptest.NewServer(NewHandler(coordinator, gateway))
 	defer server.Close()
 	client := New(server.URL+"/", time.Second)
 	ctx := context.Background()
 	capabilities := []dsl.Coordinate{{Type: "task.python", Version: 1}}
-	registration := scheduling.WorkerRegistration{WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Slots: 2, Capabilities: capabilities, TTL: time.Minute}
-	if err := client.RegisterWorker(ctx, registration); err != nil {
-		t.Fatal(err)
-	}
-	if registry.value.WorkerID != "worker" || registry.value.Slots != 2 {
-		t.Fatalf("registration=%+v", registry.value)
-	}
 	lease, err := client.Claim(ctx, attempt.ClaimCommand{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Capabilities: capabilities, LeaseDuration: time.Minute})
 	if err != nil || lease.Token != "lease" || coordinator.claim.AttemptID != "attempt" {
 		t.Fatalf("lease=%+v claim=%+v err=%v", lease, coordinator.claim, err)
@@ -44,6 +36,14 @@ func TestWorkerAPIClientAndHandlerRoundTrip(t *testing.T) {
 	if err != nil || value.ContextVersion != 1 || gateway.command.AttemptID != "attempt" {
 		t.Fatalf("context=%+v command=%+v err=%v", value, gateway.command, err)
 	}
+	claims, err := client.ClaimBatch(ctx, []attempt.ClaimCommand{{ProjectID: "project", RunID: "run", NodeRunID: "node", AttemptID: "attempt", AttemptSequence: 1, WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Capabilities: capabilities, LeaseDuration: time.Minute}})
+	if err != nil || len(claims) != 1 || claims[0].Lease.Token != "lease" || coordinator.claim.NodeRunID != "node" {
+		t.Fatalf("batch claims=%+v err=%v", claims, err)
+	}
+	contexts, err := client.LoadBatch(ctx, []runtimecontext.LoadCommand{{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, LeaseToken: "lease", FencingToken: 1}})
+	if err != nil || len(contexts) != 1 || contexts[0].Context.AttemptID != "attempt" || contexts[0].Context.LeaseToken != "lease" {
+		t.Fatalf("batch contexts=%+v err=%v", contexts, err)
+	}
 	accepted, err := client.Complete(ctx, attempt.CompleteCommand{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, LeaseToken: "lease", FencingToken: 1, TraceID: "trace", Result: platformruntime.AttemptResult{State: platformruntime.AttemptFailed, ErrorCode: "CODE_RUNTIME_ERROR", Message: "bad", DSLField: "operation.config.source_code", ErrorDetails: map[string]any{"source_line": 3}}})
 	if err != nil || !accepted || coordinator.complete.Result.DSLField != "operation.config.source_code" || coordinator.complete.Result.ErrorDetails["source_line"] != float64(3) {
 		t.Fatalf("accepted=%v complete=%+v err=%v", accepted, coordinator.complete, err)
@@ -52,7 +52,7 @@ func TestWorkerAPIClientAndHandlerRoundTrip(t *testing.T) {
 
 func TestWorkerAPIRejectsUnknownFieldsAndMapsDomainErrors(t *testing.T) {
 	coordinator := &fakeCoordinator{err: attempt.ErrCapabilityMismatch}
-	server := httptest.NewServer(NewHandler(coordinator, &fakeGateway{}, &fakeRegistry{}))
+	server := httptest.NewServer(NewHandler(coordinator, &fakeGateway{}))
 	defer server.Close()
 	client := New(server.URL, time.Second)
 	_, err := client.Claim(context.Background(), attempt.ClaimCommand{ProjectID: "project", RunID: "run", AttemptID: "attempt", AttemptSequence: 1, WorkerID: "worker", ExecutorBuild: "build", ResourceClass: scheduling.ResourceSandbox, Capabilities: []dsl.Coordinate{{Type: "task.python", Version: 1}}, LeaseDuration: time.Minute})
@@ -96,9 +96,10 @@ func (value *fakeGateway) Load(_ context.Context, command runtimecontext.LoadCom
 	return runtimecontext.ExecutionContext{ContextVersion: 1, AttemptID: command.AttemptID}, nil
 }
 
-type fakeRegistry struct{ value scheduling.WorkerRegistration }
-
-func (value *fakeRegistry) RegisterWorker(_ context.Context, registration scheduling.WorkerRegistration) error {
-	value.value = registration
-	return nil
+func (value *fakeGateway) LoadBatch(ctx context.Context, commands []runtimecontext.LoadCommand) []runtimecontext.LoadResult {
+	results := make([]runtimecontext.LoadResult, len(commands))
+	for index, command := range commands {
+		results[index].Context, results[index].Err = value.Load(ctx, command)
+	}
+	return results
 }
