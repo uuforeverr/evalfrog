@@ -104,9 +104,8 @@ jobs:
           docker run --rm \
             --network evalfrog-local_authority \
             -e EVALFROG_M12_COMPOSE=1 \
-            -e EVALFROG_INTEGRATION_POSTGRES_DSN=postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable \
-            -e EVALFROG_M12_POSTGRES_DSN=postgres://evalfrog:evalfrog@postgres:5432/evalfrog?sslmode=disable \
-            -e EVALFROG_CACHE_REDIS_ADDRESS=redis-cache:6379 \
+            -e 'EVALFROG_INTEGRATION_MYSQL_DSN=root:evalfrog-root@tcp(mysql:3306)/' \
+            -e 'EVALFROG_M12_MYSQL_DSN=evalfrog:evalfrog@tcp(mysql:3306)/evalfrog_local' \
             -e EVALFROG_KAFKA_BROKERS=kafka:9092 \
             evalfrog-integration-runner \
             go test -tags=integration ./tests/integration

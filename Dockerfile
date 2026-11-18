@@ -1,7 +1,7 @@
 # Pin the build image to the Go release containing the reachable standard
 # library security fixes. A digest prevents a later mutable tag update from
 # silently changing the release candidate build.
-FROM golang:1.26.6-alpine@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS build
+FROM golang:1.26.11-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
 
 ARG VERSION=dev
 ARG COMMIT=none
