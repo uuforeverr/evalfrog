@@ -39,7 +39,7 @@ EvalFrog 用同一套 **Canonical JSON IR** 连接可视化画布与 Agent CLI�
 - Go `1.26+`（仅在本地运行 Go 命令或 CLI 时需要）
 
 ```bash
-git clone https://github.com/uu999/evalfrog.git
+git clone https://github.com/uuforeverr/evalfrog.git
 cd evalfrog
 ```
 
