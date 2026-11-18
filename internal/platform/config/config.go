@@ -27,14 +27,13 @@ type Config struct {
 	HTTP          HTTPConfig          `yaml:"http"`
 	Endpoints     EndpointConfig      `yaml:"endpoints"`
 	Shutdown      ShutdownConfig      `yaml:"shutdown"`
-	Postgres      PostgresConfig      `yaml:"postgres"`
-	Redis         RedisConfig         `yaml:"redis"`
+	MySQL         MySQLConfig         `yaml:"mysql"`
 	Kafka         KafkaConfig         `yaml:"kafka"`
 	Engine        EngineConfig        `yaml:"engine"`
 	Worker        WorkerConfig        `yaml:"worker"`
 	Sandbox       SandboxConfig       `yaml:"sandbox"`
 	Outbox        OutboxConfig        `yaml:"outbox"`
-	Cache         CacheConfig         `yaml:"cache"`
+	SnapshotL1    SnapshotL1Config    `yaml:"snapshot_l1"`
 	Migrations    MigrationConfig     `yaml:"migrations"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
@@ -46,6 +45,7 @@ type HTTPConfig struct {
 	SandboxRuntimeAddress string   `yaml:"sandbox_runtime_address"`
 	ReadHeaderTimeout     Duration `yaml:"read_header_timeout"`
 	IdleTimeout           Duration `yaml:"idle_timeout"`
+	RunUpdatePollInterval Duration `yaml:"run_update_poll_interval"`
 }
 
 type EndpointConfig struct {
@@ -56,30 +56,16 @@ type ShutdownConfig struct {
 	Timeout Duration `yaml:"timeout"`
 }
 
-type PostgresConfig struct {
+type MySQLConfig struct {
 	DSN                           string   `yaml:"dsn"`
-	Schema                        string   `yaml:"schema"`
+	Database                      string   `yaml:"database"`
 	PoolMin                       int32    `yaml:"pool_min"`
 	PoolMax                       int32    `yaml:"pool_max"`
 	ServerMaxConnections          int32    `yaml:"server_max_connections"`
 	ExpectedControlPlaneInstances int32    `yaml:"expected_control_plane_instances"`
-	StatementTimeout              Duration `yaml:"statement_timeout"`
 	LockTimeout                   Duration `yaml:"lock_timeout"`
-	IdleInTransactionTimeout      Duration `yaml:"idle_in_transaction_timeout"`
-}
-
-type RedisConfig struct {
-	Cache RedisEndpointConfig `yaml:"cache"`
-}
-
-type RedisEndpointConfig struct {
-	Address          string   `yaml:"address"`
-	Password         string   `yaml:"password"`
-	DB               int      `yaml:"db"`
-	KeyPrefix        string   `yaml:"key_prefix"`
-	OperationTimeout Duration `yaml:"operation_timeout"`
-	MaxRetries       int      `yaml:"max_retries"`
-	EvictionPolicy   string   `yaml:"eviction_policy"`
+	ConnMaxIdleTime               Duration `yaml:"conn_max_idle_time"`
+	ConnMaxLifetime               Duration `yaml:"conn_max_lifetime"`
 }
 
 type KafkaConfig struct {
@@ -162,13 +148,9 @@ type OutboxConfig struct {
 	ScanBatch               int      `yaml:"scan_batch"`
 }
 
-type CacheConfig struct {
-	ExecutionSnapshotTTL    Duration `yaml:"execution_snapshot_ttl"`
-	ActiveRunContextTTL     Duration `yaml:"active_run_context_ttl"`
-	TerminalRunContextTTL   Duration `yaml:"terminal_run_context_ttl"`
-	ActiveRunReadModelTTL   Duration `yaml:"active_run_read_model_ttl"`
-	TerminalRunReadModelTTL Duration `yaml:"terminal_run_read_model_ttl"`
-	DefinitionNegativeTTL   Duration `yaml:"definition_negative_ttl"`
+type SnapshotL1Config struct {
+	MaxEntries int   `yaml:"max_entries"`
+	MaxBytes   int64 `yaml:"max_bytes"`
 }
 
 type MigrationConfig struct {
@@ -298,8 +280,7 @@ func applyEnvironment(config *Config, lookup func(string) (string, bool)) {
 	}
 	setString("EVALFROG_HTTP_ADDRESS", &config.HTTP.ControlPlaneAddress)
 	setString("EVALFROG_CONTROL_PLANE_URL", &config.Endpoints.ControlPlaneURL)
-	setString("EVALFROG_POSTGRES_DSN", &config.Postgres.DSN)
-	setString("EVALFROG_CACHE_REDIS_ADDRESS", &config.Redis.Cache.Address)
+	setString("EVALFROG_MYSQL_DSN", &config.MySQL.DSN)
 	setString("EVALFROG_MIGRATIONS_DIR", &config.Migrations.Directory)
 	setString("EVALFROG_SANDBOX_IMAGE", &config.Sandbox.Image)
 	setString("EVALFROG_SANDBOX_RUNTIME", &config.Sandbox.Runtime)
@@ -330,6 +311,7 @@ func (config Config) Validate() error {
 	add(config.Shutdown.Timeout.Duration() <= 0, "shutdown.timeout must be positive")
 	add(config.HTTP.ReadHeaderTimeout.Duration() <= 0, "http.read_header_timeout must be positive")
 	add(config.HTTP.IdleTimeout.Duration() <= 0, "http.idle_timeout must be positive")
+	add(config.HTTP.RunUpdatePollInterval.Duration() <= 0, "http.run_update_poll_interval must be positive")
 	for name, address := range map[string]string{
 		"control_plane_address":   config.HTTP.ControlPlaneAddress,
 		"builtin_worker_address":  config.HTTP.BuiltinWorkerAddress,
@@ -341,25 +323,17 @@ func (config Config) Validate() error {
 	}
 	controlPlaneURL, endpointErr := url.ParseRequestURI(config.Endpoints.ControlPlaneURL)
 	add(endpointErr != nil || controlPlaneURL.Scheme == "" || controlPlaneURL.Host == "", "endpoints.control_plane_url must be an absolute HTTP URL")
-	add(config.Postgres.DSN == "", "postgres.dsn is required")
-	add(!validIdentifier(config.Postgres.Schema), "postgres.schema must be a safe SQL identifier")
+	add(config.MySQL.DSN == "", "mysql.dsn is required")
+	add(!validIdentifier(config.MySQL.Database), "mysql.database must be a safe SQL identifier")
 	profileToken := strings.ReplaceAll(config.Profile, "-", "_")
-	add(!strings.Contains(config.Postgres.Schema, profileToken), "postgres.schema must be isolated for profile %q", config.Profile)
-	add(config.Postgres.PoolMin < 0 || config.Postgres.PoolMax <= 0 || config.Postgres.PoolMin > config.Postgres.PoolMax, "postgres pool bounds are invalid")
-	allowedConnections := int32(math.Floor(float64(config.Postgres.ServerMaxConnections) * 0.70))
-	usedConnections := config.Postgres.PoolMax * config.Postgres.ExpectedControlPlaneInstances
-	add(config.Postgres.ServerMaxConnections <= 0 || config.Postgres.ExpectedControlPlaneInstances <= 0, "postgres capacity values must be positive")
-	add(usedConnections > allowedConnections, "postgres pool capacity %d exceeds 70%% safety budget %d", usedConnections, allowedConnections)
-
-	validateRedis := func(name string, value RedisEndpointConfig) {
-		add(value.Address == "", "redis.%s.address is required", name)
-		_, err := ParsePort(value.Address)
-		add(err != nil, "redis.%s.address is invalid: %v", name, err)
-		add(value.DB < 0, "redis.%s.db cannot be negative", name)
-		add(value.OperationTimeout.Duration() <= 0, "redis.%s.operation_timeout must be positive", name)
-		add(!strings.Contains(value.KeyPrefix, ":"+config.Profile+":"), "redis.%s.key_prefix must be isolated for profile %q", name, config.Profile)
-	}
-	validateRedis("cache", config.Redis.Cache)
+	add(!strings.Contains(config.MySQL.Database, profileToken), "mysql.database must be isolated for profile %q", config.Profile)
+	add(config.MySQL.PoolMin < 0 || config.MySQL.PoolMax <= 0 || config.MySQL.PoolMin > config.MySQL.PoolMax, "mysql pool bounds are invalid")
+	allowedConnections := int32(math.Floor(float64(config.MySQL.ServerMaxConnections) * 0.70))
+	usedConnections := config.MySQL.PoolMax * config.MySQL.ExpectedControlPlaneInstances
+	add(config.MySQL.ServerMaxConnections <= 0 || config.MySQL.ExpectedControlPlaneInstances <= 0, "mysql capacity values must be positive")
+	add(usedConnections > allowedConnections, "mysql pool capacity %d exceeds 70%% safety budget %d", usedConnections, allowedConnections)
+	add(config.MySQL.LockTimeout.Duration() <= 0, "mysql.lock_timeout must be positive")
+	add(config.MySQL.ConnMaxIdleTime.Duration() <= 0 || config.MySQL.ConnMaxLifetime.Duration() <= 0, "mysql connection lifetimes must be positive")
 
 	add(len(config.Kafka.Brokers) == 0, "kafka.brokers is required")
 	for _, broker := range config.Kafka.Brokers {
@@ -381,7 +355,7 @@ func (config Config) Validate() error {
 	add(config.Kafka.Topics.BuiltinTask.Partitions < config.Worker.ExpectedBuiltinConsumers, "builtin task partitions must cover expected consumers")
 	add(config.Kafka.Topics.SandboxTask.Partitions < config.Worker.ExpectedSandboxConsumers, "sandbox task partitions must cover expected consumers")
 	add(config.Kafka.Topics.RuntimeEvent.Partitions < config.Worker.ExpectedRuntimeEventConsumers, "runtime event partitions must cover expected consumers")
-	add(config.Engine.MaxInflight <= 0 || int32(config.Engine.MaxInflight) >= config.Postgres.PoolMax, "engine.max_inflight must be positive and leave PostgreSQL pool capacity for other control-plane modules")
+	add(config.Engine.MaxInflight <= 0 || int32(config.Engine.MaxInflight) >= config.MySQL.PoolMax, "engine.max_inflight must be positive and leave MySQL pool capacity for other control-plane modules")
 
 	heartbeat := config.Worker.HeartbeatInterval.Duration()
 	lease := config.Worker.LeaseDuration.Duration()
@@ -413,7 +387,7 @@ func (config Config) Validate() error {
 	add(config.Outbox.InboxRetention.Duration() <= minimumInboxRetention, "outbox inbox_retention must exceed runtime event retention + manual replay window")
 	add(config.Outbox.Batch <= 0 || config.Outbox.PublishConcurrency <= 0 || config.Outbox.ScanBatch <= 0, "outbox batch and concurrency values must be positive")
 	add(config.Outbox.RetryTimerInterval.Duration() <= 0 || config.Outbox.DeadlineScannerInterval.Duration() <= 0 || config.Outbox.ReconcilerInterval.Duration() <= 0, "recovery timer, deadline scanner and reconciler intervals must be positive")
-	add(config.Cache.ExecutionSnapshotTTL.Duration() <= 0 || config.Cache.ActiveRunContextTTL.Duration() <= 0, "cache TTL values must be positive")
+	add(config.SnapshotL1.MaxEntries <= 0 || config.SnapshotL1.MaxBytes <= 0, "snapshot_l1 limits must be positive")
 	add(config.Migrations.Directory == "", "migrations.directory is required")
 	add(config.Migrations.LockTimeout.Duration() <= 0, "migrations.lock_timeout must be positive")
 	add(!slices.Contains([]string{"debug", "info", "warn", "error"}, config.Observability.LogLevel), "observability.log_level is invalid")

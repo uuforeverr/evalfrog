@@ -43,6 +43,7 @@ type RunController interface {
 
 type RunReader interface {
 	GetRun(context.Context, string, string, string) (projection.RunView, error)
+	GetRunVersion(context.Context, string, string, string) (projection.RunVersion, error)
 	GetDiagnostics(context.Context, string, string, string) (projection.DiagnosticView, error)
 }
 
@@ -146,6 +147,10 @@ func (service Service) CancelRun(ctx context.Context, projectID, principalID, ru
 func (service Service) GetRun(ctx context.Context, projectID, principalID, runID string) (projection.RunView, error) {
 	return service.reader.GetRun(ctx, projectID, principalID, runID)
 }
+
+func (service Service) GetRunVersion(ctx context.Context, projectID, principalID, runID string) (projection.RunVersion, error) {
+	return service.reader.GetRunVersion(ctx, projectID, principalID, runID)
+}
 func (service Service) GetDiagnostics(ctx context.Context, projectID, principalID, runID string) (projection.DiagnosticView, error) {
 	return service.reader.GetDiagnostics(ctx, projectID, principalID, runID)
 }
@@ -156,6 +161,21 @@ func (service Service) ReplayRun(ctx context.Context, projectID, principalID, ru
 	return service.replayer.Replay(ctx, recovery.Wakeup{ProjectID: projectID, RunID: runID, AggregateID: aggregateID, EventType: eventing.RuntimeEventType(eventType)}, traceID, principalID)
 }
 func (service Service) NodeTypes() []catalog.NodeDescription { return service.catalog.Descriptions() }
+
+func (service Service) NodeTypesForRevision(revision string) ([]catalog.NodeDescription, bool) {
+	if revision == "" {
+		return service.NodeTypes(), true
+	}
+	if directory, ok := service.catalog.(interface {
+		DescriptionsForRevision(string) ([]catalog.NodeDescription, bool)
+	}); ok {
+		return directory.DescriptionsForRevision(revision)
+	}
+	if current, ok := service.catalog.(interface{ Revision() catalog.RevisionID }); ok && string(current.Revision()) == revision {
+		return service.NodeTypes(), true
+	}
+	return nil, false
+}
 func (service Service) Connections(ctx context.Context, projectID, principalID string) ([]resources.ConnectionSummary, error) {
 	return service.connections.List(ctx, projectID, principalID)
 }

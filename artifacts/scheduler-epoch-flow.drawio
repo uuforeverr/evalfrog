@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="scheduler-epoch">
+    <mxGraphModel dx="1200" dy="1800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1160" pageHeight="1980" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="EvalFrog Scheduler 一个 Epoch：Ready 如何进入 Kafka" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=18;fontStyle=1;fontColor=#1a365d;" vertex="1" parent="1">
+          <mxGeometry x="80" y="20" width="1000" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="G = Global Dispatch Window ≈ ceil(全部 Worker Slot × 1.2)，是全局容量，不是每个 Project 各有一个 Window" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=12;fontColor=#4a5568;" vertex="1" parent="1">
+          <mxGeometry x="80" y="52" width="1000" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="term-granted" value="&lt;b&gt;本轮已授予 granted[P]&lt;/b&gt;&lt;br&gt;BuildPlan 内存计数器，本 Epoch 已决定给 Project P 的新 Credit 条数，从 0 开始，每给一个名额 +1。&lt;br&gt;选择公式：level = inflight[P] + granted[P]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;spacingRight=10;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="90" width="340" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="term-pool" value="&lt;b&gt;Pool 还有窗口&lt;/b&gt;&lt;br&gt;Builtin / Sandbox 各自有 Pool Window ≈ ceil(该池 Slot × 1.2)。队头 Task 属于哪个池，该池剩余窗口必须 &gt; 0。这是资源可行性，不是第二套公平份额。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;spacingLeft=10;spacingRight=10;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="410" y="90" width="340" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="term-window" value="&lt;b&gt;Window 用完 = G 用完&lt;/b&gt;&lt;br&gt;remainingG = G − 全局 inflight。循环发完 remainingG 个新名额就停。剩余 Ready 仍留在 PostgreSQL。不是把每个 Project 队列消化完，也不是每 Project 一个 G。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=10;spacingRight=10;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="780" y="90" width="340" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s0" value="&lt;b&gt;0 Engine 改 Ready&lt;/b&gt;&lt;br&gt;收：Runtime Completion Event&lt;br&gt;做：CAS 把后继 Node 改为 ready&lt;br&gt;发：PostgreSQL node_runs.state=ready&lt;br&gt;&lt;i&gt;此时不写 Redis / Outbox / Kafka&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="230" width="600" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s1" value="&lt;b&gt;1 Rebalance · 拉权威快照&lt;/b&gt;&lt;br&gt;收：每活跃 Project 最多 G 条 Ready（快照上限，不是准入配额）；全部 queued+running；Redis 里未落库 Reservation&lt;br&gt;做：Pause Lane，合并 inflight = queued + running + 未确认 Reservation&lt;br&gt;发：AuthoritySnapshot。超份额 Project 仍会进快照，以便空闲借用" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="370" width="600" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s2" value="&lt;b&gt;2 BuildPlan · Progressive Filling&lt;/b&gt;&lt;br&gt;收：Snapshot、G、两个 Pool Window&lt;br&gt;做：反复把下一个名额给 level 最小、队头 Pool 仍有窗口的 Project，granted[P]++&lt;br&gt;停：remainingG=0，或没有合格候选&lt;br&gt;发：本轮 Credit 计划。不写 Outbox，不新建 Reservation" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="530" width="600" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s3" value="&lt;b&gt;3 RebuildLane + Grant&lt;/b&gt;&lt;br&gt;收：Plan 里的候选和 Credit 分配&lt;br&gt;做：把候选写入对应 Lane 的 Ready Index，按计划 Grant Credit，Activate Lane&lt;br&gt;发：Scheduling Redis（Ready Index + Credit）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="690" width="600" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s4" value="&lt;b&gt;4 AdmitLane · ReserveNext&lt;/b&gt;&lt;br&gt;收：该 Lane 的 Credit 和 Ready Index 队头&lt;br&gt;做：Lua 原子扣 1 个 Credit、弹出候选、按 attempt_id 写入 Inflight Reservation（TTL）&lt;br&gt;发：Reservation。&lt;b&gt;Reservation 在这一步才写入&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="830" width="600" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s5" value="&lt;b&gt;5 DispatchReady · 落库&lt;/b&gt;&lt;br&gt;收：Reservation 中的 Candidate&lt;br&gt;做：PostgreSQL 短事务 CAS：ready → queued + Attempt + node_task_outbox&lt;br&gt;发：权威 Outbox 行；成功后 Confirm Reservation" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="980" width="600" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="s6" value="&lt;b&gt;6 Task Relay · 进 Kafka&lt;/b&gt;&lt;br&gt;收：未 published 的 Outbox&lt;br&gt;做：ProduceSync，等 Broker ACK，再 Mark Published&lt;br&gt;发：Kafka Task。Worker Claim/ACK 是更后面的执行闭环" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=12;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1120" width="600" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note" value="未准入的 Ready 一直留在 PostgreSQL。下一 Epoch 重新拉快照。Scheduler 进程不保存本地队列。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;align=center;fontSize=12;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1260" width="600" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e01" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s0" target="s1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s1" target="s2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e23" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s2" target="s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e34" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s3" target="s4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e45" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s4" target="s5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e56" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="s5" target="s6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6n" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;dashed=1;" edge="1" parent="1" source="s6" target="note">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

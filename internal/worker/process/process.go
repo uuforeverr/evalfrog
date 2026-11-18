@@ -40,7 +40,7 @@ func RunProcess(ctx context.Context, arguments []string, resourceClass string, o
 		return 0
 	}
 	if options.Migrate {
-		fmt.Fprintln(errorOutput, "workers cannot run PostgreSQL migrations")
+		fmt.Fprintln(errorOutput, "workers cannot run MySQL migrations")
 		return 2
 	}
 	configuration, err := bootstrap.Load(options)
@@ -96,18 +96,18 @@ func RunProcess(ctx context.Context, arguments []string, resourceClass string, o
 		logger.Error("worker resource class is invalid", "resource_class", resourceClass)
 		return 1
 	}
-	// A fetched batch holds the Kafka rebalance gate until every record has
-	// reached Claim+ACK. Keep the theoretical worst-case claim time below half
-	// the rebalance window as well as below the local free-slot bound.
-	safePollLimit := int(configuration.Kafka.MaxPollInterval.Duration() / configuration.Worker.ClaimTimeout.Duration() / 2)
-	pollLimit := min(slots, configuration.Worker.TaskPollLimit, configuration.Kafka.TaskMaxPollRecords, max(1, safePollLimit))
+	// Task acquisition uses one bounded transaction and one offset commit for a
+	// single partition. Eight keeps the transaction short while allowing a
+	// high-slot Worker to refill from several assigned partitions.
+	const acquisitionBatchSize = 8
+	pollLimit := min(slots, configuration.Worker.TaskPollLimit, configuration.Kafka.TaskMaxPollRecords, acquisitionBatchSize)
 	kafkaClient, err := kafka.OpenConsumer(configuration.Kafka, service, "worker-"+resourceClass+"-v1", []config.KafkaTopicConfig{topic}, pollLimit)
 	if err != nil {
 		logger.Error("Kafka client creation failed", "error", err)
 		return 1
 	}
 	defer kafkaClient.Close()
-	readiness := health.New(configuration.Redis.Cache.OperationTimeout.Duration())
+	readiness := health.New(apiTimeout)
 	mustRegister(logger, readiness, "kafka", kafkaClient.Check)
 	mustRegister(logger, readiness, "control-plane", controlPlane.Check)
 	address := configuration.HTTP.BuiltinWorkerAddress
@@ -131,6 +131,7 @@ func RunProcess(ctx context.Context, arguments []string, resourceClass string, o
 	version := buildinfo.Current().Version + "+" + buildinfo.Current().Commit
 	workerRuntime, err := workerruntime.New(kafkaClient, controlPlane, catalog, workerruntime.Settings{
 		WorkerID: workerID, ExecutorBuild: version, ResourceClass: class, Slots: slots,
+		BatchSize:     pollLimit,
 		LeaseDuration: configuration.Worker.LeaseDuration.Duration(), HeartbeatInterval: configuration.Worker.HeartbeatInterval.Duration(),
 		ClaimTimeout: configuration.Worker.ClaimTimeout.Duration(), CompleteTimeout: configuration.Worker.CompleteTimeout.Duration(),
 	}, logger)
@@ -163,7 +164,7 @@ func RunSandboxRuntime(ctx context.Context, arguments []string, output, errorOut
 		return 0
 	}
 	if options.Migrate {
-		fmt.Fprintln(errorOutput, "sandbox runtime cannot run PostgreSQL migrations")
+		fmt.Fprintln(errorOutput, "sandbox runtime cannot run MySQL migrations")
 		return 2
 	}
 	configuration, err := bootstrap.Load(options)

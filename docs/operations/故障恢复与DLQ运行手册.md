@@ -4,11 +4,11 @@
 
 ## 不变量
 
-- PostgreSQL 的 Run、Node Run、Attempt、Termination Intent、Outbox/Inbox 是权威事实；
+- MySQL 的 Run、Node Run、Attempt、Termination Intent、Outbox/Inbox 是权威事实；
 - Retry Timer、Deadline Scanner、Attempt Reaper、Reconciler 只补发 durable wake-up；
 - Engine 是唯一能够推进 Workflow 语义状态的组件；
 - `trace_id` 是一次 Run 的根关联 ID，跨 Outbox、Kafka、Worker、Completion、Recovery 与 Audit 保留；
-- Cache Redis 丢失时回源 PostgreSQL，不影响任务创建和状态推进；
+- Snapshot L1 淘汰或进程重启时回源 MySQL，不影响任务创建和状态推进；
 - DLQ 是诊断线索，绝不是任意 Kafka 重放或状态修复入口。
 
 ## 告警与第一响应
@@ -17,8 +17,8 @@
 |---|---|---|---|
 | `evalfrog_outbox_oldest_unpublished_age_seconds` | Runtime + Node Task Outbox | Relay、Kafka 连接、Outbox Claim/Publish | Relay 重启后至少一次发布，Consumer Inbox 收敛重复 |
 | `evalfrog_kafka_consumer_lag_records` | Kafka Group/Topic offset | Consumer 健康、partition/rebalance、Worker Slot | 恢复消费后 Lag 下降；Offset 不代表 Run 成功 |
-| `evalfrog_attempt_lease_lost_total` | PostgreSQL Lease Reaper | Worker 崩溃、Heartbeat、执行时长、网络 | Lost → Engine 的独立 Recovery Budget；旧结果被 Fencing 拒绝 |
-| Queued-to-Running 延迟 | PostgreSQL Attempt 时间 | Kafka Lag、Worker Slot、Claim/API 延迟 | Worker 恢复或扩容后回落 |
+| `evalfrog_attempt_lease_lost_total` | MySQL Lease Reaper | Worker 崩溃、Heartbeat、执行时长、网络 | Lost → Engine 的独立 Recovery Budget；旧结果被 Fencing 拒绝 |
+| Queued-to-Running 延迟 | MySQL Attempt 时间 | Kafka Lag、Worker Slot、Claim/API 延迟 | Worker 恢复或扩容后回落 |
 | `evalfrog_runtime_recovery_wakeups_total` | Recovery Scanner/Emitter | 条件是否仍 actionable、扫描器日志、Outbox | 重复 wake-up 由 cooldown、Inbox 与 CAS 收敛 |
 
 阈值由当前 Profile 的 SLO、Worker 容量与业务时限制定；不得把示例秒数写入领域代码。告警触发后，先按 `project_id + run_id` 获取诊断并保留 `trace_id`，不要先重启全部组件或修改数据库。
@@ -29,7 +29,7 @@
 告警 / 用户报告 Run 卡住
   → GET Run，确认当前状态
   → run diagnose，读取 Attempt、Audit、trace_id
-  → 检查 Outbox Age / Kafka Lag / Worker / PostgreSQL 健康
+  → 检查 Outbox Age / Kafka Lag / Worker / MySQL 健康
   → 等待相应 Scanner 或 Relay 自动恢复
   → 仅在事实仍 actionable 且自动恢复未及时发生时，Project Admin 使用受限 Replay
 ```
@@ -41,7 +41,7 @@ evalfrog run diagnose --server <url> --token <token> --project <project-id> --ru
 evalfrog run replay --server <url> --token <token> --project <project-id> --run <run-id> --event-type attempt.lost --aggregate-id <attempt-id>
 ```
 
-Replay 只能选择 `run.created`、`run.cancel_requested`、`attempt.completed`、`attempt.lost`、`retry.due` 或 `run.deadline_reached`。服务端再次读取 PostgreSQL：目标不再 actionable 时返回未接受，这不是失败；若接受，服务端原子写 Audit 和 Runtime Outbox，Engine 之后正常收敛。禁止复制、伪造或手动投递原始 Kafka Payload。
+Replay 只能选择 `run.created`、`run.cancel_requested`、`attempt.completed`、`attempt.lost`、`retry.due` 或 `run.deadline_reached`。服务端再次读取 MySQL：目标不再 actionable 时返回未接受，这不是失败；若接受，服务端原子写 Audit 和 Runtime Outbox，Engine 之后正常收敛。禁止复制、伪造或手动投递原始 Kafka Payload。
 
 ## 常见故障处置
 
@@ -53,13 +53,13 @@ Replay 只能选择 `run.created`、`run.cancel_requested`、`attempt.completed`
 
 恢复 Broker/Consumer 后，Runtime Outbox Relay 会至少一次发布；Engine Inbox 与 CAS 允许重复和乱序。Kafka adapter 会对短暂网络错误、`COORDINATOR_NOT_AVAILABLE`、`NOT_COORDINATOR` 及需要 rejoin 的 rebalance/generation/member 信号退避、重新 Poll/join group，Control Plane 与 Worker 不应因此退出。对于长时间的 Lag，先确认 Outbox Age、Consumer group、partition 数和 Worker Slot；不可重试的认证、Topic、协议或 static member fencing 错误需要修复部署配置，不能无限重试。不要因为 Task 已在 Kafka 中就把数据库 Attempt 标记为完成。
 
-### Cache Redis 全量清空
+### Snapshot L1 冷启动或大量淘汰
 
-不需要手工修复 Runtime 状态。Execution Context 和 Run View Cache Miss 会从 PostgreSQL 回源并回填；读取延迟可能短暂升高。若读失败，检查 PostgreSQL 与授权，而不是将缓存临时改为权威写入。
+不需要手工修复 Runtime 状态。不可变 Snapshot 会从 MySQL 回源、解析并重新进入有界进程内 L1；Run Input、Effective Output 与 Run View 始终直接读取 MySQL。若读取延迟升高，检查 Snapshot L1 命中/字节指标、ContextBatch 聚合效果和 MySQL Pool Wait，不能把可变 Runtime 状态塞进进程缓存规避权威读取。
 
-### PostgreSQL 短时不可用或连接池耗尽
+### MySQL 短时不可用或连接池耗尽
 
-Control Plane、Relay、Scanner 和 Worker Gateway 会返回可重试基础设施错误；不要把这类错误记成业务失败。恢复数据库连接后，Outbox、Scanner 与 Reconciler 重新读取事实并继续。检查连接池总预算是否仍满足所有副本 `PoolMax` 总和不超过 PostgreSQL `max_connections` 的 70%。
+Control Plane、Relay、Scanner 和 Worker Gateway 会返回可重试基础设施错误；不要把这类错误记成业务失败。恢复数据库连接后，Outbox、Scanner 与 Reconciler 重新读取事实并继续。检查连接池总预算是否仍满足所有副本 `PoolMax` 总和不超过 MySQL `max_connections` 的 70%。
 
 ### Deadline 与 Cancel 竞争
 
@@ -68,7 +68,7 @@ Control Plane、Relay、Scanner 和 Worker Gateway 会返回可重试基础设�
 ## DLQ 处置
 
 1. 记录 Topic、partition、offset、消息 ID、`trace_id`（若存在）和错误类别；不要把输入、输出、Secret、Lease Token 或 stderr 复制到工单。
-2. 使用 Run Diagnostics 和对应结构化日志确认 PostgreSQL 是否已有 Attempt/Run 事实。
+2. 使用 Run Diagnostics 和对应结构化日志确认 MySQL 是否已有 Attempt/Run 事实。
 3. 若消息已经有对应权威事实，优先让 Relay/Consumer/Scanner 重试；若是当前 actionable 的唤醒遗漏，可使用受限 Replay。
 4. 若是协议/代码缺陷，修复并走正常发布；不得把原始 DLQ Payload 直接重新生产到 Runtime Topic。
 5. 处置完成后验证：不存在非法状态组合、重复 Effective Output、跨 Project 数据、未发布 Outbox 长期积压或 Fencing 被绕过。

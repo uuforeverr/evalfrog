@@ -8,6 +8,7 @@ import (
 type RevisionID string
 
 const BuiltinRevisionV1 RevisionID = "catalog-v1"
+const BuiltinRevisionV2 RevisionID = "catalog-v2"
 
 type NodeKind string
 

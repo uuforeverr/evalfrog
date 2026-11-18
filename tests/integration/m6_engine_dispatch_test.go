@@ -18,7 +18,7 @@ func TestM6EngineInitializationAtomicallyQueuesAttemptAndTaskOutbox(t *testing.T
 	var attemptID, taskID string
 	var attemptSequence uint32
 	err := harness.client.Pool().QueryRow(harness.ctx, `
-		SELECT n.state, a.attempt_id::text, o.task_id::text, a.attempt_seq
+		SELECT n.state, BIN_TO_UUID(a.attempt_id), BIN_TO_UUID(o.task_id), a.attempt_seq
 		FROM node_runs n
 		JOIN node_attempts a
 		  ON a.project_id=n.project_id AND a.run_id=n.run_id
@@ -26,7 +26,7 @@ func TestM6EngineInitializationAtomicallyQueuesAttemptAndTaskOutbox(t *testing.T
 		JOIN node_task_outbox o
 		  ON o.project_id=a.project_id AND o.run_id=a.run_id
 		 AND o.attempt_id=a.attempt_id
-		WHERE n.project_id=$1 AND n.run_id=$2 AND n.kind='task'`,
+		WHERE n.project_id=UUID_TO_BIN($1) AND n.run_id=UUID_TO_BIN($2) AND n.kind='task'`,
 		harness.projectID, run.ID).Scan(&nodeState, &attemptID, &taskID, &attemptSequence)
 	if err != nil {
 		t.Fatal(err)
@@ -37,13 +37,13 @@ func TestM6EngineInitializationAtomicallyQueuesAttemptAndTaskOutbox(t *testing.T
 	var readyCount, attemptCount, taskCount int
 	if err = harness.client.Pool().QueryRow(harness.ctx, `
 		SELECT
-		  count(*) FILTER (WHERE n.state='ready'),
+		  SUM(CASE WHEN n.state='ready' THEN 1 ELSE 0 END),
 		  count(DISTINCT a.attempt_id),
 		  count(DISTINCT o.task_id)
 		FROM node_runs n
 		LEFT JOIN node_attempts a ON a.project_id=n.project_id AND a.run_id=n.run_id
 		LEFT JOIN node_task_outbox o ON o.project_id=n.project_id AND o.run_id=n.run_id
-		WHERE n.project_id=$1 AND n.run_id=$2`, harness.projectID, run.ID).
+		WHERE n.project_id=UUID_TO_BIN($1) AND n.run_id=UUID_TO_BIN($2)`, harness.projectID, run.ID).
 		Scan(&readyCount, &attemptCount, &taskCount); err != nil {
 		t.Fatal(err)
 	}
@@ -63,8 +63,8 @@ func TestM6DirectDispatchMigrationRemovesSchedulerIndexes(t *testing.T) {
 		var exists bool
 		if err := harness.client.Pool().QueryRow(harness.ctx, `
 			SELECT EXISTS (
-			  SELECT 1 FROM pg_indexes
-			  WHERE schemaname=current_schema() AND indexname=$1
+			  SELECT 1 FROM information_schema.statistics
+			  WHERE table_schema=DATABASE() AND index_name=$1
 			)`, name).Scan(&exists); err != nil {
 			t.Fatal(err)
 		}

@@ -11,3 +11,8 @@
 .idea/
 .vscode/
 .DS_Store
+/.tmp_*
+/tmp_*.png
+/run-input-*.json
+/math-baidu*.json
+/math-baidu.session/

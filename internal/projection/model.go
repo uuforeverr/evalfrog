@@ -1,6 +1,6 @@
 // Package projection owns client-oriented, read-only Runtime views. It never
-// advances Engine state: PostgreSQL Runtime tables remain the authority and a
-// Redis projection may always be discarded and rebuilt from them.
+// advances Engine state: MySQL Runtime tables remain the authority; Runtime
+// views are rebuilt directly from those tables.
 package projection
 
 import (
@@ -81,8 +81,14 @@ type RunView struct {
 	Nodes           []NodeView         `json:"nodes"`
 }
 
+type RunVersion struct {
+	State        runtime.RunState `json:"state"`
+	StateVersion uint64           `json:"state_version"`
+}
+
 type Repository interface {
 	GetRunView(context.Context, string, string) (RunView, error)
+	GetRunVersion(context.Context, string, string) (RunVersion, error)
 	GetDiagnosticView(context.Context, string, string) (DiagnosticView, error)
 }
 
@@ -118,6 +124,16 @@ func (service Service) GetRun(ctx context.Context, projectID, principalID, runID
 		return RunView{}, runtime.ErrRunNotFound
 	}
 	return service.repository.GetRunView(ctx, projectID, runID)
+}
+
+func (service Service) GetRunVersion(ctx context.Context, projectID, principalID, runID string) (RunVersion, error) {
+	if err := service.access.Require(ctx, projectID, principalID, access.PermissionRunRead); err != nil {
+		return RunVersion{}, err
+	}
+	if projectID == "" || runID == "" {
+		return RunVersion{}, runtime.ErrRunNotFound
+	}
+	return service.repository.GetRunVersion(ctx, projectID, runID)
 }
 
 func (service Service) GetDiagnostics(ctx context.Context, projectID, principalID, runID string) (DiagnosticView, error) {

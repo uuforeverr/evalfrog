@@ -20,9 +20,11 @@ type Consumer interface {
 }
 
 type BatchMessage struct {
-	Topic   string
-	Key     string
-	Payload []byte
+	Topic     string
+	Key       string
+	Payload   []byte
+	Partition int32
+	Offset    int64
 }
 
 type DeliveryBatch interface {
@@ -34,6 +36,13 @@ type DeliveryBatch interface {
 
 type BatchConsumer interface {
 	ReceiveBatch(context.Context) (DeliveryBatch, error)
+}
+
+// PartitionBatchConsumer returns at most limit records from one partition.
+// A successful Ack commits that partition through the highest returned
+// offset; Nack commits none of them.
+type PartitionBatchConsumer interface {
+	ReceivePartitionBatch(context.Context, int) (DeliveryBatch, error)
 }
 
 type RuntimeEventHandler interface {

@@ -8,6 +8,7 @@ http:
   sandbox_runtime_address: ":8083"
   read_header_timeout: 5s
   idle_timeout: 60s
+  run_update_poll_interval: 2s
 
 endpoints:
   control_plane_url: "http://evalfrog-control-plane:8080"
@@ -15,26 +16,16 @@ endpoints:
 shutdown:
   timeout: 30s
 
-postgres:
-  dsn: "postgres://evalfrog@postgres:5432/evalfrog?sslmode=require"
-  schema: "evalfrog_production_default"
+mysql:
+  dsn: "evalfrog@tcp(mysql:3306)/evalfrog_production_default?tls=true"
+  database: "evalfrog_production_default"
   pool_min: 5
   pool_max: 20
   server_max_connections: 400
   expected_control_plane_instances: 8
-  statement_timeout: 5s
-  lock_timeout: 500ms
-  idle_in_transaction_timeout: 10s
-
-redis:
-  cache:
-    address: "cache-redis:6379"
-    password: ""
-    db: 0
-    key_prefix: "evalfrog:production-default:cache:"
-    operation_timeout: 500ms
-    max_retries: 0
-    eviction_policy: "allkeys-lfu"
+  lock_timeout: 1s
+  conn_max_idle_time: 5m
+  conn_max_lifetime: 30m
 
 kafka:
   brokers: ["kafka:9092"]
@@ -54,8 +45,8 @@ kafka:
   linger: 5ms
   batch_bytes: 65536
   topics:
-    builtin_task: {name: "workflow-task-builtin-v1", partitions: 12, retention: 24h}
-    sandbox_task: {name: "workflow-task-sandbox-v1", partitions: 12, retention: 24h}
+    builtin_task: {name: "workflow-task-builtin-v1", partitions: 48, retention: 24h}
+    sandbox_task: {name: "workflow-task-sandbox-v1", partitions: 24, retention: 24h}
     runtime_event: {name: "workflow-runtime-event-v1", partitions: 24, retention: 72h}
     dlq: {name: "workflow-dead-letter-v1", partitions: 12, retention: 336h}
 
@@ -108,13 +99,9 @@ outbox:
   reconciler_interval: 30s
   scan_batch: 100
 
-cache:
-  execution_snapshot_ttl: 24h
-  active_run_context_ttl: 6h
-  terminal_run_context_ttl: 1h
-  active_run_read_model_ttl: 15m
-  terminal_run_read_model_ttl: 1h
-  definition_negative_ttl: 30s
+snapshot_l1:
+  max_entries: 2048
+  max_bytes: 268435456
 
 migrations:
   directory: "migrations"

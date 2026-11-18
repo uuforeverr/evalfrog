@@ -27,6 +27,7 @@ type AttemptCoordinator interface {
 
 type ContextGateway interface {
 	Load(context.Context, runtimecontext.LoadCommand) (runtimecontext.ExecutionContext, error)
+	LoadBatch(context.Context, []runtimecontext.LoadCommand) []runtimecontext.LoadResult
 }
 
 type ResourceResolver interface {
@@ -48,6 +49,8 @@ func NewHandler(coordinator AttemptCoordinator, gateway ContextGateway, resolver
 	}
 	handler := &Handler{coordinator: coordinator, context: gateway, resources: resourceResolver, router: http.NewServeMux()}
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/claim", handler.claim)
+	handler.router.HandleFunc("POST /internal/v1/attempts/claim-batch", handler.claimBatch)
+	handler.router.HandleFunc("POST /internal/v1/attempts/context-batch", handler.loadContextBatch)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/heartbeat", handler.heartbeat)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/complete", handler.complete)
 	handler.router.HandleFunc("POST /internal/v1/attempts/{attempt_id}/context", handler.loadContext)
@@ -61,14 +64,37 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 }
 
 type claimRequest struct {
+	AttemptID       string                   `json:"attempt_id,omitempty"`
 	ProjectID       string                   `json:"project_id"`
 	RunID           string                   `json:"run_id"`
+	NodeRunID       string                   `json:"node_run_id,omitempty"`
 	AttemptSequence uint32                   `json:"attempt_sequence"`
 	WorkerID        string                   `json:"worker_id"`
 	ExecutorBuild   string                   `json:"executor_build"`
 	ResourceClass   scheduling.ResourceClass `json:"resource_class"`
 	Capabilities    []capability             `json:"capabilities"`
 	LeaseDurationMS int64                    `json:"lease_duration_ms"`
+}
+
+type claimBatchRequest struct {
+	Items []claimRequest `json:"items"`
+}
+
+type claimBatchItemResponse struct {
+	Lease *leaseResponse `json:"lease,omitempty"`
+	Code  string         `json:"code,omitempty"`
+}
+
+type contextBatchRequest struct {
+	Items []struct {
+		AttemptID string `json:"attempt_id"`
+		contextRequest
+	} `json:"items"`
+}
+
+type contextBatchItemResponse struct {
+	Context *runtimecontext.ExecutionContext `json:"context,omitempty"`
+	Code    string                           `json:"code,omitempty"`
 }
 
 type capability struct {
@@ -137,7 +163,7 @@ func (handler *Handler) claim(writer http.ResponseWriter, request *http.Request)
 		capabilities[index] = dsl.Coordinate{Type: value.Type, Version: value.Version}
 	}
 	lease, err := handler.coordinator.Claim(request.Context(), attempt.ClaimCommand{
-		ProjectID: body.ProjectID, RunID: body.RunID, AttemptID: request.PathValue("attempt_id"),
+		ProjectID: body.ProjectID, RunID: body.RunID, NodeRunID: body.NodeRunID, AttemptID: request.PathValue("attempt_id"),
 		AttemptSequence: body.AttemptSequence, WorkerID: body.WorkerID, ExecutorBuild: body.ExecutorBuild,
 		ResourceClass: body.ResourceClass, Capabilities: capabilities,
 		LeaseDuration: time.Duration(body.LeaseDurationMS) * time.Millisecond,
@@ -146,6 +172,84 @@ func (handler *Handler) claim(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	writeJSON(writer, http.StatusOK, leaseResponse{lease.Token, lease.Owner, lease.FencingToken, lease.ExpiresAt, lease.CancelRequested})
+}
+
+func (handler *Handler) claimBatch(writer http.ResponseWriter, request *http.Request) {
+	var body claimBatchRequest
+	if !decode(writer, request, &body) {
+		return
+	}
+	if len(body.Items) == 0 || len(body.Items) > 8 {
+		writeError(writer, http.StatusBadRequest, "INVALID_ARGUMENT", "claim batch size must be in [1,8]")
+		return
+	}
+	commands := make([]attempt.ClaimCommand, len(body.Items))
+	for index, item := range body.Items {
+		capabilities := make([]dsl.Coordinate, len(item.Capabilities))
+		for capabilityIndex, value := range item.Capabilities {
+			capabilities[capabilityIndex] = dsl.Coordinate{Type: value.Type, Version: value.Version}
+		}
+		commands[index] = attempt.ClaimCommand{ProjectID: item.ProjectID, RunID: item.RunID, NodeRunID: item.NodeRunID,
+			AttemptID: item.AttemptID, AttemptSequence: item.AttemptSequence, WorkerID: item.WorkerID,
+			ExecutorBuild: item.ExecutorBuild, ResourceClass: item.ResourceClass, Capabilities: capabilities,
+			LeaseDuration: time.Duration(item.LeaseDurationMS) * time.Millisecond}
+	}
+	coordinator, ok := handler.coordinator.(interface {
+		ClaimBatch(context.Context, []attempt.ClaimCommand) ([]attempt.ClaimResult, error)
+	})
+	var results []attempt.ClaimResult
+	var err error
+	if ok {
+		results, err = coordinator.ClaimBatch(request.Context(), commands)
+	} else {
+		results = make([]attempt.ClaimResult, len(commands))
+		for index, command := range commands {
+			results[index].Lease, results[index].Err = handler.coordinator.Claim(request.Context(), command)
+		}
+	}
+	if err != nil {
+		writeDomainError(writer, err)
+		return
+	}
+	response := make([]claimBatchItemResponse, len(results))
+	for index, result := range results {
+		if result.Err != nil {
+			response[index].Code = domainErrorCode(result.Err)
+			continue
+		}
+		lease := leaseResponse{result.Lease.Token, result.Lease.Owner, result.Lease.FencingToken, result.Lease.ExpiresAt, result.Lease.CancelRequested}
+		response[index].Lease = &lease
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": response})
+}
+
+func (handler *Handler) loadContextBatch(writer http.ResponseWriter, request *http.Request) {
+	var body contextBatchRequest
+	if !decode(writer, request, &body) {
+		return
+	}
+	if len(body.Items) == 0 || len(body.Items) > 8 {
+		writeError(writer, http.StatusBadRequest, "INVALID_ARGUMENT", "context batch size must be in [1,8]")
+		return
+	}
+	commands := make([]runtimecontext.LoadCommand, len(body.Items))
+	for index, item := range body.Items {
+		commands[index] = runtimecontext.LoadCommand{
+			ProjectID: item.ProjectID, RunID: item.RunID, AttemptID: item.AttemptID,
+			AttemptSequence: item.AttemptSequence, LeaseToken: item.LeaseToken, FencingToken: item.FencingToken,
+		}
+	}
+	results := handler.context.LoadBatch(request.Context(), commands)
+	response := make([]contextBatchItemResponse, len(results))
+	for index, result := range results {
+		if result.Err != nil {
+			response[index].Code = domainErrorCode(result.Err)
+			continue
+		}
+		value := result.Context
+		response[index].Context = &value
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": response})
 }
 
 func (handler *Handler) heartbeat(writer http.ResponseWriter, request *http.Request) {
@@ -264,6 +368,23 @@ func writeDomainError(writer http.ResponseWriter, err error) bool {
 	}
 	writeError(writer, status, code, err.Error())
 	return true
+}
+
+func domainErrorCode(err error) string {
+	switch {
+	case errors.Is(err, attempt.ErrNotFound):
+		return "ATTEMPT_NOT_FOUND"
+	case errors.Is(err, attempt.ErrNotCurrent):
+		return "ATTEMPT_NOT_CURRENT"
+	case errors.Is(err, attempt.ErrLeaseMismatch):
+		return "LEASE_MISMATCH"
+	case errors.Is(err, attempt.ErrStateConflict):
+		return "ATTEMPT_STATE_CONFLICT"
+	case errors.Is(err, attempt.ErrCapabilityMismatch):
+		return "CAPABILITY_MISMATCH"
+	default:
+		return "INFRASTRUCTURE_ERROR"
+	}
 }
 
 func writeError(writer http.ResponseWriter, status int, code, message string) {

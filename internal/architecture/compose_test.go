@@ -36,7 +36,7 @@ func TestWorkersReceiveNoAuthoritativeStoreCredentials(t *testing.T) {
 	}
 	for _, service := range []string{"worker-builtin", "worker-sandbox"} {
 		environment := document.Services[service].Environment
-		for _, forbidden := range []string{"EVALFROG_POSTGRES_DSN", "EVALFROG_SCHEDULING_REDIS_ADDRESS", "EVALFROG_CACHE_REDIS_ADDRESS"} {
+		for _, forbidden := range []string{"EVALFROG_MYSQL_DSN", "EVALFROG_SCHEDULING_REDIS_ADDRESS", "EVALFROG_CACHE_REDIS_ADDRESS"} {
 			if _, exists := environment[forbidden]; exists {
 				t.Fatalf("%s must not receive %s", service, forbidden)
 			}
@@ -64,10 +64,13 @@ func TestWorkersReceiveNoAuthoritativeStoreCredentials(t *testing.T) {
 	if !hasNetwork(document.Services["control-plane"].Networks, "edge") || !hasNetworkAlias(document.Services["control-plane"].Networks, "edge", "evalfrog-control-plane") {
 		t.Fatalf("control-plane must publish the deployment-level edge DNS alias: %v", document.Services["control-plane"].Networks)
 	}
-	for _, service := range []string{"postgres", "redis-cache"} {
+	for _, service := range []string{"mysql"} {
 		if !hasNetwork(document.Services[service].Networks, "authority") || hasNetwork(document.Services[service].Networks, "worker") {
 			t.Fatalf("%s must not be attached to the Worker network: %v", service, document.Services[service].Networks)
 		}
+	}
+	if _, exists := document.Services["redis-cache"]; exists {
+		t.Fatal("Redis must not be a deployment dependency")
 	}
 	for _, name := range []string{"authority", "worker"} {
 		if !document.Networks[name].Internal {
@@ -75,8 +78,8 @@ func TestWorkersReceiveNoAuthoritativeStoreCredentials(t *testing.T) {
 		}
 	}
 	for _, service := range []string{"control-plane", "migrate"} {
-		if _, exists := document.Services[service].Environment["EVALFROG_POSTGRES_DSN"]; !exists {
-			t.Fatalf("%s must receive the PostgreSQL DSN", service)
+		if _, exists := document.Services[service].Environment["EVALFROG_MYSQL_DSN"]; !exists {
+			t.Fatalf("%s must receive the MySQL DSN", service)
 		}
 	}
 }

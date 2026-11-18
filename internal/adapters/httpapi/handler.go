@@ -1,5 +1,5 @@
 // Package httpapi adapts the versioned HTTP/JSON command surface to Definition
-// application commands. It never accesses PostgreSQL directly.
+// application commands. It never accesses MySQL directly.
 package httpapi
 
 import (
@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
@@ -48,6 +49,7 @@ type Application interface {
 	CreateRun(context.Context, workflowapp.CreateRunCommand) (runtime.WorkflowRunRecord, error)
 	CancelRun(context.Context, string, string, string, string) (runtime.WorkflowRunRecord, bool, error)
 	GetRun(context.Context, string, string, string) (projection.RunView, error)
+	GetRunVersion(context.Context, string, string, string) (projection.RunVersion, error)
 	GetDiagnostics(context.Context, string, string, string) (projection.DiagnosticView, error)
 	ReplayRun(context.Context, string, string, string, string, string, string) (bool, error)
 	NodeTypes() []catalog.NodeDescription
@@ -60,10 +62,11 @@ type Handler struct {
 	ids           identity.Generator
 	router        *http.ServeMux
 	updates       RunUpdateSubscriber
+	runUpdatePoll time.Duration
 }
 
 func New(authenticator Authenticator, application Application, updates ...RunUpdateSubscriber) *Handler {
-	handler := &Handler{authenticator: authenticator, application: application, ids: identity.UUIDv7Generator{}, router: http.NewServeMux()}
+	handler := &Handler{authenticator: authenticator, application: application, ids: identity.UUIDv7Generator{}, router: http.NewServeMux(), runUpdatePoll: 2 * time.Second}
 	if len(updates) != 0 {
 		handler.updates = updates[0]
 	}
@@ -84,6 +87,13 @@ func New(authenticator Authenticator, application Application, updates ...RunUpd
 	handler.router.HandleFunc("POST /v1/projects/{project_id}/runs/{run_id}/cancel", handler.cancelRun)
 	handler.router.HandleFunc("GET /v1/node-types", handler.nodeTypes)
 	handler.router.HandleFunc("GET /v1/projects/{project_id}/connections", handler.connections)
+	return handler
+}
+
+func (handler *Handler) WithRunUpdatePollInterval(interval time.Duration) *Handler {
+	if interval > 0 {
+		handler.runUpdatePoll = interval
+	}
 	return handler
 }
 
@@ -374,7 +384,8 @@ func (handler *Handler) runEvents(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	runID, projectID := request.PathValue("run_id"), request.PathValue("project_id")
-	if _, err := handler.application.GetRun(request.Context(), projectID, principal.ID, runID); handler.writeResultError(writer, request, nil, err) {
+	initialVersion, err := handler.application.GetRunVersion(request.Context(), projectID, principal.ID, runID)
+	if handler.writeResultError(writer, request, nil, err) {
 		return
 	}
 	flusher, supported := writer.(http.Flusher)
@@ -387,8 +398,26 @@ func (handler *Handler) runEvents(writer http.ResponseWriter, request *http.Requ
 	writer.Header().Set("X-Accel-Buffering", "no")
 	fmt.Fprintf(writer, "event: ready\ndata: {\"run_id\":%q}\n\n", runID)
 	flusher.Flush()
+	if initialVersion.State.Terminal() {
+		return
+	}
 	messages, closeSubscription := handler.updates.SubscribeRunUpdates(request.Context(), runID)
 	defer closeSubscription()
+	poll := time.NewTimer(jitterRunUpdatePoll(handler.runUpdatePoll))
+	defer poll.Stop()
+	knownVersion := initialVersion.StateVersion
+	sendChange := func() bool {
+		version, versionErr := handler.application.GetRunVersion(request.Context(), projectID, principal.ID, runID)
+		if versionErr != nil {
+			return false
+		}
+		if version.StateVersion != knownVersion {
+			knownVersion = version.StateVersion
+			fmt.Fprintf(writer, "event: update\ndata: {\"run_id\":%q}\n\n", runID)
+			flusher.Flush()
+		}
+		return !version.State.Terminal()
+	}
 	for {
 		select {
 		case <-request.Context().Done():
@@ -397,10 +426,24 @@ func (handler *Handler) runEvents(writer http.ResponseWriter, request *http.Requ
 			if !available {
 				return
 			}
-			fmt.Fprintf(writer, "event: update\ndata: {\"run_id\":%q}\n\n", runID)
-			flusher.Flush()
+			if !sendChange() {
+				return
+			}
+		case <-poll.C:
+			if !sendChange() {
+				return
+			}
+			poll.Reset(jitterRunUpdatePoll(handler.runUpdatePoll))
 		}
 	}
+}
+
+func jitterRunUpdatePoll(base time.Duration) time.Duration {
+	spread := base / 10
+	if spread <= 0 {
+		return base
+	}
+	return base - spread + time.Duration(rand.Int64N(int64(2*spread)+1))
 }
 
 func (handler *Handler) cancelRun(writer http.ResponseWriter, request *http.Request) {
@@ -423,7 +466,24 @@ func (handler *Handler) nodeTypes(writer http.ResponseWriter, request *http.Requ
 	if _, ok := handler.authenticate(writer, request); !ok {
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"node_types": handler.application.NodeTypes()})
+	revision := request.URL.Query().Get("catalog_revision")
+	if revision == "" {
+		writeJSON(writer, http.StatusOK, map[string]any{"node_types": handler.application.NodeTypes()})
+		return
+	}
+	directory, ok := handler.application.(interface {
+		NodeTypesForRevision(string) ([]catalog.NodeDescription, bool)
+	})
+	if !ok {
+		handler.writeError(writer, request, http.StatusNotFound, definition.CodeCatalogUnavailable, "catalog revision is unavailable", nil)
+		return
+	}
+	descriptions, exists := directory.NodeTypesForRevision(revision)
+	if !exists {
+		handler.writeError(writer, request, http.StatusNotFound, definition.CodeCatalogUnavailable, "catalog revision is unavailable", nil)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"node_types": descriptions, "catalog_revision": revision})
 }
 
 func (handler *Handler) connections(writer http.ResponseWriter, request *http.Request) {

@@ -11,7 +11,7 @@ import (
 	runtimepkg "github.com/uu999/evalfrog/internal/runtime"
 )
 
-// Project scope is asserted at the actual PostgreSQL projection boundary. The
+// Project scope is asserted at the actual MySQL projection boundary. The
 // second principal has RunRead in its own Project, so this proves that a valid
 // permission in B cannot turn an ID from A into a readable resource.
 func TestM12RunAndDiagnosticsStayInsideProjectScope(t *testing.T) {

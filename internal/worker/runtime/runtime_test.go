@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -56,6 +57,78 @@ func TestClaimThenAckDoesNotWaitForExecutionAndNoSlotPrefetch(t *testing.T) {
 	_ = worker.Shutdown(context.Background())
 }
 
+func TestPartitionBatchClaimsAndLoadsEightTasksBeforeOneAck(t *testing.T) {
+	worker, consumer, attempts := runtimeFixture(t, EchoTestExecutor{Operation: dsl.Coordinate{Type: "task.python", Version: 1}})
+	worker.settings.BatchSize = 8
+	messages := make([]eventing.BatchMessage, 8)
+	for index := range messages {
+		var task eventing.TaskMessage
+		if err := json.Unmarshal(consumer.payload, &task); err != nil {
+			t.Fatal(err)
+		}
+		task.TaskID = fmt.Sprintf("task-%d", index)
+		task.NodeRunID = fmt.Sprintf("node-%d", index)
+		task.AttemptID = fmt.Sprintf("attempt-%d", index)
+		payload, err := task.MarshalJSONMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages[index] = eventing.BatchMessage{Topic: "tasks", Partition: 3, Offset: int64(index), Payload: payload}
+	}
+	delivery := &fakeBatchDelivery{messages: messages}
+	jobs, err := worker.acquireBatch(context.Background(), delivery, attempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 8 || attempts.claimBatches.Load() != 1 || attempts.loadBatches.Load() != 1 || delivery.acks.Load() != 1 {
+		t.Fatalf("jobs=%d claim_batches=%d load_batches=%d acks=%d", len(jobs), attempts.claimBatches.Load(), attempts.loadBatches.Load(), delivery.acks.Load())
+	}
+}
+
+func TestPartitionBatchTechnicalClaimFailureNacksWholeBatch(t *testing.T) {
+	worker, consumer, attempts := runtimeFixture(t, EchoTestExecutor{Operation: dsl.Coordinate{Type: "task.python", Version: 1}})
+	worker.settings.BatchSize = 8
+	attempts.claimBatchErr = errors.New("mysql unavailable")
+	delivery := &fakeBatchDelivery{messages: []eventing.BatchMessage{{Topic: "tasks", Partition: 1, Offset: 7, Payload: consumer.payload}}}
+	if _, err := worker.acquireBatch(context.Background(), delivery, attempts); err == nil || delivery.nacks.Load() != 1 || delivery.acks.Load() != 0 {
+		t.Fatalf("err=%v nacks=%d acks=%d", err, delivery.nacks.Load(), delivery.acks.Load())
+	}
+}
+
+func TestRunUsesOnePollerAndDispatchesBatchIntoAvailableSlots(t *testing.T) {
+	worker, consumer, attempts := runtimeFixture(t, EchoTestExecutor{Operation: dsl.Coordinate{Type: "task.python", Version: 1}})
+	worker.settings.BatchSize = 2
+	worker.settings.Slots = 2
+	var second eventing.TaskMessage
+	if err := json.Unmarshal(consumer.payload, &second); err != nil {
+		t.Fatal(err)
+	}
+	second.TaskID, second.NodeRunID, second.AttemptID = "task-2", "node-2", "attempt-2"
+	secondPayload, _ := second.MarshalJSONMessage()
+	consumer.batch = &fakeBatchDelivery{messages: []eventing.BatchMessage{{Partition: 1, Offset: 1, Payload: consumer.payload}, {Partition: 1, Offset: 2, Payload: secondPayload}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	deadline := time.After(time.Second)
+	for attempts.completes.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("batch tasks did not complete")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if consumer.batch.acks.Load() != 1 || attempts.claimBatches.Load() != 1 || attempts.loadBatches.Load() != 1 {
+		t.Fatalf("acks=%d claim_batches=%d load_batches=%d", consumer.batch.acks.Load(), attempts.claimBatches.Load(), attempts.loadBatches.Load())
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("batch runtime did not stop")
+	}
+}
+
 func TestDuplicateStaleAndPoisonDeliveriesAreContained(t *testing.T) {
 	executor := EchoTestExecutor{Operation: dsl.Coordinate{Type: "task.python", Version: 1}}
 	worker, consumer, attempts := runtimeFixture(t, executor)
@@ -102,7 +175,7 @@ func TestWrongResourceClassAndCapabilityMismatchGoToDeadLetter(t *testing.T) {
 
 func TestContextFailureDefersToLeaseRecovery(t *testing.T) {
 	worker, _, attempts := runtimeFixture(t, EchoTestExecutor{Operation: dsl.Coordinate{Type: "task.python", Version: 1}})
-	attempts.loadErr = errors.New("postgres down")
+	attempts.loadErr = errors.New("mysql down")
 	if err := worker.receiveAndExecute(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -236,6 +309,23 @@ func TestCatalogResourceClassAndSettingsValidation(t *testing.T) {
 
 type fakeDelivery struct{ owner *fakeConsumer }
 
+type fakeBatchDelivery struct {
+	messages           []eventing.BatchMessage
+	acks, nacks, dlqs  atomic.Int32
+	ackErr, deadLetter error
+}
+
+func (value *fakeBatchDelivery) Messages() []eventing.BatchMessage { return value.messages }
+func (value *fakeBatchDelivery) Ack(context.Context) error {
+	value.acks.Add(1)
+	return value.ackErr
+}
+func (value *fakeBatchDelivery) Nack() { value.nacks.Add(1) }
+func (value *fakeBatchDelivery) DeadLetter(context.Context, int, string) error {
+	value.dlqs.Add(1)
+	return value.deadLetter
+}
+
 func (value *fakeDelivery) Topic() string   { return "tasks" }
 func (value *fakeDelivery) Key() string     { return "attempt" }
 func (value *fakeDelivery) Payload() []byte { return append([]byte(nil), value.owner.payload...) }
@@ -254,6 +344,7 @@ type fakeConsumer struct {
 	receives, acks, nacks, dlqs atomic.Int32
 	ackErr                      error
 	mu                          sync.Mutex
+	batch                       *fakeBatchDelivery
 }
 
 func (value *fakeConsumer) Receive(ctx context.Context) (eventing.Delivery, error) {
@@ -265,17 +356,27 @@ func (value *fakeConsumer) Receive(ctx context.Context) (eventing.Delivery, erro
 	return &fakeDelivery{owner: value}, nil
 }
 
+func (value *fakeConsumer) ReceivePartitionBatch(ctx context.Context, _ int) (eventing.DeliveryBatch, error) {
+	value.receives.Add(1)
+	if value.receives.Load() > 1 || value.batch == nil {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return value.batch, nil
+}
+
 type fakeAttempts struct {
-	claimErr, heartbeatErr, completeErr error
-	loadErr                             error
-	completes                           atomic.Int32
-	loads                               atomic.Int32
-	completed                           chan struct{}
-	heartbeatCalled                     chan struct{}
-	operation                           dsl.Coordinate
-	attemptTimeout                      time.Duration
-	complete                            attempt.CompleteCommand
-	claimLease, heartbeatLease          attempt.Lease
+	claimErr, claimBatchErr, heartbeatErr, completeErr error
+	loadErr                                            error
+	completes                                          atomic.Int32
+	loads                                              atomic.Int32
+	completed                                          chan struct{}
+	heartbeatCalled                                    chan struct{}
+	operation                                          dsl.Coordinate
+	attemptTimeout                                     time.Duration
+	complete                                           attempt.CompleteCommand
+	claimLease, heartbeatLease                         attempt.Lease
+	claimBatches, loadBatches                          atomic.Int32
 }
 
 func (value *fakeAttempts) Claim(context.Context, attempt.ClaimCommand) (attempt.Lease, error) {
@@ -287,6 +388,17 @@ func (value *fakeAttempts) Claim(context.Context, attempt.ClaimCommand) (attempt
 		lease = attempt.Lease{Token: "lease", Owner: "worker", FencingToken: 1, ExpiresAt: time.Now().Add(time.Minute)}
 	}
 	return lease, nil
+}
+func (value *fakeAttempts) ClaimBatch(ctx context.Context, commands []attempt.ClaimCommand) ([]attempt.ClaimResult, error) {
+	value.claimBatches.Add(1)
+	if value.claimBatchErr != nil {
+		return nil, value.claimBatchErr
+	}
+	results := make([]attempt.ClaimResult, len(commands))
+	for index, command := range commands {
+		results[index].Lease, results[index].Err = value.Claim(ctx, command)
+	}
+	return results, nil
 }
 func (value *fakeAttempts) Heartbeat(context.Context, attempt.HeartbeatCommand) (attempt.Lease, error) {
 	select {
@@ -318,6 +430,14 @@ func (value *fakeAttempts) Load(context.Context, runtimecontext.LoadCommand) (ru
 		timeout = time.Second
 	}
 	return runtimecontext.ExecutionContext{Operation: dsl.Operation{Type: coordinate.Type, Version: coordinate.Version}, ExecutionPolicy: dsl.ExecutionPolicy{AttemptTimeoutMS: uint64(timeout.Milliseconds())}, OutputContract: map[dsl.PortName]dsl.DataType{"result": dsl.TypeInteger}, Inputs: map[string]json.RawMessage{"result": json.RawMessage(`7`)}}, nil
+}
+func (value *fakeAttempts) LoadBatch(ctx context.Context, commands []runtimecontext.LoadCommand) ([]runtimecontext.LoadResult, error) {
+	value.loadBatches.Add(1)
+	results := make([]runtimecontext.LoadResult, len(commands))
+	for index, command := range commands {
+		results[index].Context, results[index].Err = value.Load(ctx, command)
+	}
+	return results, nil
 }
 
 type resultExecutor struct {

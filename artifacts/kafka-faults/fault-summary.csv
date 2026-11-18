@@ -1,0 +1,8 @@
+key,value
+profile,local-infrastructure-production-semantics
+samples_per_window,100
+fault_count,400
+control_count,400
+lease_duration,1m0s
+worker_crash_recovery_p95_ms,63706.592
+invariant_violations,0

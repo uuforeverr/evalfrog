@@ -35,7 +35,7 @@ func (engine *Engine) SnapshotState() State {
 }
 
 func RestoreBuiltinV1(snapshot Snapshot, state State) (*Engine, error) {
-	return Restore(snapshot, state, dsl.BuiltinV1Contract(), dsl.BuiltinV1Compatibility())
+	return Restore(snapshot, state, dsl.BuiltinV2Contract(), dsl.BuiltinV2Compatibility())
 }
 
 func Restore(snapshot Snapshot, state State, contract dsl.Contract, compatibility dsl.CompatibilityChecker) (*Engine, error) {

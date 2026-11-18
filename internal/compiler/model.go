@@ -13,6 +13,7 @@ import (
 )
 
 const VersionV1 = "compiler-v1"
+const VersionV2 = "compiler-v2"
 
 type NodeCatalog interface {
 	Revision() catalog.RevisionID

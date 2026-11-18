@@ -1,12 +1,11 @@
-// Package context owns read-only, cache-aside execution-context assembly for
-// workers. PostgreSQL remains authoritative; cache failures only reduce speed.
+// Package context owns read-only execution-context assembly for workers.
+// MySQL remains authoritative; only immutable parsed Snapshots use process L1.
 package context
 
 import (
 	stdcontext "context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/uu999/evalfrog/internal/dsl"
 	"github.com/uu999/evalfrog/internal/scheduling"
@@ -18,12 +17,22 @@ type LoadCommand struct {
 	FencingToken                            uint64
 }
 
+type LoadResult struct {
+	Context ExecutionContext
+	Err     error
+}
+
 type Metadata struct {
 	ProjectID, RunID, NodeRunID, ExecutionNodeID, AttemptID, SnapshotID string
 	AttemptSequence                                                     uint32
 	Operation                                                           dsl.Coordinate
 	ResourceClass                                                       scheduling.ResourceClass
 	ResolvedInputs                                                      map[string]json.RawMessage
+}
+
+type MetadataResult struct {
+	Metadata Metadata
+	Err      error
 }
 
 type ExecutionContext struct {
@@ -48,86 +57,136 @@ type ExecutionContext struct {
 }
 
 type Repository interface {
-	LoadAttemptMetadata(stdcontext.Context, LoadCommand) (Metadata, error)
+	LoadAttemptMetadataBatch(stdcontext.Context, []LoadCommand) []MetadataResult
 	LoadSnapshotDSL(stdcontext.Context, string, string) (json.RawMessage, error)
-	LoadRunInput(stdcontext.Context, string, string) (json.RawMessage, error)
-	LoadEffectiveOutput(stdcontext.Context, string, string, string) (json.RawMessage, error)
-}
-
-type Cache interface {
-	GetSnapshot(stdcontext.Context, string) (json.RawMessage, bool)
-	PutSnapshot(stdcontext.Context, string, json.RawMessage, time.Duration)
-	GetRunInput(stdcontext.Context, string) (json.RawMessage, bool)
-	PutRunInput(stdcontext.Context, string, json.RawMessage, time.Duration)
-	GetEffectiveOutput(stdcontext.Context, string, string) (json.RawMessage, bool)
-	PutEffectiveOutput(stdcontext.Context, string, string, json.RawMessage, time.Duration)
-}
-
-// CacheMetrics is deliberately a small outbound port. It records only
-// bounded cache-part names and hit/miss outcomes, never run or tenant IDs.
-type CacheMetrics interface {
-	ObserveExecutionContextCache(kind, outcome string)
+	LoadRunContext(stdcontext.Context, string, string, []string) (json.RawMessage, map[string]json.RawMessage, error)
 }
 
 type Gateway struct {
-	repository  Repository
-	cache       Cache
-	snapshotTTL time.Duration
-	runTTL      time.Duration
-	metrics     CacheMetrics
+	repository Repository
+	snapshots  *SnapshotCache
 }
 
-func NewGateway(repository Repository, cache Cache, snapshotTTL, runTTL time.Duration, cacheMetrics ...CacheMetrics) (*Gateway, error) {
-	if repository == nil || cache == nil || snapshotTTL <= 0 || runTTL <= 0 {
-		return nil, fmt.Errorf("execution context repository, cache and TTLs are required")
+func NewGateway(repository Repository, snapshots *SnapshotCache) (*Gateway, error) {
+	if repository == nil || snapshots == nil {
+		return nil, fmt.Errorf("execution context repository and snapshot L1 are required")
 	}
-	if len(cacheMetrics) > 1 {
-		return nil, fmt.Errorf("at most one execution context cache metrics observer is allowed")
-	}
-	var metric CacheMetrics
-	if len(cacheMetrics) == 1 {
-		metric = cacheMetrics[0]
-	}
-	return &Gateway{repository: repository, cache: cache, snapshotTTL: snapshotTTL, runTTL: runTTL, metrics: metric}, nil
+	return &Gateway{repository: repository, snapshots: snapshots}, nil
 }
 
 func (gateway *Gateway) Load(ctx stdcontext.Context, command LoadCommand) (ExecutionContext, error) {
-	if command.ProjectID == "" || command.RunID == "" || command.AttemptID == "" || command.AttemptSequence == 0 || command.LeaseToken == "" || command.FencingToken == 0 {
-		return ExecutionContext{}, fmt.Errorf("execution context attempt coordinate and lease are required")
+	result := gateway.LoadBatch(ctx, []LoadCommand{command})[0]
+	return result.Context, result.Err
+}
+
+func (gateway *Gateway) LoadBatch(ctx stdcontext.Context, commands []LoadCommand) []LoadResult {
+	results := make([]LoadResult, len(commands))
+	metadata := make([]Metadata, len(commands))
+	snapshots := make([]*parsedSnapshot, len(commands))
+	type runGroup struct {
+		projectID string
+		runID     string
+		items     []int
+		outputs   map[string]struct{}
+		input     json.RawMessage
+		values    map[string]json.RawMessage
+		err       error
 	}
-	metadata, err := gateway.repository.LoadAttemptMetadata(ctx, command)
+	groups := make(map[string]*runGroup)
+	for index, command := range commands {
+		if err := validateLoadCommand(command); err != nil {
+			results[index].Err = err
+			continue
+		}
+	}
+	validCommands := make([]LoadCommand, 0, len(commands))
+	validIndexes := make([]int, 0, len(commands))
+	for index, command := range commands {
+		if results[index].Err == nil {
+			validCommands = append(validCommands, command)
+			validIndexes = append(validIndexes, index)
+		}
+	}
+	if len(validCommands) == 0 {
+		return results
+	}
+	metadataResults := gateway.repository.LoadAttemptMetadataBatch(ctx, validCommands)
+	if len(metadataResults) != len(validCommands) {
+		for _, index := range validIndexes {
+			results[index].Err = fmt.Errorf("execution context metadata batch returned an invalid result count")
+		}
+		return results
+	}
+	for batchIndex, index := range validIndexes {
+		value, err := metadataResults[batchIndex].Metadata, metadataResults[batchIndex].Err
+		if err != nil {
+			results[index].Err = err
+			continue
+		}
+		metadata[index] = value
+		snapshot, err := gateway.snapshots.Load(ctx, value.ProjectID+"\x00"+value.SnapshotID, func(loadCtx stdcontext.Context) (json.RawMessage, error) {
+			return gateway.repository.LoadSnapshotDSL(loadCtx, value.ProjectID, value.SnapshotID)
+		})
+		if err != nil {
+			results[index].Err = err
+			continue
+		}
+		node, err := snapshot.node(value)
+		if err != nil {
+			results[index].Err = err
+			continue
+		}
+		snapshots[index] = snapshot
+		key := value.ProjectID + "\x00" + value.RunID
+		group := groups[key]
+		if group == nil {
+			group = &runGroup{projectID: value.ProjectID, runID: value.RunID, outputs: make(map[string]struct{})}
+			groups[key] = group
+		}
+		group.items = append(group.items, index)
+		for _, binding := range node.Inputs {
+			if binding.Kind != dsl.BindingNodeOutput || binding.Output == nil {
+				continue
+			}
+			upstreamID := string(binding.Output.NodeID)
+			if upstreamID != string(snapshot.entryNodeID) || binding.Output.Name != "workflow_input" {
+				group.outputs[upstreamID] = struct{}{}
+			}
+		}
+	}
+	for _, group := range groups {
+		ids := make([]string, 0, len(group.outputs))
+		for id := range group.outputs {
+			ids = append(ids, id)
+		}
+		group.input, group.values, group.err = gateway.repository.LoadRunContext(ctx, group.projectID, group.runID, ids)
+	}
+	for _, group := range groups {
+		for _, index := range group.items {
+			if group.err != nil {
+				results[index].Err = group.err
+				continue
+			}
+			results[index].Context, results[index].Err = assemble(commands[index], metadata[index], snapshots[index], group.input, group.values)
+		}
+	}
+	return results
+}
+
+func validateLoadCommand(command LoadCommand) error {
+	if command.ProjectID == "" || command.RunID == "" || command.AttemptID == "" || command.AttemptSequence == 0 || command.LeaseToken == "" || command.FencingToken == 0 {
+		return fmt.Errorf("execution context attempt coordinate and lease are required")
+	}
+	return nil
+}
+
+func assemble(command LoadCommand, metadata Metadata, snapshot *parsedSnapshot, workflowInput json.RawMessage, outputs map[string]json.RawMessage) (ExecutionContext, error) {
+	if !json.Valid(workflowInput) {
+		return ExecutionContext{}, fmt.Errorf("authoritative workflow input is not valid JSON")
+	}
+	node, err := snapshot.node(metadata)
 	if err != nil {
 		return ExecutionContext{}, err
-	}
-	snapshotJSON, ok := gateway.cache.GetSnapshot(ctx, metadata.SnapshotID)
-	node, entryNodeID, decodeErr := executionSnapshot(snapshotJSON, metadata)
-	if !ok || decodeErr != nil {
-		gateway.observeCache("snapshot", "miss")
-		snapshotJSON, err = gateway.repository.LoadSnapshotDSL(ctx, metadata.ProjectID, metadata.SnapshotID)
-		if err != nil {
-			return ExecutionContext{}, err
-		}
-		node, entryNodeID, err = executionSnapshot(snapshotJSON, metadata)
-		if err != nil {
-			return ExecutionContext{}, err
-		}
-		gateway.cache.PutSnapshot(ctx, metadata.SnapshotID, snapshotJSON, gateway.snapshotTTL)
-	} else {
-		gateway.observeCache("snapshot", "hit")
-	}
-	workflowInput, ok := gateway.cache.GetRunInput(ctx, metadata.RunID)
-	if !ok || !json.Valid(workflowInput) {
-		gateway.observeCache("run_input", "miss")
-		workflowInput, err = gateway.repository.LoadRunInput(ctx, metadata.ProjectID, metadata.RunID)
-		if err != nil {
-			return ExecutionContext{}, err
-		}
-		if !json.Valid(workflowInput) {
-			return ExecutionContext{}, fmt.Errorf("authoritative workflow input is not valid JSON")
-		}
-		gateway.cache.PutRunInput(ctx, metadata.RunID, workflowInput, gateway.runTTL)
-	} else {
-		gateway.observeCache("run_input", "hit")
 	}
 	upstream := make(map[string]json.RawMessage)
 	for _, binding := range node.Inputs {
@@ -138,26 +197,13 @@ func (gateway *Gateway) Load(ctx stdcontext.Context, command LoadCommand) (Execu
 		if _, exists := upstream[upstreamID]; exists {
 			continue
 		}
-		if upstreamID == string(entryNodeID) && binding.Output.Name == "workflow_input" {
-			// The entry node is a control node: it has no attempt and therefore
-			// no row in node_output_values. Its workflow_input effective output
-			// is the authoritative run input, which is already loaded above.
+		if upstreamID == string(snapshot.entryNodeID) && binding.Output.Name == "workflow_input" {
 			upstream[upstreamID] = cloneRaw(workflowInput)
 			continue
 		}
-		value, hit := gateway.cache.GetEffectiveOutput(ctx, metadata.RunID, upstreamID)
-		if !hit || !json.Valid(value) {
-			gateway.observeCache("effective_output", "miss")
-			value, err = gateway.repository.LoadEffectiveOutput(ctx, metadata.ProjectID, metadata.RunID, upstreamID)
-			if err != nil {
-				return ExecutionContext{}, err
-			}
-			if !json.Valid(value) {
-				return ExecutionContext{}, fmt.Errorf("authoritative output for node %q is not valid JSON", upstreamID)
-			}
-			gateway.cache.PutEffectiveOutput(ctx, metadata.RunID, upstreamID, value, gateway.runTTL)
-		} else {
-			gateway.observeCache("effective_output", "hit")
+		value, exists := outputs[upstreamID]
+		if !exists || !json.Valid(value) {
+			return ExecutionContext{}, fmt.Errorf("authoritative output for node %q is unavailable or invalid", upstreamID)
 		}
 		upstream[upstreamID] = cloneRaw(value)
 	}
@@ -167,39 +213,18 @@ func (gateway *Gateway) Load(ctx stdcontext.Context, command LoadCommand) (Execu
 		AttemptID: metadata.AttemptID, AttemptSequence: metadata.AttemptSequence,
 		LeaseToken: command.LeaseToken, FencingToken: command.FencingToken,
 		SnapshotID: metadata.SnapshotID, ResourceClass: metadata.ResourceClass,
-		Operation: node.Operation, ExecutionPolicy: node.ExecutionPolicy, OutputContract: node.Outputs,
+		Operation: cloneOperation(node.Operation), ExecutionPolicy: clonePolicy(node.ExecutionPolicy), OutputContract: cloneOutputs(node.Outputs),
 		WorkflowInput: cloneRaw(workflowInput), Inputs: cloneMap(metadata.ResolvedInputs),
 		UpstreamOutputs: upstream, ResourceMaterial: map[string]json.RawMessage{},
 	}, nil
 }
 
-func (gateway *Gateway) observeCache(kind, outcome string) {
-	if gateway.metrics != nil {
-		gateway.metrics.ObserveExecutionContextCache(kind, outcome)
-	}
-}
-
-func executionSnapshot(snapshotJSON json.RawMessage, metadata Metadata) (*dsl.Node, dsl.NodeID, error) {
-	var document dsl.Document
-	if err := json.Unmarshal(snapshotJSON, &document); err != nil {
-		return nil, "", fmt.Errorf("decode execution snapshot DSL: %w", err)
-	}
-	for index := range document.Nodes {
-		node := &document.Nodes[index]
-		if string(node.ID) != metadata.ExecutionNodeID {
-			continue
-		}
-		if node.Operation.Coordinate() != metadata.Operation {
-			return nil, "", fmt.Errorf("execution snapshot and persisted node coordinate disagree")
-		}
-		return node, document.EntryNodeID, nil
-	}
-	return nil, "", fmt.Errorf("execution snapshot and persisted node coordinate disagree")
-}
-
 func executionNode(snapshotJSON json.RawMessage, metadata Metadata) (*dsl.Node, error) {
-	node, _, err := executionSnapshot(snapshotJSON, metadata)
-	return node, err
+	snapshot, err := parseSnapshot(snapshotJSON)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.node(metadata)
 }
 
 func cloneRaw(value json.RawMessage) json.RawMessage { return append(json.RawMessage(nil), value...) }
@@ -210,4 +235,26 @@ func cloneMap(values map[string]json.RawMessage) map[string]json.RawMessage {
 		result[key] = cloneRaw(value)
 	}
 	return result
+}
+
+func cloneOperation(value dsl.Operation) dsl.Operation {
+	value.Config = cloneMap(value.Config)
+	return value
+}
+
+func cloneOutputs(values map[dsl.PortName]dsl.DataType) map[dsl.PortName]dsl.DataType {
+	result := make(map[dsl.PortName]dsl.DataType, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func clonePolicy(value dsl.ExecutionPolicy) dsl.ExecutionPolicy {
+	value.RetryableErrorCodes = append([]string(nil), value.RetryableErrorCodes...)
+	if value.RetryBackoff != nil {
+		backoff := *value.RetryBackoff
+		value.RetryBackoff = &backoff
+	}
+	return value
 }

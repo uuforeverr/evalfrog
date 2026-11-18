@@ -254,3 +254,7 @@ M2 使用有序多值决策图（Multi-valued Decision Diagram，MDD）精确表
 分析设置有界节点数并失败关闭；超过实现安全上限返回 `CONTROL_GRAPH_COMPLEXITY_EXCEEDED`，绝不以近似算法放行不安全引用。控制上游可达性仍是独立前置条件，使用 DAG 拓扑与位集合传递闭包检查。
 
 未来 Data Merge/Select 的节点形态仍未冻结。
+
+### v2 控制节点补充
+
+`control.start@2` 在初始化时按具名端口校验 Run Input，将各字段作为 Start Effective Output；字段缺失、多余或类型错误均使初始化失败，并由 Engine 按持久化失败路径结算 Run。`control.end@2` 解析同名 Input 后按输出声明复核类型，组装 JSON Object 并沿用原有 End/Run 原子成功边界。`control.branch@2` 按声明顺序对组内条件执行 AND/OR，首个命中 Route 生效，未命中走 ELSE；路径不存在或类型不匹配仍失败，不能当作条件 false。旧 `@1` 操作语义不变。

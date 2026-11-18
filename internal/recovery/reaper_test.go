@@ -31,7 +31,7 @@ func TestReaperMarksExpiredAttemptsAndIgnoresSettledRaces(t *testing.T) {
 }
 
 func TestReaperPropagatesAuthorityFailuresAndStops(t *testing.T) {
-	repository := &fakeRepository{err: errors.New("postgres unavailable")}
+	repository := &fakeRepository{err: errors.New("mysql unavailable")}
 	reaper, err := NewReaper(repository, &fakeCoordinator{}, 0, time.Millisecond, 1, "trace", discardLogger())
 	if err != nil {
 		t.Fatal(err)

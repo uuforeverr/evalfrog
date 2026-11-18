@@ -10,10 +10,9 @@ import (
 	"syscall"
 
 	"github.com/uu999/evalfrog/internal/access"
-	"github.com/uu999/evalfrog/internal/adapters/cacheredis"
 	"github.com/uu999/evalfrog/internal/adapters/httpapi"
 	"github.com/uu999/evalfrog/internal/adapters/kafka"
-	"github.com/uu999/evalfrog/internal/adapters/postgres"
+	"github.com/uu999/evalfrog/internal/adapters/mysql"
 	"github.com/uu999/evalfrog/internal/adapters/workerapi"
 	"github.com/uu999/evalfrog/internal/catalog"
 	"github.com/uu999/evalfrog/internal/definition"
@@ -72,27 +71,26 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		return 1
 	}
 	metricRegistry := metrics.New(serviceName)
-	postgresClient, err := postgres.OpenWithAcquireObserver(ctx, configuration.Postgres, metricRegistry)
+	mysqlClient, err := mysql.OpenWithAcquireObserver(ctx, configuration.MySQL, metricRegistry)
 	if err != nil {
-		logger.Error("PostgreSQL client creation failed", "error", err)
+		logger.Error("MySQL client creation failed", "error", err)
 		return 1
 	}
-	defer postgresClient.Close()
+	defer mysqlClient.Close()
+	metricRegistry.RegisterMySQLPoolStats(mysqlClient.Pool().Stats)
 	if options.Migrate {
 		runner := migrations.Runner{
-			Pool: postgresClient.Pool(), Schema: configuration.Postgres.Schema,
+			Database: mysqlClient.Pool().Raw(), DatabaseName: configuration.MySQL.Database,
 			Directory: configuration.Migrations.Directory, LockTimeout: configuration.Migrations.LockTimeout.Duration(),
 		}
 		if err := runner.Up(ctx); err != nil {
 			logger.Error("migration failed", "error", err)
 			return 1
 		}
-		logger.Info("migrations applied", "schema", configuration.Postgres.Schema)
+		logger.Info("migrations applied", "database", configuration.MySQL.Database)
 		return 0
 	}
 
-	cacheClient := cacheredis.Open(configuration.Redis.Cache)
-	defer closeWithLog(logger, "cache Redis", cacheClient.Close)
 	kafkaClient, err := kafka.Open(configuration.Kafka, serviceName)
 	if err != nil {
 		logger.Error("Kafka client creation failed", "error", err)
@@ -100,24 +98,30 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 	}
 	defer kafkaClient.Close()
 
-	readiness := health.New(configuration.Redis.Cache.OperationTimeout.Duration())
-	mustRegister(logger, readiness, "postgres", postgresClient.Check)
-	mustRegister(logger, readiness, "redis-cache", cacheClient.Check)
+	readiness := health.New(configuration.MySQL.LockTimeout.Duration())
+	mustRegister(logger, readiness, "mysql", mysqlClient.Check)
 	mustRegister(logger, readiness, "kafka", kafkaClient.Check)
 	server := httpserver.New(
 		serviceName, configuration.HTTP.ControlPlaneAddress,
 		configuration.HTTP.ReadHeaderTimeout.Duration(), configuration.HTTP.IdleTimeout.Duration(),
 		logger, readiness, metricRegistry,
 	)
-	store := postgres.NewStore(postgresClient.Pool())
-	store.SetRunViewInvalidator(cacheClient)
+	store := mysql.NewStore(mysqlClient.Pool())
+	notifier := projection.NewLocalNotifier()
+	store.SetRunUpdateNotifier(notifier)
+	snapshotCache, err := runtimecontext.NewSnapshotCache(
+		configuration.SnapshotL1.MaxEntries, configuration.SnapshotL1.MaxBytes, metricRegistry,
+	)
+	if err != nil {
+		logger.Error("snapshot L1 construction failed", "error", err)
+		return 1
+	}
 	accessService := access.NewService(store)
 	resourceResolver := resources.NewResolver(store, accessService)
 	definitionService := definition.NewBuiltinService(store, accessService, resourceResolver)
 	runCreator := runtime.NewBuiltinRunCreator(store, accessService)
 	runControl := runtime.NewBuiltinRunControl(store, accessService)
-	runReader := projection.NewCachedService(projection.NewBuiltinService(store, accessService), cacheClient,
-		configuration.Cache.ActiveRunReadModelTTL.Duration(), configuration.Cache.TerminalRunReadModelTTL.Duration())
+	runReader := projection.NewBuiltinService(store, accessService)
 	connectionDirectory := resources.NewBuiltinConnectionDirectory(store, accessService)
 	recoveryEmitter := recovery.NewBuiltinEmitter(store)
 	manualReplayer, err := recovery.NewManualReplayer(store, recoveryEmitter, accessService)
@@ -125,20 +129,20 @@ func run(ctx context.Context, arguments []string, output, errorOutput io.Writer)
 		logger.Error("manual recovery replay construction failed", "error", err)
 		return 1
 	}
-	application, err := workflowapp.New(definitionService, runCreator, runControl, runReader, catalog.BuiltinV1(), connectionDirectory, manualReplayer)
+	application, err := workflowapp.New(definitionService, runCreator, runControl, runReader, catalog.BuiltinDirectory(), connectionDirectory, manualReplayer)
 	if err != nil {
 		logger.Error("workflow application construction failed", "error", err)
 		return 1
 	}
-	server.Handle("/v1/", httpapi.New(accessService, application, cacheClient))
+	server.Handle("/v1/", httpapi.New(accessService, application, notifier).
+		WithRunUpdatePollInterval(configuration.HTTP.RunUpdatePollInterval.Duration()))
 	attemptCoordinator := attempt.NewBuiltinCoordinator(store)
-	contextGateway, err := runtimecontext.NewGateway(store, cacheClient,
-		configuration.Cache.ExecutionSnapshotTTL.Duration(), configuration.Cache.ActiveRunContextTTL.Duration(), metricRegistry)
+	contextGateway, err := runtimecontext.NewGateway(store, snapshotCache)
 	if err != nil {
 		logger.Error("execution context gateway construction failed", "error", err)
 		return 1
 	}
-	runtimeResources := postgres.NewRuntimeResourceResolver(store, resources.NoopSecretResolver{})
+	runtimeResources := mysql.NewRuntimeResourceResolver(store, resources.NoopSecretResolver{})
 	server.Handle("/internal/v1/", workerapi.NewHandler(attemptCoordinator, contextGateway, runtimeResources))
 	instanceID, err := (identity.UUIDv7Generator{}).New()
 	if err != nil {
@@ -233,11 +237,5 @@ func mustRegister(logger *slog.Logger, registry *health.Registry, name string, c
 	if err := registry.Register(name, check); err != nil {
 		logger.Error("health check registration failed", "check", name, "error", err)
 		panic(err)
-	}
-}
-
-func closeWithLog(logger *slog.Logger, name string, close func() error) {
-	if err := close(); err != nil {
-		logger.Warn("dependency close failed", "dependency", name, "error", err)
 	}
 }

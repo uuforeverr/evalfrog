@@ -30,7 +30,7 @@ const (
 )
 
 // RuntimeEvent is deliberately a lightweight wake-up signal. Consumers must
-// reload DSL, Attempt Result and Output from PostgreSQL authority.
+// reload DSL, Attempt Result and Output from MySQL authority.
 type RuntimeEvent struct {
 	MessageVersion int              `json:"message_version"`
 	EventID        string           `json:"event_id"`

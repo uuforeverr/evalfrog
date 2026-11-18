@@ -40,6 +40,16 @@ func BuiltinV1() *Catalog {
 	return catalog
 }
 
+// BuiltinV2 keeps the v1 catalog available for immutable published snapshots.
+func BuiltinV2() *Catalog {
+	contracts := []contract{startContractV2(), endContractV2(), branchContractV2(), codeContract(), httpContract(), rpcContract()}
+	catalog, err := newCatalog(BuiltinRevisionV2, contracts)
+	if err != nil {
+		panic(err)
+	}
+	return catalog
+}
+
 func newCatalog(revision RevisionID, contracts []contract) (*Catalog, error) {
 	if revision == "" {
 		return nil, fmt.Errorf("catalog revision is required")

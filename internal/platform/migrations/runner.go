@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,13 +12,14 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var migrationName = regexp.MustCompile(`^(\d{6})_([a-z0-9_]+)\.up\.sql$`)
+var (
+	migrationName = regexp.MustCompile(`^(\d{6})_([a-z0-9_]+)\.up\.sql$`)
+	identifier    = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]{0,63}$`)
+)
 
 type Migration struct {
 	Version  int64
@@ -27,98 +29,85 @@ type Migration struct {
 }
 
 type Runner struct {
-	Pool        *pgxpool.Pool
-	Schema      string
-	Directory   string
-	LockTimeout time.Duration
+	Database     *sql.DB
+	DatabaseName string
+	Directory    string
+	LockTimeout  time.Duration
 }
 
+// Up applies append-only MySQL migrations under a server-side named lock.
+// MySQL DDL is atomic per statement but not transactional across a file, so
+// released migrations must remain immutable. This cutover supports fresh
+// databases only: after partial DDL failure, rebuild an empty database before
+// retrying. The checksum ledger detects history edits before later migrations run.
 func (runner Runner) Up(ctx context.Context) error {
+	if runner.Database == nil {
+		return errors.New("MySQL migration database is required")
+	}
+	if !identifier.MatchString(runner.DatabaseName) {
+		return fmt.Errorf("unsafe MySQL database name %q", runner.DatabaseName)
+	}
 	plan, err := LoadPlan(os.DirFS(runner.Directory))
 	if err != nil {
 		return err
 	}
-	lockCtx, cancel := context.WithTimeout(ctx, runner.LockTimeout)
-	defer cancel()
-	connection, err := runner.Pool.Acquire(lockCtx)
+	connection, err := runner.Database.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migration connection: %w", err)
 	}
-	defer connection.Release()
-	lockName := "evalfrog:migrations:" + runner.Schema
-	if _, err := connection.Exec(lockCtx, "SELECT pg_advisory_lock(hashtextextended($1, 0))", lockName); err != nil {
-		return fmt.Errorf("acquire migration advisory lock: %w", err)
+	defer connection.Close()
+	var selectedDatabase sql.NullString
+	if err := connection.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&selectedDatabase); err != nil {
+		return fmt.Errorf("read selected MySQL database: %w", err)
 	}
-	defer func() {
-		_, _ = connection.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtextextended($1, 0))", lockName)
-	}()
-
-	identifier := pgx.Identifier{runner.Schema}.Sanitize()
-	table := identifier + ".schema_migrations"
-	if err := runner.withMigrationTransaction(ctx, connection, 0, func(transaction pgx.Tx) error {
-		if _, err := transaction.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+identifier); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
-		if _, err := transaction.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+table+" (version BIGINT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())"); err != nil {
-			return fmt.Errorf("create migration ledger: %w", err)
-		}
-		return nil
-	}); err != nil {
-		return err
+	if !selectedDatabase.Valid || selectedDatabase.String != runner.DatabaseName {
+		return fmt.Errorf("MySQL DSN selected database %q, expected %q", selectedDatabase.String, runner.DatabaseName)
+	}
+	lockSeconds := int64((runner.LockTimeout + time.Second - 1) / time.Second)
+	if lockSeconds < 1 {
+		lockSeconds = 1
+	}
+	lockDigest := sha256.Sum256([]byte(runner.DatabaseName))
+	lockName := "evalfrog:migrations:" + hex.EncodeToString(lockDigest[:16])
+	var locked sql.NullInt64
+	if err := connection.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, lockSeconds).Scan(&locked); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if !locked.Valid || locked.Int64 != 1 {
+		return fmt.Errorf("acquire migration lock %q timed out", lockName)
+	}
+	defer func() { _, _ = connection.ExecContext(context.Background(), "SELECT RELEASE_LOCK(?)", lockName) }()
+	if _, err := connection.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version BIGINT PRIMARY KEY,
+		name VARCHAR(200) NOT NULL,
+		checksum CHAR(64) NOT NULL,
+		applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+	) ENGINE=InnoDB`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
 	}
 	for _, migration := range plan {
-		if err := runner.withMigrationTransaction(ctx, connection, migration.Version, func(transaction pgx.Tx) error {
-			var checksum string
-			err := transaction.QueryRow(ctx, "SELECT checksum FROM "+table+" WHERE version=$1", migration.Version).Scan(&checksum)
-			switch {
-			case err == nil:
-				if checksum != migration.Checksum {
-					return fmt.Errorf("migration %06d checksum mismatch", migration.Version)
-				}
-				return nil
-			case !errors.Is(err, pgx.ErrNoRows):
-				return fmt.Errorf("read migration %06d: %w", migration.Version, err)
+		var checksum string
+		err := connection.QueryRowContext(ctx, "SELECT checksum FROM schema_migrations WHERE version=?", migration.Version).Scan(&checksum)
+		switch {
+		case err == nil:
+			if checksum != migration.Checksum {
+				return fmt.Errorf("migration %06d checksum mismatch", migration.Version)
 			}
-			if _, err := transaction.Exec(ctx, "SET LOCAL search_path TO "+identifier); err != nil {
-				return fmt.Errorf("set migration schema %06d: %w", migration.Version, err)
-			}
-			if _, err := transaction.Exec(ctx, migration.SQL); err != nil {
-				return fmt.Errorf("execute migration %06d_%s: %w", migration.Version, migration.Name, err)
-			}
-			if _, err := transaction.Exec(ctx, "INSERT INTO "+table+" (version, name, checksum) VALUES ($1, $2, $3)", migration.Version, migration.Name, migration.Checksum); err != nil {
-				return fmt.Errorf("record migration %06d: %w", migration.Version, err)
-			}
-			return nil
-		}); err != nil {
-			return err
+			continue
+		case !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("read migration %06d: %w", migration.Version, err)
 		}
-	}
-	return nil
-}
-
-// withMigrationTransaction isolates every statement that belongs to schema
-// evolution from the short timeout configured for online request pools. The
-// advisory lock is still acquired with LockTimeout before entering here, and
-// SET LOCAL disappears at commit/rollback, so the borrowed connection cannot
-// leak a permissive timeout back to ordinary application queries.
-func (runner Runner) withMigrationTransaction(ctx context.Context, connection *pgxpool.Conn, version int64, apply func(pgx.Tx) error) (result error) {
-	transaction, err := connection.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin migration %06d: %w", version, err)
-	}
-	defer func() {
-		if result != nil {
-			_ = transaction.Rollback(ctx)
+		if strings.TrimSpace(migration.SQL) == "" {
+			return fmt.Errorf("migration %06d_%s is empty", migration.Version, migration.Name)
 		}
-	}()
-	if _, err := transaction.Exec(ctx, "SET LOCAL statement_timeout TO 0"); err != nil {
-		return fmt.Errorf("disable migration statement timeout %06d: %w", version, err)
-	}
-	if err := apply(transaction); err != nil {
-		return err
-	}
-	if err := transaction.Commit(ctx); err != nil {
-		return fmt.Errorf("commit migration %06d: %w", version, err)
+		if _, err := connection.ExecContext(ctx, migration.SQL); err != nil {
+			return fmt.Errorf("execute migration %06d_%s: %w", migration.Version, migration.Name, err)
+		}
+		if _, err := connection.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
+			migration.Version, migration.Name, migration.Checksum); err != nil {
+			return fmt.Errorf("record migration %06d: %w", migration.Version, err)
+		}
 	}
 	return nil
 }

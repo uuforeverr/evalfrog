@@ -1,0 +1,67 @@
+<mxfile host="app.diagrams.net" agent="Codex">
+  <diagram id="evalfrog-core-runtime" name="核心运行链路">
+    <mxGraphModel dx="1793" dy="944" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="960" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=28;fontStyle=1;fontColor=#172B4D;" value="EvalFrog 工作流核心链路" vertex="1">
+          <mxGeometry height="50" width="820" x="390" y="25" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=16;fontColor=#5E6C84;" value="编辑 / 发布 / 调用　→　状态推进　→　异步执行　→　结果回流" vertex="1">
+          <mxGeometry height="30" width="800" x="400" y="75" as="geometry" />
+        </mxCell>
+        <mxCell id="entry-label" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#6B778C;" value="外部入口" vertex="1">
+          <mxGeometry height="30" width="120" x="60" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="service-label" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#6B778C;" value="应用与执行组件" vertex="1">
+          <mxGeometry height="30" width="160" x="60" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="infra-label" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#6B778C;" value="基础设施" vertex="1">
+          <mxGeometry height="30" width="120" x="70" y="470" as="geometry" />
+        </mxCell>
+        <mxCell id="client" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E9F2FF;strokeColor=#4C9AFF;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0747A6;spacing=8;" value="用户 / Agent&#xa;Web · CLI" vertex="1">
+          <mxGeometry height="100" width="220" x="60" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="api" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DEEBFF;strokeColor=#2684FF;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0747A6;spacing=8;" value="Workflow API&#xa;编辑 · 发布 · 创建 Run" vertex="1">
+          <mxGeometry height="120" width="260" x="460" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="gateway" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4E5;strokeColor=#FF991F;strokeWidth=2;fontSize=17;fontStyle=1;fontColor=#974F0C;spacing=8;" value="Execution Gateway&#xa;Claim · Context&#xa;Heartbeat · Complete" vertex="1">
+          <mxGeometry height="140" width="300" x="430" y="685" as="geometry" />
+        </mxCell>
+        <mxCell id="relay" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAE6FF;strokeColor=#6554C0;strokeWidth=2;fontSize=17;fontStyle=1;fontColor=#403294;spacing=8;" value="Outbox Relay&#xa;任务 / 运行事件可靠投递" vertex="1">
+          <mxGeometry height="110" width="240" x="490" y="370" as="geometry" />
+        </mxCell>
+        <mxCell id="worker" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DEEBFF;strokeColor=#2684FF;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0747A6;spacing=8;" value="Worker&#xa;异步执行节点" vertex="1">
+          <mxGeometry height="110" width="240" x="1400" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="postgres" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#E3FCEF;strokeColor=#36B37E;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#006644;size=15;spacing=8;" value="PostgreSQL&#xa;定义 · Run / Node / Attempt&#xa;Output · Outbox / Inbox" vertex="1">
+          <mxGeometry height="150" width="320" x="1130" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="kafka" parent="1" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#FFF0B3;strokeColor=#FFAB00;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#7A4A00;" value="Kafka&#xa;Task / Runtime Event" vertex="1">
+          <mxGeometry height="110" width="280" x="1120" y="530" as="geometry" />
+        </mxCell>
+        <mxCell id="e-client-api" edge="1" parent="1" source="client" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2684FF;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#0747A6;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="api" value="编辑 · 发布 · 调用">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-data-line" parent="1" style="shape=line;html=1;strokeColor=#2684FF;strokeWidth=3;" value="" vertex="1">
+          <mxGeometry height="10" width="50" x="60" y="910" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-data-text" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontColor=#42526E;" value="权威数据 / 同步请求" vertex="1">
+          <mxGeometry height="40" width="180" x="120" y="895" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-event-line" parent="1" style="shape=line;html=1;strokeColor=#FFAB00;strokeWidth=3;" value="" vertex="1">
+          <mxGeometry height="10" width="50" x="320" y="910" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-event-text" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=13;fontColor=#42526E;" value="异步控制消息" vertex="1">
+          <mxGeometry height="40" width="150" x="380" y="895" as="geometry" />
+        </mxCell>
+        <mxCell id="boundary-note" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F4F5F7;strokeColor=#DFE1E6;strokeWidth=1;fontSize=14;fontColor=#42526E;align=center;verticalAlign=middle;" value="PostgreSQL 保存权威事实　｜　Kafka 只传递轻量 Task / Event　｜　Worker 不直接访问数据库" vertex="1">
+          <mxGeometry height="45" width="810" x="650" y="895" as="geometry" />
+        </mxCell>
+        <mxCell id="engine" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DEEBFF;strokeColor=#2684FF;strokeWidth=2;fontSize=18;fontStyle=1;fontColor=#0747A6;spacing=8;" value="Engine&#xa;工作流状态推进" vertex="1">
+          <mxGeometry height="110" width="240" x="880" y="740" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

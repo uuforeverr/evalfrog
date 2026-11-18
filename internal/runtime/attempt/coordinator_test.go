@@ -76,6 +76,28 @@ func TestCoordinatorValidatesAndCoordinatesLeaseOperations(t *testing.T) {
 	}
 }
 
+func TestCoordinatorBoundsClaimBatchAndPreservesItemResults(t *testing.T) {
+	repository := &fakeRepository{}
+	coordinator, err := NewCoordinator(repository, fixedIDs{"lease"}, clock.NewFake(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := []ClaimCommand{validClaim(), validClaim()}
+	commands[1].AttemptID = "b"
+	results, err := coordinator.ClaimBatch(context.Background(), commands)
+	if err != nil || len(results) != 2 || results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("results=%+v err=%v", results, err)
+	}
+	tooMany := make([]ClaimCommand, 9)
+	for index := range tooMany {
+		tooMany[index] = validClaim()
+		tooMany[index].AttemptID = string(rune('a' + index))
+	}
+	if _, err = coordinator.ClaimBatch(context.Background(), tooMany); err == nil {
+		t.Fatal("claim batch larger than eight was accepted")
+	}
+}
+
 func TestCoordinatorRejectsInvalidCoordinatesAndResults(t *testing.T) {
 	coordinator, _ := NewCoordinator(&fakeRepository{}, fixedIDs{"id"}, clock.NewFake(time.Now()))
 	if _, err := coordinator.Claim(context.Background(), ClaimCommand{}); err == nil {

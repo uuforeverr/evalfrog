@@ -325,9 +325,48 @@ func (client *Client) ReceiveBatch(ctx context.Context) (eventing.DeliveryBatch,
 func (batch *deliveryBatch) Messages() []eventing.BatchMessage {
 	result := make([]eventing.BatchMessage, len(batch.records))
 	for index, record := range batch.records {
-		result[index] = eventing.BatchMessage{Topic: record.Topic, Key: string(record.Key), Payload: append([]byte(nil), record.Value...)}
+		result[index] = eventing.BatchMessage{Topic: record.Topic, Key: string(record.Key), Payload: append([]byte(nil), record.Value...), Partition: record.Partition, Offset: record.Offset}
 	}
 	return result
+}
+
+func (client *Client) ReceivePartitionBatch(ctx context.Context, limit int) (eventing.DeliveryBatch, error) {
+	if limit < 1 || limit > 8 {
+		return nil, fmt.Errorf("Kafka partition batch limit must be in [1,8]")
+	}
+	client.deliveryMu.Lock()
+	defer client.deliveryMu.Unlock()
+	if client.outstanding {
+		return nil, fmt.Errorf("previous Kafka delivery is not settled")
+	}
+	for {
+		if len(client.pending) == 0 {
+			fetches := client.client.PollRecords(ctx, min(client.maxPoll, limit))
+			if err := fetches.Err(); err != nil {
+				if retryErr := waitForConsumerRetry(ctx, err, consumerRetryBackoff); retryErr != nil {
+					return nil, fmt.Errorf("poll Kafka partition batch: %w", retryErr)
+				}
+				continue
+			}
+			fetches.EachRecord(func(value *kgo.Record) { client.pending = append(client.pending, value) })
+		}
+		if len(client.pending) == 0 {
+			continue
+		}
+		first := client.pending[0]
+		records := make([]*kgo.Record, 0, limit)
+		remaining := make([]*kgo.Record, 0, len(client.pending))
+		for _, record := range client.pending {
+			if len(records) < limit && record.Topic == first.Topic && record.Partition == first.Partition {
+				records = append(records, record)
+			} else {
+				remaining = append(remaining, record)
+			}
+		}
+		client.pending = remaining
+		client.outstanding = true
+		return &deliveryBatch{owner: client, records: records}, nil
+	}
 }
 
 func (batch *deliveryBatch) Nack() { batch.settle(false) }
@@ -483,3 +522,4 @@ var _ eventing.TaskPublisher = (*Client)(nil)
 var _ eventing.BatchTaskPublisher = (*Client)(nil)
 var _ eventing.Consumer = (*Client)(nil)
 var _ eventing.BatchConsumer = (*Client)(nil)
+var _ eventing.PartitionBatchConsumer = (*Client)(nil)

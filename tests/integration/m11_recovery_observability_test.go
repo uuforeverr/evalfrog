@@ -34,7 +34,7 @@ func TestM11RecoveryWakeupsAreDurableTraceableAndEngineOwned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE node_attempts SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE attempt_id=$1`, queued.ID)
+	mustExec(t, harness.ctx, harness.client.Pool(), `UPDATE node_attempts SET lease_expires_at=CURRENT_TIMESTAMP(6)-INTERVAL 1 SECOND WHERE attempt_id=UUID_TO_BIN($1)`, queued.ID)
 	reaper, err := recovery.NewReaper(harness.store, harness.coordinator, 0, time.Second, 10, "m11-reaper", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +64,7 @@ func TestM11RecoveryWakeupsAreDurableTraceableAndEngineOwned(t *testing.T) {
 	var wakeupCount int
 	if err = harness.client.Pool().QueryRow(harness.ctx, `
 		SELECT trace_id, count(*) FROM outbox_events
-		WHERE project_id=$1 AND run_id=$2 AND event_type='attempt.lost'
+		WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND event_type='attempt.lost'
 		GROUP BY trace_id ORDER BY max(created_at) DESC LIMIT 1`, harness.projectID, run.ID).Scan(&wakeupTrace, &wakeupCount); err != nil {
 		t.Fatal(err)
 	}
@@ -99,12 +99,12 @@ func TestM11DeadlineBlocksRetryRecoveryAndDiagnosticsAuditAreSafe(t *testing.T) 
 	// the workflow deadline authoritative. The Retry Timer must find nothing;
 	// Deadline Scanner is the only resulting wake-up source.
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		UPDATE node_runs SET state='retry_wait', state_version=state_version+1, current_attempt_id=$4,
-		       next_retry_at=clock_timestamp()-interval '1 second'
-		WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3`, harness.projectID, run.ID, nodeID, queued.ID)
+		UPDATE node_runs SET state='retry_wait', state_version=state_version+1, current_attempt_id=UUID_TO_BIN($4),
+		       next_retry_at=CURRENT_TIMESTAMP(6)-INTERVAL 1 SECOND
+		WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3`, harness.projectID, run.ID, nodeID, queued.ID)
 	mustExec(t, harness.ctx, harness.client.Pool(), `
-		UPDATE workflow_runs SET deadline_at=created_at+interval '1 microsecond'
-		WHERE project_id=$1 AND run_id=$2`, harness.projectID, run.ID)
+		UPDATE workflow_runs SET deadline_at=created_at+INTERVAL 1 MICROSECOND
+		WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2)`, harness.projectID, run.ID)
 	if values, err := harness.store.ListRetryDue(harness.ctx, 10); err != nil || len(values) != 0 {
 		t.Fatalf("expired Run retry candidates=%+v err=%v", values, err)
 	}
@@ -123,7 +123,7 @@ func TestM11DeadlineBlocksRetryRecoveryAndDiagnosticsAuditAreSafe(t *testing.T) 
 		t.Fatalf("run state=%s", got)
 	}
 	var readyNodes int
-	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM node_runs WHERE project_id=$1 AND run_id=$2 AND state='ready'`, harness.projectID, run.ID).Scan(&readyNodes); err != nil || readyNodes != 0 {
+	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT count(*) FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND state='ready'`, harness.projectID, run.ID).Scan(&readyNodes); err != nil || readyNodes != 0 {
 		t.Fatalf("deadline Run retained ready nodes: count=%d err=%v", readyNodes, err)
 	}
 
@@ -176,10 +176,10 @@ func TestM11TraceIsPreservedFromRunThroughTaskAndCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	var taskTrace, completionTrace string
-	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT trace_id FROM node_task_outbox WHERE task_id=$1`, task.TaskID).Scan(&taskTrace); err != nil {
+	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT trace_id FROM node_task_outbox WHERE task_id=UUID_TO_BIN($1)`, task.TaskID).Scan(&taskTrace); err != nil {
 		t.Fatal(err)
 	}
-	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT trace_id FROM outbox_events WHERE aggregate_id=$1 AND event_type='attempt.completed'`, task.AttemptID).Scan(&completionTrace); err != nil {
+	if err = harness.client.Pool().QueryRow(harness.ctx, `SELECT trace_id FROM outbox_events WHERE aggregate_id=UUID_TO_BIN($1) AND event_type='attempt.completed'`, task.AttemptID).Scan(&completionTrace); err != nil {
 		t.Fatal(err)
 	}
 	if taskTrace != run.TraceID || completionTrace != run.TraceID {
@@ -192,7 +192,7 @@ var sandboxCapability = []dsl.Coordinate{{Type: "task.python", Version: 1}}
 func nodeState(t *testing.T, harness *m5Harness, runID, nodeID string) string {
 	t.Helper()
 	var state string
-	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_runs WHERE project_id=$1 AND run_id=$2 AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state); err != nil {
+	if err := harness.client.Pool().QueryRow(harness.ctx, `SELECT state FROM node_runs WHERE project_id=UUID_TO_BIN($1) AND run_id=UUID_TO_BIN($2) AND execution_node_id=$3`, harness.projectID, runID, nodeID).Scan(&state); err != nil {
 		t.Fatal(err)
 	}
 	return state

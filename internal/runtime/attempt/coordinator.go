@@ -31,13 +31,21 @@ type Lease struct {
 	CancelRequested bool
 }
 
+// ClaimResult keeps business rejections local to one item. Err is only used
+// for expected domain outcomes; an infrastructure error is returned by
+// ClaimBatch itself and makes the whole transaction retryable.
+type ClaimResult struct {
+	Lease Lease
+	Err   error
+}
+
 type ClaimCommand struct {
-	ProjectID, RunID, AttemptID string
-	AttemptSequence             uint32
-	WorkerID, ExecutorBuild     string
-	ResourceClass               scheduling.ResourceClass
-	Capabilities                []dsl.Coordinate
-	LeaseDuration               time.Duration
+	ProjectID, RunID, NodeRunID, AttemptID string
+	AttemptSequence                        uint32
+	WorkerID, ExecutorBuild                string
+	ResourceClass                          scheduling.ResourceClass
+	Capabilities                           []dsl.Coordinate
+	LeaseDuration                          time.Duration
 }
 
 type HeartbeatCommand struct {
@@ -91,6 +99,10 @@ type Repository interface {
 	MarkExpiredLost(context.Context, MarkLostRecord) (bool, error)
 }
 
+type BatchRepository interface {
+	ClaimBatch(context.Context, []ClaimRecord) ([]ClaimResult, error)
+}
+
 func (coordinator Coordinator) MarkExpiredLost(ctx context.Context, command MarkLostCommand) (bool, error) {
 	if command.ProjectID == "" || command.RunID == "" || command.AttemptID == "" || command.AttemptSequence == 0 || command.TraceID == "" {
 		return false, fmt.Errorf("lost attempt coordinate and trace are required")
@@ -124,19 +136,56 @@ func NewBuiltinCoordinator(repository Repository) Coordinator {
 }
 
 func (coordinator Coordinator) Claim(ctx context.Context, command ClaimCommand) (Lease, error) {
-	if command.ProjectID == "" || command.RunID == "" || command.AttemptID == "" || command.AttemptSequence == 0 || command.WorkerID == "" || command.ExecutorBuild == "" || !command.ResourceClass.Valid() || len(command.Capabilities) == 0 || command.LeaseDuration <= 0 {
-		return Lease{}, fmt.Errorf("claim identity, worker, build and positive lease are required")
-	}
-	for _, capability := range command.Capabilities {
-		if capability.Type == "" || capability.Version == 0 {
-			return Lease{}, fmt.Errorf("claim capability coordinate is invalid")
-		}
+	if err := validateClaim(command); err != nil {
+		return Lease{}, err
 	}
 	token, err := coordinator.ids.New()
 	if err != nil {
 		return Lease{}, err
 	}
 	return coordinator.repository.Claim(ctx, ClaimRecord{ClaimCommand: command, LeaseToken: token, Now: coordinator.clock.Now().UTC()})
+}
+
+func validateClaim(command ClaimCommand) error {
+	if command.ProjectID == "" || command.RunID == "" || command.AttemptID == "" || command.AttemptSequence == 0 || command.WorkerID == "" || command.ExecutorBuild == "" || !command.ResourceClass.Valid() || len(command.Capabilities) == 0 || command.LeaseDuration <= 0 {
+		return fmt.Errorf("claim identity, worker, build and positive lease are required")
+	}
+	for _, capability := range command.Capabilities {
+		if capability.Type == "" || capability.Version == 0 {
+			return fmt.Errorf("claim capability coordinate is invalid")
+		}
+	}
+	return nil
+}
+
+// ClaimBatch acquires up to eight independent Attempt leases in one bounded
+// repository transaction. Expected stale/duplicate outcomes stay per item;
+// only a technical failure aborts and retries the complete Kafka batch.
+func (coordinator Coordinator) ClaimBatch(ctx context.Context, commands []ClaimCommand) ([]ClaimResult, error) {
+	if len(commands) == 0 || len(commands) > 8 {
+		return nil, fmt.Errorf("claim batch size must be in [1,8]")
+	}
+	now := coordinator.clock.Now().UTC()
+	records := make([]ClaimRecord, len(commands))
+	for index, command := range commands {
+		if err := validateClaim(command); err != nil {
+			return nil, fmt.Errorf("claim batch item %d: %w", index, err)
+		}
+		token, err := coordinator.ids.New()
+		if err != nil {
+			return nil, err
+		}
+		records[index] = ClaimRecord{ClaimCommand: command, LeaseToken: token, Now: now}
+	}
+	if repository, ok := coordinator.repository.(BatchRepository); ok {
+		return repository.ClaimBatch(ctx, records)
+	}
+	results := make([]ClaimResult, len(records))
+	for index, record := range records {
+		lease, err := coordinator.repository.Claim(ctx, record)
+		results[index] = ClaimResult{Lease: lease, Err: err}
+	}
+	return results, nil
 }
 
 func (coordinator Coordinator) Heartbeat(ctx context.Context, command HeartbeatCommand) (Lease, error) {

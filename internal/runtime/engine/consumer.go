@@ -81,7 +81,7 @@ func (consumer Consumer) consumeInTransaction(ctx context.Context, tx RunTransac
 }
 
 // ConsumeBatch groups a Kafka poll by Run. Events for one Run remain ordered
-// in one PostgreSQL transaction; different Runs execute with explicit bounded
+// in one MySQL transaction; different Runs execute with explicit bounded
 // concurrency so Kafka batch size never becomes database connection demand.
 func (consumer Consumer) ConsumeBatch(ctx context.Context, events []eventing.RuntimeEvent) error {
 	if len(events) == 0 {
@@ -169,7 +169,7 @@ func (consumer Consumer) initialize(ctx context.Context, tx RunTransaction, even
 	if cancelWinsDeadline(runRecord) {
 		return consumer.advancePendingCancellation(ctx, tx, event, runRecord)
 	}
-	// A delayed RunCreated is only a wake-up. PostgreSQL time, rather than the
+	// A delayed RunCreated is only a wake-up. MySQL time, rather than the
 	// message timestamp, decides whether its immutable Run has already expired.
 	if !now.Before(runRecord.DeadlineAt) {
 		return consumer.advancePendingDeadline(ctx, tx, event, runRecord, now)

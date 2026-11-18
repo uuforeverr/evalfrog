@@ -27,6 +27,20 @@ func BuiltinV1Compatibility() CompatibilityChecker {
 	)
 }
 
+func BuiltinV2Compatibility() CompatibilityChecker {
+	return NewCompatibilityChecker(
+		Coordinate{Type: "control.start", Version: 1},
+		Coordinate{Type: "control.end", Version: 1},
+		Coordinate{Type: "control.start", Version: 2},
+		Coordinate{Type: "control.end", Version: 2},
+		Coordinate{Type: "control.branch", Version: 1},
+		Coordinate{Type: "control.branch", Version: 2},
+		Coordinate{Type: "task.python", Version: 1},
+		Coordinate{Type: "task.http", Version: 1},
+		Coordinate{Type: "task.rpc", Version: 1},
+	)
+}
+
 func (checker CompatibilityChecker) CheckAll(document Document) []Issue {
 	issues := make([]Issue, 0)
 	for _, node := range document.Nodes {

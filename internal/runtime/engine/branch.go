@@ -17,6 +17,62 @@ type branchCase struct {
 	Value    json.RawMessage `json:"value"`
 }
 
+type branchCaseV2 struct {
+	Route      string `json:"route"`
+	Logic      string `json:"logic"`
+	Conditions []struct {
+		Input    string          `json:"input"`
+		Path     string          `json:"path,omitempty"`
+		Operator string          `json:"operator"`
+		Value    json.RawMessage `json:"value"`
+	} `json:"conditions"`
+}
+
+func evaluateBranchV2(node dsl.Node, inputs map[string]json.RawMessage) (string, *Error) {
+	var cases []branchCaseV2
+	var fallback string
+	if json.Unmarshal(node.Operation.Config["cases"], &cases) != nil || json.Unmarshal(node.Operation.Config["default_route"], &fallback) != nil {
+		return "", &Error{Code: FailureBranchOperatorMismatch, NodeID: string(node.ID), Field: "operation.config"}
+	}
+	for caseIndex, candidate := range cases {
+		matched := candidate.Logic == "and"
+		for conditionIndex, condition := range candidate.Conditions {
+			field := fmt.Sprintf("operation.config.cases.%d.conditions.%d", caseIndex, conditionIndex)
+			raw, exists := inputs[condition.Input]
+			if !exists {
+				return "", &Error{Code: FailureBranchPathNotFound, NodeID: string(node.ID), Field: field + ".input"}
+			}
+			actual, err := decodeJSON(raw)
+			if err != nil {
+				return "", &Error{Code: FailureBranchOperatorMismatch, NodeID: string(node.ID), Field: field + ".input", Cause: err}
+			}
+			if condition.Path != "" {
+				actual, exists = lookupPath(actual, condition.Path)
+				if !exists {
+					return "", &Error{Code: FailureBranchPathNotFound, NodeID: string(node.ID), Field: field + ".path"}
+				}
+			}
+			expected, err := decodeJSON(condition.Value)
+			if err != nil {
+				return "", &Error{Code: FailureBranchOperatorMismatch, NodeID: string(node.ID), Field: field + ".value", Cause: err}
+			}
+			result, err := compareBranch(actual, condition.Operator, expected)
+			if err != nil {
+				return "", &Error{Code: FailureBranchOperatorMismatch, NodeID: string(node.ID), Field: field, Cause: err}
+			}
+			if candidate.Logic == "and" {
+				matched = matched && result
+			} else {
+				matched = matched || result
+			}
+		}
+		if matched {
+			return candidate.Route, nil
+		}
+	}
+	return fallback, nil
+}
+
 func evaluateBranch(node dsl.Node, raw json.RawMessage) (string, *Error) {
 	var cases []branchCase
 	var fallback string

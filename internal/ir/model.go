@@ -6,6 +6,7 @@ import (
 )
 
 const VersionV1 = "1"
+const VersionV2 = "2"
 
 type LogicalID string
 type NodeType string

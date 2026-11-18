@@ -6,22 +6,15 @@ endpoints:
 
 http:
   sandbox_runtime_address: ":8083"
+  run_update_poll_interval: 1s
 
-postgres:
-  dsn: "postgres://evalfrog@localhost:15432/evalfrog?sslmode=disable"
-  schema: "evalfrog_local"
+mysql:
+  dsn: "evalfrog:evalfrog@tcp(localhost:13306)/evalfrog_local"
+  database: "evalfrog_local"
   pool_min: 1
   pool_max: 5
   server_max_connections: 100
   expected_control_plane_instances: 1
-
-redis:
-  cache:
-    address: "localhost:16380"
-    key_prefix: "evalfrog:local:cache:"
-    operation_timeout: 500ms
-    max_retries: 0
-    eviction_policy: "allkeys-lfu"
 
 kafka:
   brokers: ["localhost:29092"]
@@ -64,13 +57,9 @@ outbox:
   published_retention: 24h
   inbox_retention: 24h
 
-cache:
-  execution_snapshot_ttl: 1h
-  active_run_context_ttl: 30m
-  terminal_run_context_ttl: 10m
-  active_run_read_model_ttl: 5m
-  terminal_run_read_model_ttl: 10m
-  definition_negative_ttl: 10s
+snapshot_l1:
+  max_entries: 128
+  max_bytes: 16777216
 
 observability:
   log_level: "debug"

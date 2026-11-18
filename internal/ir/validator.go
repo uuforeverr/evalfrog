@@ -37,8 +37,8 @@ func NewStructuralValidator() Validator {
 
 func (v Validator) Validate(document Document) []Diagnostic {
 	diagnostics := make([]Diagnostic, 0)
-	if document.IRVersion != VersionV1 {
-		diagnostics = append(diagnostics, ErrorDiagnostic(PhaseStructure, "IR_VERSION_UNSUPPORTED", "ir_version must be 1", Location{IRPath: "/ir_version"}))
+	if document.IRVersion != VersionV1 && document.IRVersion != VersionV2 {
+		diagnostics = append(diagnostics, ErrorDiagnostic(PhaseStructure, "IR_VERSION_UNSUPPORTED", "ir_version must be 1 or 2", Location{IRPath: "/ir_version"}))
 	}
 	if len(document.Nodes) == 0 {
 		diagnostics = append(diagnostics, ErrorDiagnostic(PhaseStructure, "IR_NODES_REQUIRED", "strict validation requires at least one node", Location{IRPath: "/nodes"}))

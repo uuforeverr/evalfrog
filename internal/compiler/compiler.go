@@ -40,12 +40,26 @@ func BuiltinV1() Compiler {
 	return compiler
 }
 
+func BuiltinV2() Compiler {
+	compiler, err := New(VersionV2, BuiltinRegistryV2(), dsl.BuiltinV2Contract(), dsl.BuiltinV2Compatibility())
+	if err != nil {
+		panic(err)
+	}
+	return compiler
+}
+
 func (compiler Compiler) Compile(request Request) (Result, []ir.Diagnostic) {
 	if request.Catalog == nil {
 		return Result{}, []ir.Diagnostic{ir.ErrorDiagnostic(ir.PhaseCompile, "CATALOG_REQUIRED", "compiler requires an immutable node catalog", ir.Location{})}
 	}
 	if request.Policy.Revision() == "" {
 		return Result{}, []ir.Diagnostic{ir.ErrorDiagnostic(ir.PhaseCompile, "POLICY_REQUIRED", "compiler requires an immutable project policy", ir.Location{})}
+	}
+	if compiler.version == VersionV1 && request.IR.IRVersion != ir.VersionV1 {
+		return Result{}, []ir.Diagnostic{ir.ErrorDiagnostic(ir.PhaseCompile, "IR_VERSION_UNSUPPORTED", "compiler-v1 accepts only IR v1", ir.Location{IRPath: "/ir_version"})}
+	}
+	if compiler.version == VersionV2 && (request.IR.IRVersion == ir.VersionV1 && request.Catalog.Revision() != catalog.BuiltinRevisionV1 || request.IR.IRVersion == ir.VersionV2 && request.Catalog.Revision() != catalog.BuiltinRevisionV2) {
+		return Result{}, []ir.Diagnostic{ir.ErrorDiagnostic(ir.PhaseCompile, "IR_CATALOG_VERSION_MISMATCH", "IR version does not match its immutable catalog revision", ir.Location{IRPath: "/ir_version"})}
 	}
 	validator := ir.NewStrictValidator(request.Catalog)
 	if diagnostics := validator.Validate(request.IR); ir.HasErrors(diagnostics) {
@@ -76,8 +90,12 @@ func (compiler Compiler) Compile(request Request) (Result, []ir.Diagnostic) {
 		},
 	}
 	diagnostics = make([]ir.Diagnostic, 0)
+	registry := compiler.registry
+	if compiler.version == VersionV2 && request.IR.IRVersion == ir.VersionV1 {
+		registry = BuiltinRegistry()
+	}
 	for nodeIndex, node := range request.IR.Nodes {
-		handler, exists := compiler.registry.Handler(node.Type)
+		handler, exists := registry.Handler(node.Type)
 		if !exists {
 			diagnostics = append(diagnostics, ir.ErrorDiagnostic(ir.PhaseCompile, "COMPILER_HANDLER_NOT_REGISTERED", "node type has no compiler handler", ir.Location{LogicalNodeID: node.ID, IRPath: ir.NodePath(node.ID, nodeIndex)}))
 			continue
@@ -330,6 +348,16 @@ func requiredSourceFields(document dsl.Document) sourcemap.RequiredFields {
 					for index, branchCase := range cases {
 						for field := range branchCase {
 							fields = append(fields, fmt.Sprintf("%s.%d.%s", root, index, field))
+						}
+						if node.Operation.Version == 2 {
+							var conditions []map[string]json.RawMessage
+							if json.Unmarshal(branchCase["conditions"], &conditions) == nil {
+								for conditionIndex, condition := range conditions {
+									for field := range condition {
+										fields = append(fields, fmt.Sprintf("%s.%d.conditions.%d.%s", root, index, conditionIndex, field))
+									}
+								}
+							}
 						}
 					}
 				}

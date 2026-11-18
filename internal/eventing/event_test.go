@@ -85,7 +85,7 @@ func TestRuntimeConsumerAcksSuccessDeadLettersPoisonAndNacksRetryableFailure(t *
 
 	ctx, cancel = context.WithCancel(context.Background())
 	consumer = &sequenceConsumer{deliveries: []*testDelivery{{payload: valid}}}
-	handler = &testRuntimeHandler{err: errors.New("postgres down"), after: cancel}
+	handler = &testRuntimeHandler{err: errors.New("mysql down"), after: cancel}
 	service, _ = NewRuntimeConsumerService(consumer, handler, logger)
 	_ = service.Run(ctx)
 	if consumer.deliveries[0].nacked.Load() != 1 || consumer.deliveries[0].acked.Load() != 0 {
@@ -126,7 +126,7 @@ func TestRuntimeConsumerProcessesKafkaPollAsOneEngineBatch(t *testing.T) {
 	ctx, cancel = context.WithCancel(context.Background())
 	batch = &testDeliveryBatch{messages: []BatchMessage{{Payload: valid}}, after: cancel}
 	consumer = &testBatchConsumer{batch: batch}
-	handler = &testBatchRuntimeHandler{err: errors.New("postgres unavailable")}
+	handler = &testBatchRuntimeHandler{err: errors.New("mysql unavailable")}
 	service, _ = NewRuntimeConsumerService(consumer, handler, logger)
 	if err = service.Run(ctx); err == nil || batch.nacked.Load() != 1 || batch.acked.Load() != 0 {
 		t.Fatalf("batch failure err=%v acked=%d nacked=%d", err, batch.acked.Load(), batch.nacked.Load())
