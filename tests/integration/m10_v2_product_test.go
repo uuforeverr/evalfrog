@@ -4,6 +4,7 @@ package integration
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -57,7 +58,12 @@ func TestM10V2UpgradePublishAndRunUsesImmutableCatalog(t *testing.T) {
 	}
 	harness.initializeRun(t, run)
 	view, err := application.GetRun(harness.ctx, harness.projectID, harness.principalID, run.ID)
-	if err != nil || view.State != runtimepkg.RunSucceeded || string(view.Output) != `{"workflow_output":{"amount":7}}` {
+	var output map[string]any
+	if decodeErr := json.Unmarshal(view.Output, &output); decodeErr != nil {
+		t.Fatalf("decode v2 run output: %v", decodeErr)
+	}
+	wantOutput := map[string]any{"workflow_output": map[string]any{"amount": float64(7)}}
+	if err != nil || view.State != runtimepkg.RunSucceeded || !reflect.DeepEqual(output, wantOutput) {
 		t.Fatalf("v2 run view=%+v err=%v", view, err)
 	}
 	badRun, err := application.CreateRun(harness.ctx, workflowapp.CreateRunCommand{ProjectID: harness.projectID, PrincipalID: harness.principalID, WorkflowID: workflow.ID, WorkflowInput: json.RawMessage(`{"wrong":7}`), DeadlineAt: time.Now().UTC().Add(time.Hour), IdempotencyKey: "m10-v2-bad-run-" + newID(t), TraceID: "trace-m10-v2-bad"})

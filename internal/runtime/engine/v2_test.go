@@ -48,3 +48,74 @@ func TestBranchV2OrderedAndOrConditions(t *testing.T) {
 		t.Fatalf("route=%s failure=%v", route, failure)
 	}
 }
+
+func TestBranchV2FailurePathsAndFallback(t *testing.T) {
+	tests := []struct {
+		name      string
+		cases     string
+		inputs    map[string]json.RawMessage
+		wantRoute string
+		wantCode  string
+		wantField string
+	}{
+		{
+			name:      "malformed config",
+			cases:     `{`,
+			inputs:    map[string]json.RawMessage{},
+			wantCode:  FailureBranchOperatorMismatch,
+			wantField: "operation.config",
+		},
+		{
+			name:      "missing named input",
+			cases:     `[{"route":"pass","logic":"and","conditions":[{"input":"score","operator":"gte","value":60}]}]`,
+			inputs:    map[string]json.RawMessage{},
+			wantCode:  FailureBranchPathNotFound,
+			wantField: "operation.config.cases.0.conditions.0.input",
+		},
+		{
+			name:      "invalid input json",
+			cases:     `[{"route":"pass","logic":"and","conditions":[{"input":"score","operator":"gte","value":60}]}]`,
+			inputs:    map[string]json.RawMessage{"score": json.RawMessage(`[`)},
+			wantCode:  FailureBranchOperatorMismatch,
+			wantField: "operation.config.cases.0.conditions.0.input",
+		},
+		{
+			name:      "missing object path",
+			cases:     `[{"route":"pass","logic":"and","conditions":[{"input":"user","path":"profile.score","operator":"gte","value":60}]}]`,
+			inputs:    map[string]json.RawMessage{"user": json.RawMessage(`{"profile":{}}`)},
+			wantCode:  FailureBranchPathNotFound,
+			wantField: "operation.config.cases.0.conditions.0.path",
+		},
+		{
+			name:      "unsupported operator",
+			cases:     `[{"route":"pass","logic":"and","conditions":[{"input":"score","operator":"between","value":60}]}]`,
+			inputs:    map[string]json.RawMessage{"score": json.RawMessage(`70`)},
+			wantCode:  FailureBranchOperatorMismatch,
+			wantField: "operation.config.cases.0.conditions.0",
+		},
+		{
+			name:      "no case matches",
+			cases:     `[{"route":"pass","logic":"and","conditions":[{"input":"score","operator":"gt","value":60}]}]`,
+			inputs:    map[string]json.RawMessage{"score": json.RawMessage(`50`)},
+			wantRoute: "else",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node := dsl.Node{ID: "xn_000000000000000000000004", Operation: dsl.Operation{Type: "control.branch", Version: 2, Config: map[string]json.RawMessage{
+				"cases":         json.RawMessage(test.cases),
+				"default_route": json.RawMessage(`"else"`),
+			}}}
+			route, failure := evaluateBranchV2(node, test.inputs)
+			if test.wantCode == "" {
+				if failure != nil || route != test.wantRoute {
+					t.Fatalf("route=%s failure=%v", route, failure)
+				}
+				return
+			}
+			if failure == nil || failure.Code != test.wantCode || failure.Field != test.wantField {
+				t.Fatalf("failure=%+v, want code=%s field=%s", failure, test.wantCode, test.wantField)
+			}
+		})
+	}
+}
